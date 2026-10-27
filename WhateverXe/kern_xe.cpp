@@ -14080,6 +14080,14 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	if (!that->getProperty("IOGVAHEVCDecode") &&
 	    OSDynamicCast(OSDictionary, that->getProperty("IOGVAHEVCDecodeCapabilities")))
 		that->setProperty("IOGVAHEVCDecode", "2");
+	// Acer ANV15-52, Raptor Lake-P: AppleGVA's pixel transfer (AVFPixelProcess_PrepareToTransferImages) on this
+	// GPU fails to create the VA driver's AVD accelerator and crashes in AVD_DestroyAVDAccelerator (NULL+8: Safari's GPU
+	// process, mediaanalysisd), while hardware decode itself works. Not advertising the VA scaler leaves scaling and
+	// colour conversion to VideoToolbox's other paths; the codec keys stay.
+	if (callbackXE->adlpDisplaySelected && that->getProperty("IOGVAScaler")) {
+		that->removeProperty("IOGVAScaler");
+		SYSLOG("igfx", "Display13 va: IOGVAScaler not advertised (pixel transfer stays off the VA driver)");
+	}
 
 	if (!tglBlitScratchSize || (*tglBlitScratchSize!=0xD240 && *tglBlitScratchSize!=0xE000)) {
 		SYSLOG("igfx", "TGL blit scratch parameter mismatch");
