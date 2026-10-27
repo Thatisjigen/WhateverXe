@@ -9073,8 +9073,22 @@ void XE::wrapAlderLakeNClockInit(IOService *controller) {
 	*reinterpret_cast<uint64_t *>(c+0xEA0)=r.nativeMaxHz();
 }
 uint64_t XE::wrapAlderLakeNClockProbe(IOService *controller) {return adlnClockReadout(controller).nativeHz();}
+// Acer ANV15-52: the VBT describes the eDP panel and Type-C ports, so the wiring is multi-output
+// and every CDCLK change takes adlnSetDualClock, which needs the controller work-loop gate. At the first eDP modeset that
+// gate was held elsewhere (tryCloseGate failed), the change was refused and the panel stayed off. When only pipe A has
+// a framebuffer, the single-output path below (pipe A's FB mutex, no gate) is the matching one.
+bool XE::display13OnlyPipeAFramebuffer() {
+	auto &c=display13FBPower;if(!c.lock)return false;
+	IOLockLock(c.lock);
+	const bool only=c.pipe[0].memoryFramebuffer && !c.pipe[1].memoryFramebuffer && !c.pipe[2].memoryFramebuffer;
+	IOLockUnlock(c.lock);return only;
+}
 void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
-	if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring)) {adlnSetDualClock(controller,nativeHz);return;}
+	if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring)) {
+		const bool single=display13OnlyPipeAFramebuffer();
+		SYSLOG("igfx","Display13 clock: request %llu, %s path",nativeHz,single?"single-output (pipe A only)":"dual");
+		if(!single) {adlnSetDualClock(controller,nativeHz);return;}
+	}
 	auto &c=display13FBPower;if(!c.lock)return;
 	Display13Clock::Change result;result.requestedHz=nativeHz;
 	auto fb=c.pipe[0].memoryFramebuffer;
@@ -9127,6 +9141,8 @@ void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
 	wmRecord[0]=1;wmRecord[3]=static_cast<uint32_t>(beforeWM.status);wmRecord[4]=static_cast<uint32_t>(afterWM.status);
 	wmRecord[5]=c.pipe[0].watermarkClockHz;
 	IOLockUnlock(c.lock);if(mutex)IORecursiveLockUnlock(mutex);
+	SYSLOG("igfx","Display13 clock: single path status=%u writes=%u from=%llu to=%llu",static_cast<unsigned>(result.status),
+		result.writes,wmRecord[1],result.after.nativeHz());
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBClockWM",wmRecord,sizeof(wmRecord));
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBClockChange",&result,sizeof(result));
 }
