@@ -7132,9 +7132,20 @@ uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing
             Display13FBMemory::singlePath<OSObject *>(service) : nullptr;
         if(dsiLifecycleTarget(service,path))return kIOReturnNotReady;
     }
-    return Display13TC::finishMode(
+    const auto result=Display13TC::finishMode(
         [&](){return FunctionCast(wrapDisplay13TCSetMode,self->orgDisplay13TCSetMode)(controller,fb,timing);},
         [&](){reinterpret_cast<void (*)(void *,void *,uint32_t)>(self->display13TCNotify)(controller,fb,1);});
+    // Sleep, sleepirq2: the wake restore cannot turn display interrupts back on in the dual-output wiring
+    // (no pipe active yet: readActivePipes -> Topology). The first completed modeset after the
+    // wake has lit a pipe; turn them on here. WEXDisplay13SleepIRQ2 = {attempts, last result, enabled after}.
+    if(display13SleepIRQOff && !display13FBIRQ.state.enabled) {
+        static uint32_t sleepIRQ2[3] {};++sleepIRQ2[0];
+        const auto e=wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE));
+        sleepIRQ2[1]=static_cast<uint32_t>(e);sleepIRQ2[2]=display13FBIRQ.state.enabled;
+        if(e==kIOReturnSuccess)display13SleepIRQOff=false;
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepIRQ2",sleepIRQ2,sizeof(sleepIRQ2));
+    }
+    return result;
 }
 
 bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
@@ -10482,7 +10493,8 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 		sleepIRQ[2]=!display13FBIRQ.state.enabled;sleepIRQ[3]=UINT32_MAX;
 		if(ready) {
 			if(!display13FBIRQ.state.enabled)sleepIRQ[3]=static_cast<uint32_t>(wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE)));
-			display13SleepIRQOff=false;
+			// sleepirq2: stays pending until enabled; the first modeset after the wake retries (wrapDisplay13TCSetMode).
+			if(display13FBIRQ.state.enabled)display13SleepIRQOff=false;
 		}
 		IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepIRQ",sleepIRQ,sizeof(sleepIRQ));
 	}
