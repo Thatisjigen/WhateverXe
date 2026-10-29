@@ -10012,6 +10012,36 @@ void XE::wrapAlderLakeNEngineEnable(void *power) {
 		!c.bridge.state.suspended && acquired.status==Display13Power::Status::Complete && !c.clockFaulted && clock.status==Display13Clock::Status::Complete &&
 		Display13Power::objectAssociations(power,0x80,c.controller,0x1C20)) {
 		Display13FBDBUFIO io {c.map};
+		// Sleep, sleepdbuf: after a system sleep the DBUF slices, the plane DDB entries and MBUS_CTL come back
+		// reset (enginediag 02:35: DBUF_CTL 0x0040c000 x4 with neither request nor power, MBUS 0x700 for 0x1c000700,
+		// PLANE_BUF_CFG zero) while the retained state still holds them, and resumeProof fails hardwareMatches
+		// (kern_display13_dbuf.hpp, Conflict). As i915 reprograms MBUS and the DDB on resume: write back the saved MBUS
+		// and the selected pipes' zeroed DDB entries (read back), and forget the slice requests the hardware lost so
+		// power() requests them again. WEXDisplay13SleepDBUF = {count, MBUS before, after, written pipes, DDB ok, requested before}.
+		if(c.dbuf.begun && !c.dbuf.faulted && !c.dbuf.updating && !c.dbuf.joined && c.dbuf.requested) {
+			bool lost=true;
+			for(unsigned i=0;i<4;++i) {
+				const auto v=io.read(Display13DBUF::regs[i]);
+				if(v==UINT32_MAX || (v&(Display13DBUF::Request|Display13DBUF::On)))lost=false;
+			}
+			if(lost) {
+				static uint32_t sleepDBUF[6] {};auto &q=c.dbuf;
+				auto raw=[&](uint32_t reg,uint32_t value) {*reinterpret_cast<volatile uint32_t *>(c.map->getVirtualAddress()+reg)=value;};
+				++sleepDBUF[0];sleepDBUF[1]=io.read(0x4438C);sleepDBUF[3]=0;sleepDBUF[4]=1;sleepDBUF[5]=q.requested;
+				if(sleepDBUF[1]!=q.mbus)raw(0x4438C,q.mbus);
+				sleepDBUF[2]=io.read(0x4438C);
+				const auto wells=io.read(0x45404);
+				for(unsigned p=0;p<3;++p)if((q.selected&(1U<<p)) && Display13FBIRQ::powered(wells,p)) {
+					const auto pr=Display13DBUF::hardwareRaw(q,p,q.pipe[p].primary),cr=Display13DBUF::hardwareRaw(q,p,q.pipe[p].cursor);
+					if(pr==UINT32_MAX || cr==UINT32_MAX || io.read(0x7027C+0x1000*p) || io.read(0x7017C+0x1000*p))continue;
+					raw(0x7027C+0x1000*p,pr);raw(0x7017C+0x1000*p,cr);sleepDBUF[3]|=1U<<p;
+					if(io.read(0x7027C+0x1000*p)!=pr || io.read(0x7017C+0x1000*p)!=cr)sleepDBUF[4]=0;
+				}
+				q.requested=q.powered=q.owned=0;
+				for(unsigned i=0;i<4;++i)q.raw[i]=io.read(Display13DBUF::regs[i]);
+				IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepDBUF",sleepDBUF,sizeof(sleepDBUF));
+			}
+		}
 		status=Display13DBUF::begin(io,c.dbuf,__builtin_popcount(callbackXE->adlnOutputWiring.selected())>=3 ? 7U : 0U,c.transcoders);
 		if(status==Display13DBUF::Status::Complete) {
 			if(acquired.status==Display13Power::Status::Complete)status=Display13DBUF::resumeEngine(io,c.dbuf);
