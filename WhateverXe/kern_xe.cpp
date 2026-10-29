@@ -7118,6 +7118,9 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
     return result.status;
 }
 
+// Sleep, sleepirq: set when the display interrupts are off as the sleep power override returns; cleared once they are
+// on again.
+static bool display13SleepIRQOff {};
 uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing) {
     auto self=callbackXE;
     // The GOP-preserving surface adapter must replace this refusal before
@@ -10325,6 +10328,9 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	if(acquiredGate)reinterpret_cast<void (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopOpen)(acquiredGate);
 	if(suspendIRQ[0])IORegistryEntry::getRegistryRoot()->setProperty("N97FBSuspendIRQ",suspendIRQ,sizeof(suspendIRQ));
 	adlnPublishPowerRecord("N97FBPowerOverride",record);
+	// Sleep, sleepirq: the suspend above parks the display interrupts on its own. The donor reached this override with
+	// them still on, so nothing says it will ask for them again at wake: the wake restore gives them back.
+	if(!enable && display13FBIRQ.state.begun && !display13FBIRQ.state.enabled)display13SleepIRQOff=true;
 }
 
 // Called with the display owner lock. No framebuffer or connector owns this
@@ -10468,6 +10474,18 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
     IOLockLock(c.lock);const bool ready=restoreDisplay13ResourcesLocked(power,waking);
     auto controller=static_cast<IOService *>(c.controller);IOLockUnlock(c.lock);
     if(ready)restoreDisplay13Ports(controller);
+	// Sleep, sleepirq: give back the display interrupts the sleep left off, once power and engine are back, unless the
+	// donor already re-enabled them. After a power loss the enable reinstalls them (restoreAfterPowerLoss).
+	// WEXDisplay13SleepIRQ = {calls, restore ok, was off, enable result}.
+	if(display13SleepIRQOff) {
+		static uint32_t sleepIRQ[4] {};++sleepIRQ[0];sleepIRQ[1]=ready;
+		sleepIRQ[2]=!display13FBIRQ.state.enabled;sleepIRQ[3]=UINT32_MAX;
+		if(ready) {
+			if(!display13FBIRQ.state.enabled)sleepIRQ[3]=static_cast<uint32_t>(wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE)));
+			display13SleepIRQOff=false;
+		}
+		IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepIRQ",sleepIRQ,sizeof(sleepIRQ));
+	}
 }
 
 void XE::wrapAlderLakeNPrimaryDBUF(OSObject *plane,uint32_t start,uint32_t end,bool wait) {
