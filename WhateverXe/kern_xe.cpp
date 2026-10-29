@@ -10154,6 +10154,8 @@ void XE::wrapAlderLakeNEngineDisable(void *power) {
 	if(acquiredGate)reinterpret_cast<void (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopOpen)(acquiredGate);
 }
 
+// Sleep, sleepirq: set when the sleep override, not the donor, turned display interrupts off.
+static bool display13SleepIRQOff {};
 void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	auto &c=display13FBPower;if(!c.lock || power!=c.power || !c.controller)return;
 	// The last hwShutdown can suspend the power banks before returning.
@@ -10165,6 +10167,12 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	// override(true) is only reached by the donor's simulator backend; our
 	// physical object has simulator=0. Do not force unrelated DDI/AUX domains.
 	if(!enable)wrapAlderLakeNEngineDisable(power);
+	// Sleep, sleepirq: the donor reaches the sleep override with the display interrupt master still on
+	// (sleepdiag: MASTER 0x80000000 and state.enabled, every other quiescence input clean), so quiescent() refuses,
+	// the bridge faults and the panel stays dark at wake. With no handler running, turn display interrupts off here
+	// exactly as hwDisableInterrupts does (wrapDisplay13FBDisableIRQ); the wake restore turns them back on.
+	if(!enable && display13FBIRQ.state.begun && display13FBIRQ.state.enabled && !display13FBIRQ.handlers &&
+	   wrapDisplay13FBDisableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE))==kIOReturnSuccess)display13SleepIRQOff=true;
 	uint64_t record[32] {};Display13Power::Result result;IOLockLock(c.lock);
 	if(callbackXE->display13FBLifecycleHooksReady && !enable && c.bridge.begun && !c.bridge.state.faulted &&
 		!c.engineEnabled && c.clockStopped && !c.dbuf.owned && !Display13WM::busyPipes(c.pipe)) {
@@ -10199,6 +10207,17 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 	display13FBPowerRecord(record,9,waking,result);IOLockUnlock(c.lock);
 	adlnPublishPowerRecord("N97FBPowerRestore",record);
 	if(result.status==Display13Power::Status::Complete)wrapAlderLakeNEngineEnable(power);
+	// Sleep, sleepirq: give back the display interrupts the sleep override turned off, once power and engine
+	// are back, unless the donor already re-enabled them. WEXDisplay13SleepIRQ = {calls, restore ok, was off, enable result}.
+	if(display13SleepIRQOff) {
+		static uint32_t sleepIRQ[4] {};++sleepIRQ[0];sleepIRQ[1]=result.status==Display13Power::Status::Complete;
+		sleepIRQ[2]=!display13FBIRQ.state.enabled;sleepIRQ[3]=UINT32_MAX;
+		if(result.status==Display13Power::Status::Complete) {
+			if(!display13FBIRQ.state.enabled)sleepIRQ[3]=static_cast<uint32_t>(wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE)));
+			display13SleepIRQOff=false;
+		}
+		IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepIRQ",sleepIRQ,sizeof(sleepIRQ));
+	}
 }
 
 void XE::wrapAlderLakeNPrimaryDBUF(OSObject *plane,uint32_t start,uint32_t end,bool wait) {
