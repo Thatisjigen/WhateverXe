@@ -446,6 +446,50 @@ template<class IO> Status armDetection(IO &io,const State &s) {
     }
     return (io.read(DDIControl)&ddiMask(s,8))==ddiMask(s,8) ? Status::Complete : Status::Readback;
 }
+// Sleep, doublesleep: with the display off the dual wiring keeps the interrupts in the HPD-only state
+// (hotplugOnly from the engine stop), and the engine stop of the next sleep proves that state. After S3 the PCH and
+// north hotplug banks come back reset and enable() waits for an active pipe, so a dark wake without a modeset left
+// them unprogrammed: the next stop's hotplugOnly read SDEIER 0 (Readback), the stop became Conflict and the bridge
+// faulted (13th test, line 10149). Put back what enable() programs for hotplug - detection, the owned PCH IER/IMR
+// bits, the DP Alt north bank (with its replay), GfxMaster - and enter the same HPD-only state; pipe banks stay
+// masked. ConfigureVBL then admits the pipes with extendActivePipes, as after a display-only sleep.
+template<class IO> Status restoreHotplug(IO &io,State &s,uint32_t sharedGT) {
+    if(!s.begun || s.faulted || s.enabled || (sharedGT && sharedGT!=NativeGT))return Status::Unavailable;
+    if(!available(io) || (s.typeC && !io.readable(NorthControl)) || ((s.ports&0x78) && !io.readable(TCControl)))return Status::Unavailable;
+    const auto master=io.read(Master),wells=io.read(Driver);
+    if(master==UINT32_MAX || wells==UINT32_MAX)return Status::Readback;
+    if(master&Enable)return Status::Unavailable;
+    if((wells&3)!=3)return Status::Power;
+    if(io.read(GfxMaster)&((3U)|(3U<<29))&~sharedGT)return Status::ForeignIRQ;
+    const auto pchIER=io.read(0xC400C),pchIMR=io.read(0xC4004);
+    if(pchIER==UINT32_MAX)return Status::Readback;
+    if((pchIER&~pchIMR)&~(pchOwned(s)|s.excludedPCH))return Status::ForeignIRQ;
+    const auto ddi=io.read(DDIControl);if(ddi==UINT32_MAX)return Status::Readback;
+    io.write(DDIControl,(ddi&~0x3333U)|ddiMask(s,8)|(ddi&ddiMask(s,3)));
+    if(s.ports&0x78) {
+        const auto tc=io.read(TCControl);if(tc==UINT32_MAX)return Status::Readback;
+        io.write(TCControl,(tc&~0x333333U)|tcMask(s,8)|(tc&tcMask(s,3)));
+    }
+    // 0.7.0: USB-C DP Alt ports (s.typeC) are owned through the north TC hotplug bank; put back what enable()
+    // programs for them (NorthControl detection, HPD IMR/IER bits, stale status acknowledged). 0.7.0 has no replay.
+    if(s.typeC) {
+        const auto ctl=io.read(NorthControl);
+        if(ctl==UINT32_MAX)return Status::Readback;
+        io.write(NorthControl,(ctl&~0x333333U)|northControl(s,8)|(ctl&northControl(s,3)));
+        io.write(HPDBank-4,io.read(HPDBank-4)&~northOwned(s));
+        io.write(HPDBank+4,io.read(HPDBank+4)|northOwned(s));
+        const auto staleNorth=io.read(HPDBank)&northOwned(s);if(staleNorth)io.write(HPDBank,staleNorth);
+        if((io.read(NorthControl)&northControl(s,8))!=northControl(s,8) ||
+           (io.read(HPDBank+4)&northOwned(s))!=northOwned(s) || (io.read(HPDBank-4)&northOwned(s)))
+            return Status::Readback;
+    }
+    io.write(0xC4004,io.read(0xC4004)&~pchOwned(s));
+    io.write(0xC400C,io.read(0xC400C)|pchOwned(s));
+    const auto stale=io.read(0xC4008)&pchOwned(s);if(stale)io.write(0xC4008,stale);
+    io.write(GfxMaster,Enable);
+    if(!(io.read(GfxMaster)&Enable))return Status::Readback;
+    return hotplugOnly(io,s,true);
+}
 // The runtime supplies one mask to WM checks, this hardware proof and its
 // access block. Never silently derive a different DDI mapping inside the proof.
 template<class IO> bool quiescentPipes(IO &io,const State &s,uint32_t domains,unsigned handlers,uint32_t pipes) {

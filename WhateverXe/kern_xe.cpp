@@ -7060,7 +7060,9 @@ uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing
     // Sleep, sleepirq2: the wake restore cannot turn display interrupts back on in the dual-output wiring
     // (no pipe active yet: readActivePipes -> Topology). The first completed modeset after the
     // wake has lit a pipe; turn them on here. WEXDisplay13SleepIRQ2 = {attempts, last result, enabled after}.
-    if(display13SleepIRQOff && !display13FBIRQ.state.enabled) {
+    // doublesleep: the restore may already have put back the HPD-only state; the same call then admits the lit
+    // pipes (extendActivePipes), in case no ConfigureVBL did.
+    if(display13SleepIRQOff) {
         static uint32_t sleepIRQ2[3] {};++sleepIRQ2[0];
         const auto e=wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE));
         sleepIRQ2[1]=static_cast<uint32_t>(e);sleepIRQ2[2]=display13FBIRQ.state.enabled;
@@ -10028,7 +10030,7 @@ void XE::wrapAlderLakeNEngineEnable(void *power) {
 	if(callbackXE->display13FBEngineEnableHookReady && c.bridge.begun && !c.bridge.state.faulted &&
 		!c.bridge.state.suspended && acquired.status==Display13Power::Status::Complete && !c.clockFaulted && clock.status==Display13Clock::Status::Complete &&
 		Display13Power::objectAssociations(power,0x80,c.controller,0x1C20)) {
-		Display13FBDBUFIO io {c.map};
+		Display13FBDBUFIO io {c.map};uint32_t sleepInitial=0;
 		// Sleep, sleepdbuf: after a system sleep the DBUF slices, the plane DDB entries and MBUS_CTL come back
 		// reset (enginediag 02:35: DBUF_CTL 0x0040c000 x4 with neither request nor power, MBUS 0x700 for 0x1c000700,
 		// PLANE_BUF_CFG zero) while the retained state still holds them, and resumeProof fails hardwareMatches
@@ -10054,7 +10056,7 @@ void XE::wrapAlderLakeNEngineEnable(void *power) {
 					raw(0x7027C+0x1000*p,pr);raw(0x7017C+0x1000*p,cr);sleepDBUF[3]|=1U<<p;
 					if(io.read(0x7027C+0x1000*p)!=pr || io.read(0x7017C+0x1000*p)!=cr)sleepDBUF[4]=0;
 				}
-				q.requested=q.powered=q.owned=0;
+				q.requested=q.powered=q.owned=0;sleepInitial=q.initialRequests;
 				for(unsigned i=0;i<4;++i)q.raw[i]=io.read(Display13DBUF::regs[i]);
 				IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepDBUF",sleepDBUF,sizeof(sleepDBUF));
 			}
@@ -10065,6 +10067,10 @@ void XE::wrapAlderLakeNEngineEnable(void *power) {
 			else status=Display13DBUF::Status::Power;
 		}
 		if(status==Display13DBUF::Status::Complete)status=Display13DBUF::tracker(io,c.dbuf);
+		// Sleep, doublesleep: power() requests the firmware's slices (initialRequests) again after S3 and marks
+		// them owned; stop() keeps them requested as the predecessor's, so the next sleep found owned 0xf and its
+		// override refused (13th test). Give them back the boot state: requested, not ours.
+		if(status==Display13DBUF::Status::Complete && sleepInitial)c.dbuf.owned&=~sleepInitial;
 	}
 	c.engineEnabled=status==Display13DBUF::Status::Complete;
     // This method already holds a sleepable owner lock. Qualify immutable BAR
@@ -10267,16 +10273,24 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 	}
 	// Sleep, hpdwake: interrupts still off (no active pipe until the first modeset) means the PCH hotplug
 	// detection reset by S3 is still off too, and the donor's panel power-on in that modeset waits for an HPD it cannot
-	// see ("Timeout waiting for HPD" at every wake since test 4; the display-only wakes never had it). Arm detection only.
-	// WEXDisplay13HotplugArm = the result.
+	// see ("Timeout waiting for HPD" at every wake since test 4; the display-only wakes never had it).
+	// doublesleep: put back the HPD-only state the display had before the sleep (Display13FBIRQ::restoreHotplug), which
+	// the next sleep's engine stop proves; if it is refused, arm the detection alone as hpdwake did.
+	// WEXDisplay13HotplugRestore = restoreHotplug | armDetection << 8.
 	if(display13WakePending) {
 		display13WakePending=false;
-		if(result.status==Display13Power::Status::Complete && !display13FBIRQ.state.enabled && display13FBIRQ.lock && display13FBIRQ.base) {
+		if(result.status==Display13Power::Status::Complete && !display13FBIRQ.state.enabled && display13FBIRQ.lock && display13FBIRQ.base &&
+		   adlnIRQOwner(display13FBIRQ.controller)) {
 			auto &irq=display13FBIRQ;Display13FBIRQIO irqIO {irq.base};
 			const auto saved=IOSimpleLockLockDisableInterrupt(irq.lock);
-			const auto armed=Display13FBIRQ::armDetection(irqIO,irq.state);
+			const auto hotplug=irq.quiescing || irq.handlers ? Display13FBIRQ::Status::Unavailable :
+				Display13FBIRQ::restoreHotplug(irqIO,irq.state,adlnSharedGT(irq.controller));
+			auto restored=static_cast<uint32_t>(hotplug);
+			if(hotplug!=Display13FBIRQ::Status::Complete && !irq.state.enabled)
+				restored|=static_cast<uint32_t>(Display13FBIRQ::armDetection(irqIO,irq.state))<<8;
+			adlnIRQCache(irq.controller,irqIO);
 			IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
-			IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HotplugArm",static_cast<uint32_t>(armed),32);
+			IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HotplugRestore",restored,32);
 		}
 	}
 }
