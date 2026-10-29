@@ -433,6 +433,31 @@ template<class IO> Status hotplugOnly(IO &io,State &s,bool preservePipeStatus=fa
     if(!(io.read(Master)&Enable))return fail(io,s,Status::Readback);
     s.enabled=true;return Status::Complete;
 }
+// Sleep, hpdwake: S3 resets the PCH hotplug control with the rest of the south bank (SDEIER reads 0 at the
+// wake enable). The donor waits for the eDP HPD live state (SDEISR) inside the first modeset after the wake, before
+// enable() can run (no active pipe yet), and its link training and port probe treat a low HPD as no panel. Turn the
+// detection of the owned DDI/legacy TC ports back on, alone: IER, IMR, master and the sticky status stay untouched,
+// the next enable() clears that status. i915 likewise re-runs intel_hpd_init before restoring the display on resume.
+template<class IO> Status armDetection(IO &io,const State &s) {
+    if(!s.begun || s.faulted)return Status::Unavailable;
+    const auto wells=io.read(Driver);
+    if(wells==UINT32_MAX || (wells&3)!=3)return Status::Power;
+    const auto ddi=io.read(DDIControl);if(ddi==UINT32_MAX)return Status::Readback;
+    if((ddi&ddiMask(s,8))!=ddiMask(s,8))io.write(DDIControl,(ddi&~0x3333U)|ddiMask(s,8));
+    if(s.ports&0x78) {
+        const auto tc=io.read(TCControl);if(tc==UINT32_MAX)return Status::Readback;
+        if((tc&tcMask(s,8))!=tcMask(s,8))io.write(TCControl,(tc&~0x333333U)|tcMask(s,8));
+        if((io.read(TCControl)&tcMask(s,8))!=tcMask(s,8))return Status::Readback;
+    }
+    // 0.7.0: a USB-C DP Alt port (s.typeC) is detected by the north TC_HOTPLUG_CTL, which enable() programs through
+    // northControl(); tcMask() leaves its PCH bits alone. Re-arm that detection the same way, status untouched.
+    if(s.typeC) {
+        const auto north=io.read(NorthControl);if(north==UINT32_MAX)return Status::Readback;
+        if((north&northControl(s,8))!=northControl(s,8))io.write(NorthControl,(north&~0x333333U)|northControl(s,8));
+        if((io.read(NorthControl)&northControl(s,8))!=northControl(s,8))return Status::Readback;
+    }
+    return (io.read(DDIControl)&ddiMask(s,8))==ddiMask(s,8) ? Status::Complete : Status::Readback;
+}
 // The runtime supplies one mask to WM checks, this hardware proof and its
 // access block. Never silently derive a different DDI mapping inside the proof.
 template<class IO> bool quiescentPipes(IO &io,const State &s,uint32_t domains,unsigned handlers,uint32_t pipes) {

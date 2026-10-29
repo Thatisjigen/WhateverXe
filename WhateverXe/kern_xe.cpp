@@ -7121,6 +7121,9 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
 // Sleep, sleepirq: set when the display interrupts are off as the sleep power override returns; cleared once they are
 // on again.
 static bool display13SleepIRQOff {};
+// Sleep, hpdwake: set by the sleep power override, cleared by the first power restore after it, which puts the
+// hotplug detection back (wrapAlderLakeNPowerRestore).
+static bool display13WakePending {};
 uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing) {
     auto self=callbackXE;
     // The GOP-preserving surface adapter must replace this refusal before
@@ -10342,6 +10345,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	// Sleep, sleepirq: the suspend above parks the display interrupts on its own. The donor reached this override with
 	// them still on, so nothing says it will ask for them again at wake: the wake restore gives them back.
 	if(!enable && display13FBIRQ.state.begun && !display13FBIRQ.state.enabled)display13SleepIRQOff=true;
+	if(!enable)display13WakePending=true; // hpdwake: the next restore re-arms the hotplug detection
 }
 
 // Called with the display owner lock. No framebuffer or connector owns this
@@ -10497,6 +10501,20 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 			if(display13FBIRQ.state.enabled)display13SleepIRQOff=false;
 		}
 		IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepIRQ",sleepIRQ,sizeof(sleepIRQ));
+	}
+	// Sleep, hpdwake: interrupts still off (no active pipe until the first modeset) means the PCH hotplug
+	// detection reset by S3 is still off too, and the donor's panel power-on in that modeset waits for an HPD it cannot
+	// see ("Timeout waiting for HPD" at every wake since test 4; the display-only wakes never had it). Arm detection only.
+	// WEXDisplay13HotplugArm = the result.
+	if(display13WakePending) {
+		display13WakePending=false;
+		if(ready && !display13FBIRQ.state.enabled && display13FBIRQ.lock && display13FBIRQ.base) {
+			auto &irq=display13FBIRQ;Display13FBIRQIO irqIO {irq.base};
+			const auto saved=IOSimpleLockLockDisableInterrupt(irq.lock);
+			const auto armed=Display13FBIRQ::armDetection(irqIO,irq.state);
+			IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
+			IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HotplugArm",static_cast<uint32_t>(armed),32);
+		}
 	}
 }
 
