@@ -83,6 +83,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - 内蔵画面の輝度調整には`SSDT-PNLF`を追加します。
 - GPUは自動選択するため、通常は`device-id`上書きは不要です。
 - Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/P/Uではタイル形式を自動選択します。`-yTileDisable`は使わないでください。`AAPL,GfxYTile`は不要です。
+- 開発時の一時診断用に `-wex-reset-trace` を指定すると、GPUハングからの回復処理の各段階（チャネル再起動、エンジンリセット、スケジューラのリセットと再開、コマンドストリーマのリセット）を、レンダーエンジンのリセット関連およびリングのレジスタとともに `WEXGPUResetTrace` レジストリプロパティへ記録します。回復処理の動作は変更しません。
 
 ## 動作確認済みの機能と既知の問題
 
