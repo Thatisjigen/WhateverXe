@@ -12,6 +12,9 @@ uint32_t tglRecoveryCalls {},tglRecoveryReturns {};
 uint64_t tglRecoveryRecords[16][16] {},ticks {};
 unsigned resets,resumes,stage;bool nativeOK,replaceScheduler,replaceOwner,timeout,expectStamp;
 uint32_t initialFailures;
+// Hooks the wrapper calls around the helper. Their bodies are outside this check: each stub pins where the
+// wrapper calls it and with what.
+struct {unsigned traces;uint64_t traced;} hooks;
 using TGLRecovery::field;
 
 bool reset(void *r,void *c) {
@@ -42,6 +45,11 @@ bool wait(void *r,uint32_t *value,uint32_t target,uint32_t us) {
 }
 const TGLRecovery::StampOps tglRecoveryStamp {submit,wait};
 void clock_get_uptime(uint64_t *value) {*value=++ticks;}
+void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_t result) {
+    assert(object==channel && !arg && event==++hooks.traces);
+    assert(event==1 ? stage==0 && !result : event==2 && stage==(expectStamp ? 5U : 2U));
+    hooks.traced=result;
+}
 }
 #define arrsize(a) (sizeof(a)/sizeof((a)[0]))
 struct XE { static void wrapTGLRecovery(void *); };
@@ -63,13 +71,15 @@ int main() {
         field<uint32_t>(affected,0x20)=17;field<uint32_t>(affected,0x17C)=initial;
         initialFailures=initial;nativeOK=ok;replaceScheduler=replaceOwner=replace;timeout=expired;
         expectStamp=engine==2 && ok && present;
-        resets=resumes=stage=tglRecoveryCalls=tglRecoveryReturns=0;ticks=0;
+        resets=resumes=stage=tglRecoveryCalls=tglRecoveryReturns=0;ticks=0;hooks={};
         std::memset(tglRecoveryRecords,0,sizeof(tglRecoveryRecords));
         XE::wrapTGLRecovery(channel);
         assert(resets==1 && resumes==1 && stage==(expectStamp ? 5 : 2));
         assert(tglRecoveryCalls==1 && tglRecoveryReturns==1);
+        assert(hooks.traces==2);
         const auto q=tglRecoveryRecords[0];
         const uint32_t failed=initial+unsigned(present && (!ok || (expectStamp && expired)));
+        assert(hooks.traced==(uint64_t(ok)|(uint64_t(present ? failed : 0U)<<8)));
         assert(q[15]==1 && q[1]==1 && q[2]==1 && q[3]==2);
         assert(q[4]==reinterpret_cast<uintptr_t>(channel) && q[5]==reinterpret_cast<uintptr_t>(ring));
         assert(q[6]==reinterpret_cast<uintptr_t>(context) && q[7]==reinterpret_cast<uintptr_t>(present ? affected : nullptr));
