@@ -7037,6 +7037,9 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
     return result.status;
 }
 
+// Sleep, sleepirq: set when the sleep override, not the donor, turned display interrupts off; cleared once
+// they are on again.
+static bool display13SleepIRQOff {};
 uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing) {
     auto self=callbackXE;
     // The GOP-preserving surface adapter must replace this refusal before
@@ -7048,9 +7051,20 @@ uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing
             Display13FBMemory::singlePath<OSObject *>(service) : nullptr;
         if(dsiLifecycleTarget(service,path))return kIOReturnNotReady;
     }
-    return Display13TC::finishMode(
+    const auto result=Display13TC::finishMode(
         [&](){return FunctionCast(wrapDisplay13TCSetMode,self->orgDisplay13TCSetMode)(controller,fb,timing);},
         [&](){reinterpret_cast<void (*)(void *,void *,uint32_t)>(self->display13TCNotify)(controller,fb,1);});
+    // Sleep, sleepirq2: the wake restore cannot turn display interrupts back on in the dual-output wiring
+    // (no pipe active yet: readActivePipes -> Topology). The first completed modeset after the
+    // wake has lit a pipe; turn them on here. WEXDisplay13SleepIRQ2 = {attempts, last result, enabled after}.
+    if(display13SleepIRQOff && !display13FBIRQ.state.enabled) {
+        static uint32_t sleepIRQ2[3] {};++sleepIRQ2[0];
+        const auto e=wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE));
+        sleepIRQ2[1]=static_cast<uint32_t>(e);sleepIRQ2[2]=display13FBIRQ.state.enabled;
+        if(e==kIOReturnSuccess)display13SleepIRQOff=false;
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepIRQ2",sleepIRQ2,sizeof(sleepIRQ2));
+    }
+    return result;
 }
 
 bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
@@ -10184,8 +10198,6 @@ void XE::wrapAlderLakeNEngineDisable(void *power) {
 	if(acquiredGate)reinterpret_cast<void (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopOpen)(acquiredGate);
 }
 
-// Sleep, sleepirq: set when the sleep override, not the donor, turned display interrupts off.
-static bool display13SleepIRQOff {};
 void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	auto &c=display13FBPower;if(!c.lock || power!=c.power || !c.controller)return;
 	// The last hwShutdown can suspend the power banks before returning.
@@ -10244,7 +10256,8 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 		sleepIRQ[2]=!display13FBIRQ.state.enabled;sleepIRQ[3]=UINT32_MAX;
 		if(result.status==Display13Power::Status::Complete) {
 			if(!display13FBIRQ.state.enabled)sleepIRQ[3]=static_cast<uint32_t>(wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE)));
-			display13SleepIRQOff=false;
+			// sleepirq2: stays pending until enabled; the first modeset after the wake retries (wrapDisplay13TCSetMode).
+			if(display13FBIRQ.state.enabled)display13SleepIRQOff=false;
 		}
 		IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepIRQ",sleepIRQ,sizeof(sleepIRQ));
 	}
