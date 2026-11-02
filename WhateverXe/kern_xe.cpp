@@ -14898,6 +14898,13 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 		that->removeProperty("IOGVAScaler");
 		SYSLOG("igfx", "Display13 va: IOGVAScaler not advertised (pixel transfer stays off the VA driver)");
 	}
+	// Acer ANV15-52, Graphics 0.4.0: without the scaler key AppleGVA still opens the VA driver for pixel transfers,
+	// and the driver crashes (VTPixelTransferSessionTransferImage: Photo Booth's first camera frame, mediaanalysisd). Hiding
+	// the keys one at a time from a test process, IOVARendererID alone stops the crash and H.264 and HEVC stay in hardware.
+	if (callbackXE->adlpDisplaySelected) {
+		that->removeProperty("IOVARendererID");
+		SYSLOG("igfx", "Display13 va: IOVARendererID not advertised (pixel transfer stays off the VA driver)");
+	}
 
 	if (!tglBlitScratchSize || (*tglBlitScratchSize!=0xD240 && *tglBlitScratchSize!=0xE000)) {
 		SYSLOG("igfx", "TGL blit scratch parameter mismatch");
