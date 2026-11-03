@@ -6228,6 +6228,81 @@ void XE::wrapDisplay13FBSWIRQ(IOService *controller,IOInterruptEventSource *sour
 	}
 }
 
+// Sleep, tcreplay: a port released at sleep comes back through the modeset of its framebuffer's wake, which first
+// asks whether the display is still there. Once in four stops the answer is no, just as the monitor's hub powers
+// on: "Display removed in lower power state", and HPD, already high, gives no further event. So once a pipe is lit (never in a dark
+// wake) a port that stays idle with its sink live gets a long pulse, what a replug would give, every few seconds for a minute. As the
+// boot replay of the 0.6.1 route (Display13FBIRQ::replayLive). WEXDisplay13TCReplay = {ports released at sleep, pulses, last port state}.
+static uint32_t display13ReplayPorts,display13ReplayTries;
+static uint32_t display13ReplayRecord[3];
+static uint64_t display13ReplayDue,display13ReplayEnd,display13ReplayDelay,display13ReplayGap,display13ReplayWindow;
+static uint32_t display13ReplayPulse(Display13FBIRQIO &io) {
+	const auto ports=__atomic_load_n(&display13ReplayPorts,__ATOMIC_ACQUIRE);
+	if(!ports || !display13FBIRQ.state.active)return 0;
+	const auto now=mach_absolute_time();
+	if(!display13ReplayDue) {display13ReplayDue=now+display13ReplayDelay;display13ReplayEnd=now+display13ReplayWindow;return 0;}
+	if(now<display13ReplayDue)return 0;
+	display13ReplayDue=now+display13ReplayGap;
+	const auto live=io.read(0x44470); // GEN11_DE_HPD_ISR: DP Alt live at 16+tc, TBT at tc
+	uint32_t pulse=0,remaining=ports;
+	for(unsigned tc=0;tc<4;++tc)if(ports&(1U<<tc)) {
+		if(display13FBPower.tcMode[tc].phase!=Display13TC::Mode::Phase::Idle || now>=display13ReplayEnd || display13ReplayTries>=8) {remaining&=~(1U<<tc);continue;}
+		if(live!=UINT32_MAX && (live&(1U<<(16+tc))) && !(live&(1U<<tc)))pulse|=1U<<(2*tc);
+	}
+	__atomic_store_n(&display13ReplayPorts,remaining,__ATOMIC_RELEASE);
+	display13ReplayRecord[2]=live;
+	if(pulse) {++display13ReplayTries;++display13ReplayRecord[1];}
+	return pulse;
+}
+
+// Sleep, red, a diagnostic: the panel shows red from the modeset of a wake to WindowServer's first frame, about 1.4 s.
+// What pipe A holds meanwhile, read only, 16 samples 150 ms apart from the first modeset after a sleep. WEXDisplay13WakeScanout, each sample =
+// {ms, wells, PLANE_CTL, PLANE_COLOR_CTL, SURF, SURFLIVE, STRIDE, PIPE_BOTTOM_COLOR, GAMMA_MODE, CSC_MODE, PIPE_MISC, TRANSCONF, DE pipe IIR,
+// GGTT entry of SURF low, high, first word of that page, then the same 1 MiB into the surface: entry low, high, word}. Memory is read as
+// adlnObserveScanoutPixels reads it, through the direct map with nofault_copy: a page it cannot reach leaves the word at 0.
+static bool display13ScanoutArmed;
+static thread_call_t display13ScanoutCall;
+static uint32_t display13Scanout[16][19];
+static unsigned display13ScanoutNext;
+static uint64_t display13ScanoutStart;
+static void display13ScanoutTick(thread_call_param_t,thread_call_param_t) {
+	auto &c=display13FBPower;if(!c.lock || !c.map || display13ScanoutNext>=16)return;
+	auto &r=display13Scanout[display13ScanoutNext];uint64_t ns=0;
+	absolutetime_to_nanoseconds(mach_absolute_time()-display13ScanoutStart,&ns);r[0]=static_cast<uint32_t>(ns/1000000);
+	IOLockLock(c.lock);
+	const auto base=c.map->getVirtualAddress();const bool mapped=base && c.map->getLength()==0x1000000;
+	auto rd=[&](uint32_t reg) {return *reinterpret_cast<volatile uint32_t *>(base+reg);};
+	if(mapped) {
+		r[1]=rd(0x45404);
+		if(Display13FBIRQ::powered(r[1],0)) {
+			constexpr uint32_t regs[] {0x70180,0x701CC,0x7019C,0x701AC,0x70188,0x70034,0x4A480,0x49028,0x70030,0x70008,0x44408};
+			for(unsigned i=0;i<arrsize(regs);++i)r[2+i]=rd(regs[i]);
+			for(unsigned n=0;n<2;++n) {
+				auto q=r+13+3*n;
+				const uint64_t entry=0x800000+((uint64_t(r[4])+(n ? 0x100000 : 0))>>12)*8;
+				if(entry+8>0x1000000)continue;
+				q[0]=rd(static_cast<uint32_t>(entry));q[1]=rd(static_cast<uint32_t>(entry+4));
+				const auto phys=((uint64_t(q[1])<<32)|q[0])&0x7FFFFFF000ULL;
+				if(!(q[0]&1) || !phys || !tglVM.enabled || !tglVM.nofault || !tglVM.directBase || phys>UINT64_MAX-tglVM.directBase)continue;
+				const auto cpu=tglVM.directBase+phys;
+				if(cpu<tglVM.directBase || cpu>=tglVM.directEnd || tglVM.directEnd-cpu<4)continue;
+				tglVM.nofault(cpu,reinterpret_cast<uintptr_t>(q+2),4);
+			}
+		}
+	}
+	IOLockUnlock(c.lock);
+	if(++display13ScanoutNext<16) {
+		uint64_t deadline;clock_interval_to_deadline(150,kMillisecondScale,&deadline);
+		thread_call_enter_delayed(display13ScanoutCall,deadline);
+	} else IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13WakeScanout",display13Scanout,sizeof(display13Scanout));
+}
+
+static void display13ScanoutBegin() {
+	if(!display13ScanoutCall || !__atomic_exchange_n(&display13ScanoutArmed,false,__ATOMIC_ACQ_REL))return;
+	display13ScanoutNext=0;display13ScanoutStart=mach_absolute_time();memset(display13Scanout,0,sizeof(display13Scanout));
+	thread_call_enter(display13ScanoutCall);
+}
+
 void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t *aux,uint32_t *hotplug) {
 	// Original ProcessInterrupt holds c+90 here. Keep its real VBL/flip and
 	// DSB busy retirement, atomic E08/E0C/E10 queue and native SW source.
@@ -6241,6 +6316,10 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
 	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
 	if(e.aux)display13TCReleaseArm(); // A DP Alt event: the port may have just lost its sink.
+	if(e.status==Display13FBIRQ::Status::Complete) {
+		const auto pulse=display13ReplayPulse(io);
+		if(pulse) {*aux|=pulse;display13TCReleaseArm();} // The watch's tick publishes WEXDisplay13TCReplay, in a thread.
+	}
 	if(c.state.faulted) {
 		*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xD84)=0;
 		*(reinterpret_cast<uint8_t *>(controller)+0xFD4)=0;
@@ -7198,6 +7277,7 @@ uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing
     const auto result=Display13TC::finishMode(
         [&](){return FunctionCast(wrapDisplay13TCSetMode,self->orgDisplay13TCSetMode)(controller,fb,timing);},
         [&](){reinterpret_cast<void (*)(void *,void *,uint32_t)>(self->display13TCNotify)(controller,fb,1);});
+    display13ScanoutBegin();
     // Sleep, sleepirq2: the wake restore cannot turn display interrupts back on in the dual-output wiring
     // (no pipe active yet: readActivePipes -> Topology). The first completed modeset after the
     // wake has lit a pipe; turn them on here. WEXDisplay13SleepIRQ2 = {attempts, last result, enabled after}.
@@ -7799,6 +7879,7 @@ static uint32_t display13TCReleaseLeft,display13TCReleaseSeq,display13TCReleaseE
 
 void XE::display13TCReleaseSetup() {
  if(!display13TCReleaseCall)display13TCReleaseCall=thread_call_allocate(display13TCReleaseTick,nullptr);
+ if(!display13ScanoutCall && display13TraceEnabled)display13ScanoutCall=thread_call_allocate(display13ScanoutTick,nullptr);
  IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCReleaseReady",display13TCReleaseCall!=nullptr);
 }
 
@@ -7890,6 +7971,7 @@ void XE::display13TCReleaseTick(void *,void *) {
    if(gated)reinterpret_cast<void (*)(IOWorkLoop *)>(self->adlnWorkLoopOpen)(gate);
   } else IOLockUnlock(c.lock);
  }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCReplay",display13ReplayRecord,sizeof(display13ReplayRecord));
  const auto left=__atomic_load_n(&display13TCReleaseLeft,__ATOMIC_ACQUIRE);
  if(left) {
   uint32_t expected=left;__atomic_compare_exchange_n(&display13TCReleaseLeft,&expected,left-1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
@@ -10563,6 +10645,7 @@ void XE::releaseDisplay13TCForSleep() {
   record[0]+=!result;record[1]=tc;record[2]=stop;record[3]=result;record[4]=static_cast<uint32_t>(c.tcMode[tc].phase);
   record[5]=c.bridge.nativeDDIRefs(ddi);record[6]=c.bridge.nativeAUXRefs(ddi);record[7]=resolved && c.tcObject[tc]==port?io.read(p.buffer):UINT32_MAX;
   IOLockUnlock(c.lock);port->release();
+  if(!result) {__atomic_fetch_or(&display13ReplayPorts,1U<<tc,__ATOMIC_ACQ_REL);++display13ReplayRecord[0];}
   IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepTC",record,sizeof(record));
   IOLog("WEX sleep tc: ddi %u link stop %u mode 0 result 0x%x phase %u refs %u/%u\n",ddi,stop,result,record[4],record[5],record[6]);
  }
@@ -10580,6 +10663,14 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	// physical object has simulator=0. Do not force unrelated DDI/AUX domains.
 	if(!enable)stopDisplay13Engine(power,true);
 	if(!enable)releaseDisplay13TCForSleep();
+	if(!enable) {
+		// tcreplay and red count from the next wake that lights a pipe. The times are worked out here: the replay runs with interrupts off.
+		clock_interval_to_absolutetime_interval(4,kSecondScale,&display13ReplayDelay);
+		clock_interval_to_absolutetime_interval(5,kSecondScale,&display13ReplayGap);
+		clock_interval_to_absolutetime_interval(60,kSecondScale,&display13ReplayWindow);
+		display13ReplayDue=0;display13ReplayTries=0;
+		__atomic_store_n(&display13ScanoutArmed,true,__ATOMIC_RELEASE);
+	}
 	uint64_t record[32] {},suspendIRQ[24] {};Display13Power::Result result;
 	IOWorkLoop *acquiredGate=nullptr;IOLockLock(c.lock);
 	if(callbackXE->display13FBLifecycleHooksReady && !enable && c.bridge.begun && !c.bridge.state.faulted &&

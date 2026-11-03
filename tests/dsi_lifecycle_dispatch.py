@@ -33,6 +33,8 @@ void adlnPublishMemory(const char*,unsigned,void*,size_t,bool=false){}
 IOService *panel=nullptr;bool dsiModeTarget(IOService *fb){return fb && fb==panel;}
 constexpr uint32_t kIOReturnNotReady=0xe00002d8;
 constexpr uint32_t kIOReturnSuccess=0;
+// Sleep, red: the diagnostic that starts at the first modeset after a sleep has nothing to do in this replay.
+static void display13ScanoutBegin(){}
 // Sleep, sleepirq2 retry inside wrapDisplay13TCSetMode: its flag is never set by this replay, so the
 // stubs only have to exist; reaching them would mean the DSI dispatch ran the sleep retry.
 bool display13SleepIRQOff=false;
