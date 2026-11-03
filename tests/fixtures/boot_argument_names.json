@@ -145,7 +145,7 @@
   "-wex-noaccel": [],
   "-wex-display-trace": [],
   "-wex-adlp-readout": [],
-  "-wex-reset-restore": [],
+  "-wex-reset-recover": [],
   "-wex-reset-trace": [],
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
