@@ -188,6 +188,20 @@ int main() {
     assert(prepareCursor(cursorPower,cp)==Status::Power && !cursorPower.writes);
     IO primaryPower;State pp;assert(begin(primaryPower,pp)==Status::Complete);primaryPower.r[0x45404]=0;
     assert(preparePrimary(primaryPower,pp,40,2047)==Status::Power && !primaryPower.writes);
+    // A 96-block cursor prefix takes the same steps from the firmware's layout: the primary
+    // moves first, or the cursor finds it in the way. A cursor already lit cannot move.
+    IO wideEarly;State we;we.cursorBlocks=96;assert(begin(wideEarly,we)==Status::Complete);
+    assert(prepareCursor(wideEarly,we)==Status::Range && !wideEarly.writes && we.faulted);
+    IO wideCursor;State wc;wc.cursorBlocks=96;assert(begin(wideCursor,wc)==Status::Complete);
+    const auto wide=singlePipeLayout(wideCursor,wc);
+    assert(wide.status==Status::Complete && wide.primary.start==96 && wide.primary.end==2048 && wide.cursor.end==96);
+    assert(preparePrimary(wideCursor,wc,96,2047)==Status::Complete);
+    wideCursor.r[0x7027C]=0x07FF0060;assert(finishPrimary(wideCursor,wc)==Status::Complete);
+    assert(prepareCursor(wideCursor,wc)==Status::Complete);wideCursor.r[0x7017C]=95U<<16;
+    assert(finishCursor(wideCursor,wc)==Status::Complete && wc.pipe[0].cursor.end==96 && wc.pipe[0].primary.start==96);
+    IO wideLit;wideLit.r[0x7027C]=0x07FF0060;wideLit.r[0x7017C]=39U<<16;wideLit.r[0x70080]=7;
+    State wl;wl.cursorBlocks=96;assert(begin(wideLit,wl)==Status::Complete);
+    assert(prepareCursor(wideLit,wl)==Status::Conflict && !wideLit.writes);
     IO allocator;State al;assert(begin(allocator,al)==Status::Complete);
     assert(preparePrimary(allocator,al,layout.primary.start,layout.primary.end-1)==Status::Complete);
     allocator.r[0x7027C]=0x07FF0028;assert(finishPrimary(allocator,al)==Status::Complete && al.unretired==3);
