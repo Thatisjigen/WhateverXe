@@ -424,6 +424,8 @@ private:
     static uint32_t wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,bool force);
     static uint32_t wrapDisplay13GMBusRead(void *access,uint64_t reg);
     static void wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value);
+    mach_vm_address_t orgDisplay13FBModeInfo {};
+    static uint32_t wrapDisplay13FBModeInfo(IOService *fb,int mode,void *info);
     static void holdDisplay13TCWake(IOService *fb);
     mach_vm_address_t orgAlderLakeNGamma10 {},adlnGammaTableUpdate {},orgAlderLakeNPreGamma {};
     bool processDisplay13FramebufferColor(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
