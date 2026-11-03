@@ -29,7 +29,7 @@ struct Context {
  alignas(8) uint8_t controllerBytes[0xe08]{},powerBytes[0x80]{};
  unsigned tcBusy[4]{};IOWorkLoop *workLoop=&::workLoop;
  void *controller=controllerBytes,*power=powerBytes,*lock=(void*)1;bool tcSignalReady[4]{},clockFaulted=false,memoryFaulted=false,panelFaulted=false,tcBankFaulted=false;
- unsigned firstFaultLine=0;
+ unsigned firstFaultLine=0;struct Link{unsigned rate;} tcDPLink[4]{};
 } display13FBPower;
 struct Display13FBPowerIO {
  MMIO *map;
@@ -75,6 +75,8 @@ unsigned XE::wrapDisplay13TCMode(OSObject*p,unsigned wanted){
 // PRODUCTION_DRAIN
 static constexpr uint32_t display13TCReleaseEmptyTicks=3,display13TCReleaseLimit=600;
 static uint32_t display13TCReleaseSeq,display13TCReleaseEmpty[4],display13TCReleaseTries[4];
+struct Display13DeferredClock {void *port {};uint32_t value {};bool pending {};};
+static Display13DeferredClock display13DeferredClocks[3];
 // PRODUCTION_RELEASE
 template<class T>void put(void*p,unsigned at,T value){memcpy(static_cast<uint8_t*>(p)+at,&value,sizeof(value));}
 int main(){
@@ -148,6 +150,7 @@ int main(){
   Display13FBPowerIO power{&map};assert(Display13Power::initialize(power,c.bridge.state,Display13Power::nativeDomains(0x7b)));c.bridge.begun=true;c.bridge.selectedPorts=0x78;
   Transport io{&port,p.tc};auto &mode=c.tcMode[p.tc];const auto who=reinterpret_cast<uintptr_t>(c.controller),obj=reinterpret_cast<uintptr_t>(&port);
   assert(mode.connect(io,who,obj,d,3).status==Status::Complete);
+  map.regs[0x46144]=map.regs[0x46148]=0;map.regs[0x61400]=map.regs[0x71008]=map.regs[0x62400]=map.regs[0x72008]=0;
   const auto step=[&](bool gated){locked=true;const auto r=XE::display13TCReleaseStep(p.tc,gated);assert(locked);locked=false;return r;};
   assert(!step(true)&&mode.phase==Mode::Phase::Active); // Sink present, nothing asked: not touched.
   map.regs[0x64310+256*p.tc]=0x80000000; // AUX still busy: a refused release stays pending, then completes by itself.
@@ -156,6 +159,17 @@ int main(){
   assert(step(false)&&mode.phase==Mode::Phase::Active&&io.nativeMode()==3); // Work loop gate busy: nothing happens.
   c.tcBusy[p.tc]=1;assert(step(true)&&io.nativeMode()==3);c.tcBusy[p.tc]=0;
   map.regs[0x64310+256*p.tc]=0;
+  if(!asked) {
+   // The native clock stop never came: a transcoder on the DDI blocks the stop, then the tick does it and the next one releases.
+   assert(c.bridge.getDDI(power,d).status==Display13Power::Status::Complete);
+   map.regs[p.pll]=0xcc000000;map.regs[p.clock]=0x80001234;map.regs[Clock::Gate]&=~Clock::gateBit(p.tc);c.tcSignalReady[p.tc]=true;
+   map.regs[0x46140]=(d+3)<<28|5;display13DeferredClocks[0]={&port,9,true};
+   const auto wells=map.regs[0x45404];map.regs[0x45404]|=1U<<10;map.regs[0x60400]=0x80000000U|((d+1)<<27);
+   assert(step(true)&&map.regs[p.pll]==0xcc000000&&map.regs[0x46140]==((d+3)<<28|5));
+   map.regs[0x60400]=0;map.regs[0x45404]=wells;
+   assert(step(true)&&!(map.regs[p.pll]&0xcc000000U)&&!c.bridge.nativeDDIRefs(d)&&!c.tcSignalReady[p.tc]);
+   assert(map.regs[0x46140]==5&&!display13DeferredClocks[0].pending);
+  }
   assert(!step(true)&&mode.phase==Mode::Phase::Idle&&!io.nativeMode()&&!(map.regs[p.buffer]&64)&&!c.tcObject[p.tc]);
   assert(!step(true)&&!display13TCReleaseEmpty[p.tc]&&!display13TCReleaseTries[p.tc]);
  }
