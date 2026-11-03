@@ -6794,12 +6794,21 @@ uint32_t XE::wrapDisplay13TCMode(OSObject *port,uint32_t wanted) {
     const auto preparation=framebufferLinkRequirements(port,selected).preparation(inherited);
     IO io{port,tc,reinterpret_cast<uint32_t (*)(OSObject *,uint32_t)>(self->display13TCBaseMode),preparation};
     const auto owner=reinterpret_cast<uintptr_t>(c.controller),object=reinterpret_cast<uintptr_t>(port);
+    // A replug can beat the retry tick. Finish the old disconnect first when the port is quiescent, so the connect starts from
+    // Idle with the new orientation; otherwise fall through to Mode::connect, which re-accepts a live port with the same lanes.
+    static uint32_t replug[3];
+    if(wanted && mode.disconnectPending && mode.phase==Display13TC::Mode::Phase::Active) {
+        const auto old=mode.disconnect(io,owner,object,ddi);++replug[0];
+        if(old.status==Display13TC::Status::Complete){++replug[1];c.tcSignalReady[tc]=false;c.tcDPLink[tc]={};}
+        else ++replug[2];
+    }
     const auto result=wanted?mode.connect(io,owner,object,ddi,wanted):mode.disconnect(io,owner,object,ddi);
     const bool done=result.status==Display13TC::Status::Complete;
     if(!wanted && done){c.tcSignalReady[tc]=false;c.tcDPLink[tc]={};OSSafeReleaseNULL(c.tcObject[tc]);}
     uint32_t record[]={2,ddi,wanted,uint32_t(result.status),uint32_t(result.phy.status),uint32_t(result.power.status),uint32_t(mode.phase),mode.disconnectPending,mode.lanes.mask,mode.lanes.pin};
     IOLockUnlock(c.lock);auto root=IORegistryEntry::getRegistryRoot();
     root->setProperty("WEXDisplay13TCMode",record,sizeof(record));
+    if(replug[0])root->setProperty("WEXDisplay13TCReplug",replug,sizeof(replug));
     char modeKey[40];snprintf(modeKey,sizeof(modeKey),"WEXDisplay13TCMode%u",ddi);root->setProperty(modeKey,record,sizeof(record));
     // Keep the initiating power-domain result; subsequent native getPG errors
     // can only observe the shared fault and cannot reconstruct this boundary.
