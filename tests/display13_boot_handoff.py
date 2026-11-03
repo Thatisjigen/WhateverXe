@@ -65,6 +65,7 @@ base=base.replace('struct XE {','''struct XE {
  static uint32_t wrapDisplay13WriteAUX(void*,uint32_t,void*,uint32_t);
  static bool display13BootPanelDSCOff(void*,unsigned);
  static uint32_t wrapDisplay13PortTraining(void*,void*);
+ static void display13TrainGate(uint32_t,void*,uint32_t){}
  uintptr_t display13DPImage=0,framebufferClockImage=0,tglPortByDDI=0;
  uintptr_t orgDisplay13TCEnableClocks=0,orgDisplay13TCDisableClocks=0;
  bool adlsDisplaySelected=false,dsiStopAttempted=false,dsiIRQParked=false,dsiResourcesReady=false;
