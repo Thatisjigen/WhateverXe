@@ -12,7 +12,8 @@ using namespace Display13TC;
 struct OSObject {alignas(8) uint8_t bytes[0x700]{};int refs=1;void retain(){++refs;}void release(){assert(refs>0);--refs;}const OSObject*getMetaClass(){return this;}unsigned getClassSize()const{return sizeof(bytes);}};
 struct IOWorkLoop {} workLoop;
 bool inGate=true;bool workLoopInGate(const IOWorkLoop*){return inGate;}
-struct IORegistryEntry {static IORegistryEntry*getRegistryRoot(){static IORegistryEntry r;return &r;}void setProperty(const char*,const void*,unsigned){}};
+struct IORegistryEntry {static IORegistryEntry*getRegistryRoot(){static IORegistryEntry r;return &r;}void setProperty(const char*,const void*,unsigned){}void*getProperty(const char*){return nullptr;}};
+#define IOLog(...) do{}while(0)
 struct MMIO {
  std::map<unsigned,unsigned> regs;std::vector<unsigned> writes,reads;bool noConnectorReads=false;
  bool readable(unsigned r){return regs.count(r);}
@@ -27,7 +28,8 @@ struct Context {
  Display13Power::NativeBridge bridge;Mode tcMode[4];OSObject *tcObject[4]{};MMIO *map=nullptr;
  alignas(8) uint8_t controllerBytes[0xe08]{},powerBytes[0x80]{};
  unsigned tcBusy[4]{};IOWorkLoop *workLoop=&::workLoop;
- void *controller=controllerBytes,*power=powerBytes,*lock=(void*)1;bool tcSignalReady[4]{},clockFaulted=false;
+ void *controller=controllerBytes,*power=powerBytes,*lock=(void*)1;bool tcSignalReady[4]{},clockFaulted=false,memoryFaulted=false,panelFaulted=false,tcBankFaulted=false;
+ unsigned firstFaultLine=0;struct Link{unsigned rate;} tcDPLink[4]{};
 } display13FBPower;
 struct Display13FBPowerIO {
  MMIO *map;
@@ -51,6 +53,7 @@ struct XE {
  static void wrapDisplay13DPPhyGating(void*,bool);
  static unsigned wrapDisplay13TCMode(OSObject*,unsigned);
  static void drainDisplay13TCMode(unsigned);
+ static bool display13TCReleaseStep(unsigned,bool);
 } instance,*callbackXE=&instance;
 // PRODUCTION_GATE
 struct Transport : Display13FBTCIO {
@@ -70,6 +73,11 @@ unsigned XE::wrapDisplay13TCMode(OSObject*p,unsigned wanted){
  if(result.status==Status::Complete){c.tcObject[d-3]=nullptr;p->release();return 0;}return 1;
 }
 // PRODUCTION_DRAIN
+static constexpr uint32_t display13TCReleaseEmptyTicks=3,display13TCReleaseLastResort=10,display13TCReleaseLimit=600;
+static uint32_t display13TCReleaseSeq,display13TCReleaseEmpty[4],display13TCReleaseTries[4];
+struct Display13DeferredClock {void *port {};uint32_t value {};bool pending {};};
+static Display13DeferredClock display13DeferredClocks[3];
+// PRODUCTION_RELEASE
 template<class T>void put(void*p,unsigned at,T value){memcpy(static_cast<uint8_t*>(p)+at,&value,sizeof(value));}
 int main(){
  for(unsigned d=3;d<=6;++d)for(unsigned gone:{0U,4U,0x2dU,UINT32_MAX})for(bool cleanup:{false,true}){
@@ -129,5 +137,49 @@ int main(){
   map.regs[p.laneAssignment()]=3U<<(8*(p.tc&1));map.regs[p.pinAssignment()]=4U<<(4*(p.tc&1));
   assert(mode.connect(io,who,obj,d,3).status==Status::Complete&&mode.lanes.mask==3&&io.owned(d));
  }
- puts("PASS real TC owner IO: lost HPD/mode/assignment, retained identity and power, clock stop then mode release, new orientation on reconnect");
+// A refused or never-requested mode 0 of a port that lost its sink: the retry tick, without the framebuffer's path removal.
+ for(unsigned d=3;d<=6;++d)for(bool asked:{false,true}) {
+  display13FBPower.~Context();new(&display13FBPower)Context;auto &c=display13FBPower;MMIO map;c.map=&map;
+  Port p;assert(Port::resolve(d,p));OSObject port;c.tcObject[p.tc]=&port;port.refs=2;
+  unsigned cfg[6]={d};put(port.bytes,0x548,cfg);put(port.bytes,0x120,d);
+  instance.adlnOutputWiring.dp=instance.adlnOutputWiring.typeC=1U<<d;
+  put(c.controller,0xc8,c.power);put(c.controller,0xc40,static_cast<void*>(&map));put(c.controller,0xe00,c.workLoop);
+  map.regs={{0x45404,0},{0x45444,0},{0x45454,0},{0x42000,0x8e380000},{p.ready,0x1d},{p.buffer,0x80},{p.pll,0},{p.clock,0},{Clock::Gate,0xa5000000|Clock::gateBit(p.tc)},
+   {p.laneAssignment(),12U<<(8*(p.tc&1))},{p.pinAssignment(),4U<<(4*(p.tc&1))},{0xc4000,0},{0x44470,1U<<(16+p.tc)},
+   {0x60400,0},{0x70008,0},{0x46140,0},{p.hip,0x01010101},{p.phyRegister(0xa0),0},{0x64310+256*p.tc,0}};
+  Display13FBPowerIO power{&map};assert(Display13Power::initialize(power,c.bridge.state,Display13Power::nativeDomains(0x7b)));c.bridge.begun=true;c.bridge.selectedPorts=0x78;
+  Transport io{&port,p.tc};auto &mode=c.tcMode[p.tc];const auto who=reinterpret_cast<uintptr_t>(c.controller),obj=reinterpret_cast<uintptr_t>(&port);
+  assert(mode.connect(io,who,obj,d,3).status==Status::Complete);
+  map.regs[0x46144]=map.regs[0x46148]=0;map.regs[0x61400]=map.regs[0x71008]=map.regs[0x62400]=map.regs[0x72008]=0;
+  const auto step=[&](bool gated){locked=true;const auto r=XE::display13TCReleaseStep(p.tc,gated);assert(locked);locked=false;return r;};
+  assert(!step(true)&&mode.phase==Mode::Phase::Active); // Sink present, nothing asked: not touched.
+  map.regs[0x64310+256*p.tc]=0x80000000; // AUX still busy: a refused release stays pending, then completes by itself.
+  if(asked) {assert(mode.disconnect(io,who,obj,d).status==Status::InUse&&mode.disconnectPending);assert(step(true)&&mode.disconnectPending);}
+  else {assert(step(true)==false&&!mode.disconnectPending);map.regs[0x44470]=0;assert(step(true)&&step(true)&&!mode.disconnectPending);assert(step(true)&&mode.disconnectPending);}
+  assert(step(false)&&mode.phase==Mode::Phase::Active&&io.nativeMode()==3); // Work loop gate busy: nothing happens.
+  c.tcBusy[p.tc]=1;assert(step(true)&&io.nativeMode()==3);c.tcBusy[p.tc]=0;
+  map.regs[0x64310+256*p.tc]=0;
+  if(!asked) {
+   // The native clock stop never came: a transcoder on the DDI blocks the stop, then the tick does it and the next one releases.
+   assert(c.bridge.getDDI(power,d).status==Display13Power::Status::Complete);
+   map.regs[p.pll]=0xcc000000;map.regs[p.clock]=0x80001234;map.regs[Clock::Gate]&=~Clock::gateBit(p.tc);c.tcSignalReady[p.tc]=true;
+   map.regs[0x46140]=(d+3)<<28|5;display13DeferredClocks[0]={&port,9,true};
+   const auto wells=map.regs[0x45404];map.regs[0x45404]|=1U<<10;map.regs[0x60400]=0x80000000U|((d+1)<<27);
+   assert(step(true)&&map.regs[p.pll]==0xcc000000&&map.regs[0x46140]==((d+3)<<28|5));
+   map.regs[0x60400]=0;map.regs[0x45404]=wells;
+   assert(step(true)&&!(map.regs[p.pll]&0xcc000000U)&&!c.bridge.nativeDDIRefs(d)&&!c.tcSignalReady[p.tc]);
+   assert(map.regs[0x46140]==5&&!display13DeferredClocks[0].pending);
+  }
+  assert(!step(true)&&mode.phase==Mode::Phase::Idle&&!io.nativeMode()&&!(map.regs[p.buffer]&64)&&!c.tcObject[p.tc]);
+  assert(!step(true)&&!display13TCReleaseEmpty[p.tc]&&!display13TCReleaseTries[p.tc]);
+  // A latch refuses the mode 0 for good: after 10 s without a sink the PHY alone goes back, never with the buffer on.
+  map.regs[p.ready]=0x1d;map.regs[0x44470]=1U<<(16+p.tc);c.tcObject[p.tc]=&port;port.refs=2;
+  assert(mode.connect(io,who,obj,d,3).status==Status::Complete);
+  map.regs[0x44470]=0;map.regs[0x64310+256*p.tc]=0x80000000;map.regs[p.buffer]|=1U<<31;
+  while(display13TCReleaseEmpty[p.tc]<9)assert(step(true)&&(map.regs[p.buffer]&64));
+  assert(step(true)&&(map.regs[p.buffer]&64));
+  map.regs[p.buffer]&=~(1U<<31);assert(step(true)&&!(map.regs[p.buffer]&64)&&mode.phase==Mode::Phase::Active);
+  display13TCReleaseEmpty[p.tc]=display13TCReleaseTries[p.tc]=0;
+ }
+ puts("PASS real TC owner IO: lost HPD/mode/assignment, retained identity and power, clock stop then mode release, new orientation on reconnect, retry tick");
 }
