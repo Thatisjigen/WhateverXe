@@ -147,6 +147,7 @@
   "-wex-reset-recover": [],
   "-wex-reset-trace": [],
   "-wex-scanout-coherent": [],
+  "-wex-hidpi-dbuf": [],
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
   "-wex-dsi-hdmi-test": [],
