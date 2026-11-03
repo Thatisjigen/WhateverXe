@@ -13,7 +13,7 @@ struct OSObject {alignas(8) uint8_t bytes[0x700]{};int refs=1;void retain(){++re
 struct IOWorkLoop {} workLoop;
 bool inGate=true;bool workLoopInGate(const IOWorkLoop*){return inGate;}
 struct IORegistryEntry {static IORegistryEntry*getRegistryRoot(){static IORegistryEntry r;return &r;}void setProperty(const char*,const void*,unsigned){}void*getProperty(const char*){return nullptr;}};
-#define SYSLOG(...) do{}while(0)
+#define IOLog(...) do{}while(0)
 struct MMIO {
  std::map<unsigned,unsigned> regs;std::vector<unsigned> writes,reads;bool noConnectorReads=false;
  bool readable(unsigned r){return regs.count(r);}
