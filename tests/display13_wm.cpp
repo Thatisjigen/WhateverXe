@@ -319,6 +319,14 @@ int main() {
     assert(clockFits(cursorClockPlan,400000000) && !clockFits(cursorClockPlan,399999999));
     clockPlan.pipePixelHz=200000000;clockPlan.pipeLineTime=pipeLineTime(p.htotal,clockPlan.pipePixelHz);
     assert(!clockFits(clockPlan,384000000));
+    // Behind a pipe scaler the primary and cursor rates may reach twice CDCLK, the pipe's own clock still CDCLK.
+    auto scaledPrimary=p;scaledPrimary.pixelHz=784000000;
+    auto scaledCursor=cursor;scaledCursor.pixelHz=784000000;
+    auto scaledPlan=committed.snapshot(scaledPrimary,&scaledCursor);
+    scaledPlan.pipePixelHz=441050000;scaledPlan.pipeLineTime=pipeLineTime(scaledPrimary.htotal,scaledPlan.pipePixelHz);
+    assert(clockFits(scaledPlan,1305600000) && clockFits(scaledPlan,882100000) && !clockFits(scaledPlan,882099999));
+    scaledCursor.pixelHz=1400000000;
+    assert(!clockFits(scaledPlan,1305600000));
     LatchIO afterCrawl(p);afterCrawl.clock=1305600000;
     assert(latch(afterCrawl,afterCrawl.snapshot(p)).status==Status::Complete && afterCrawl.writes.empty());
     LatchIO sameFrame(p);sameFrame.frozen=true;
