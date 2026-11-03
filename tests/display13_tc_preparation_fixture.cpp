@@ -48,6 +48,7 @@ struct Display13FBTCIO:Display13FBPowerIO {
  bool quiescent(unsigned d){return !(read(0x64000+256*d)&0x80000000);}
  // MODE_QUIESCENCE
 };
+#define IOLog(...) do{}while(0)
 struct XE {
  bool display13FramebufferRequested=true,display13FBTCHooksReady=true;XELP::Profile xeProfile;
  uint64_t adlnPlatform[0x1c0/sizeof(uint64_t)]{},tglPlatformCopy[0x1c0/sizeof(uint64_t)]{};Display13OutputWiring adlnOutputWiring;

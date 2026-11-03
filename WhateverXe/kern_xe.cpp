@@ -4864,6 +4864,7 @@ static void adlnFault(bool &flag,uint32_t line,uint32_t status=UINT32_MAX) {
         r[26]=display13FBIRQ.handlers;r[27]=display13FBIRQ.quiescing;r[28]=c.bridge.begun;r[29]=c.bridge.state.suspended;
         r[30]=c.bridge.pgRefs[0];r[31]=c.bridge.pgRefs[2];
         IORegistryEntry::getRegistryRoot()->setProperty("N97FBFirstResourceFault",r,sizeof(r));
+        IOLog("WEX first fault: line %u status 0x%x\n",line,status);
     }
     flag=true;
 }
@@ -6808,6 +6809,7 @@ uint32_t XE::wrapDisplay13TCMode(OSObject *port,uint32_t wanted) {
     uint32_t record[]={2,ddi,wanted,uint32_t(result.status),uint32_t(result.phy.status),uint32_t(result.power.status),uint32_t(mode.phase),mode.disconnectPending,mode.lanes.mask,mode.lanes.pin};
     IOLockUnlock(c.lock);auto root=IORegistryEntry::getRegistryRoot();
     root->setProperty("WEXDisplay13TCMode",record,sizeof(record));
+    IOLog("WEX tc mode: ddi %u wanted %u status %u phy %u power %u phase %u pending %u\n",ddi,wanted,record[3],record[4],record[5],record[6],record[7]);
     if(replug[0])root->setProperty("WEXDisplay13TCReplug",replug,sizeof(replug));
     char modeKey[40];snprintf(modeKey,sizeof(modeKey),"WEXDisplay13TCMode%u",ddi);root->setProperty(modeKey,record,sizeof(record));
     // Keep the initiating power-domain result; subsequent native getPG errors
@@ -6844,7 +6846,10 @@ void XE::drainDisplay13TCMode(unsigned ddi) {
         record[7]=wrapDisplay13TCMode(port,0);
         record[8]=Display13FBMemory::field<uint32_t>(port,0x550);port->release();
     }
-    if(pending)IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCDrain",record,sizeof(record));
+    if(pending) {
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCDrain",record,sizeof(record));
+        IOLog("WEX tc drain: ddi %u gated %u refs %u/%u linkcfg 0x%x result 0x%x mode %u\n",ddi,gated,record[4],record[5],record[6],record[7],record[8]);
+    }
 }
 
 void XE::wrapDisplay13TCEnableClocks(void *controller,void *raw,void *other,uint32_t *params) {
@@ -6915,6 +6920,7 @@ void XE::wrapDisplay13TCDisableClocks(void *controller,void *raw,void *other) {
     if(!ok)adlnFault(c.clockFaulted,__LINE__);
     uint32_t record[]={1,ddi,ok};IOLockUnlock(c.lock);
     IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCClockDisable",record,sizeof(record));
+    IOLog("WEX tc clock stop: ddi %u ok %u\n",ddi,ok);
 }
 uint32_t XE::wrapDisplay13TCSignal(void *raw,uint32_t swing,uint32_t emphasis,void *drive) {
     auto self=callbackXE;auto port=static_cast<OSObject *>(raw);auto &c=display13FBPower;
@@ -7143,7 +7149,7 @@ uint64_t XE::wrapDisplay13DPCDInfo(void *raw) {
     if(seen) {
         bytes[0x1E]=0;
         if(__atomic_add_fetch(&hidden,1,__ATOMIC_RELAXED)==1) {
-            SYSLOG("igfx","WEX typeC: ddi %u sink is MST-capable, capability hidden (SST only)",config[0]);
+            IOLog("WEX typeC: ddi %u sink is MST-capable, capability hidden (SST only)\n",config[0]);
             root->setProperty("WEXDisplay13SSTMasked",config[0],32);
         }
     }
@@ -7695,7 +7701,7 @@ void XE::display13TrainGate(uint32_t where,void *port,uint32_t pipe) {
  auto root=IORegistryEntry::getRegistryRoot();
  root->setProperty("WEXDisplay13TrainGate",record,sizeof(record));
  if(!root->getProperty("WEXDisplay13TrainGateFirst"))root->setProperty("WEXDisplay13TrainGateFirst",record,sizeof(record));
- if(n<=16)SYSLOG("igfx","WEX train gate: where %u ddi %u bits 0x%x mst %u/%u mode %u pipe %u first fault line %u",where,ddi,bits,record[8],record[5],mode,pipe,record[11]);
+ if(n<=16)IOLog("WEX train gate: where %u ddi %u bits 0x%x mst %u/%u mode %u pipe %u first fault line %u\n",where,ddi,bits,record[8],record[5],mode,pipe,record[11]);
 }
 
 // A DP Alt port that lost its sink has to give the PHY back, and the only route to that is one setPortMode(0) from the donor
@@ -7765,7 +7771,7 @@ bool XE::display13TCReleaseStep(unsigned tc,bool gated) {
   const auto buffer=io.read(p.buffer);
   if(buffer!=UINT32_MAX && !(buffer&0x80000000U) && (buffer&64)) {
    io.write(p.buffer,buffer&~64U);level=3;
-   SYSLOG("igfx","WEX tc release: ddi %u PHY handed back after %u s without the mode 0, buffer 0x%x",ddi,empty,buffer);
+   IOLog("WEX tc release: ddi %u PHY handed back after %u s without the mode 0, buffer 0x%x\n",ddi,empty,buffer);
   }
  }
  const bool released=mode.phase==Display13TC::Mode::Phase::Idle;
@@ -7777,8 +7783,8 @@ bool XE::display13TCReleaseStep(unsigned tc,bool gated) {
  auto root=IORegistryEntry::getRegistryRoot();
  if(!root->getProperty("WEXDisplay13TCReleaseFirst"))root->setProperty("WEXDisplay13TCReleaseFirst",record,sizeof(record));
  root->setProperty("WEXDisplay13TCRelease",record,sizeof(record));
- if(tries<=4 || released || !(tries%5))
-  SYSLOG("igfx","WEX tc release: ddi %u try %u empty %u phase %u pending %u gated %u busy %u refs %u/%u result 0x%x level %u buf 0x%x pll 0x%x aux 0x%x ready 0x%x faults 0x%x line %u",
+ if(tries<=90 || released || !(tries%10))
+  IOLog("WEX tc release: ddi %u try %u empty %u phase %u pending %u gated %u busy %u refs %u/%u result 0x%x level %u buf 0x%x pll 0x%x aux 0x%x ready 0x%x faults 0x%x line %u\n",
    ddi,tries,empty,record[2],record[3],gated,record[7],record[8],record[9],result,level,record[12],record[13],record[14],record[15],faults,record[18]);
  IOLockLock(c.lock);
  if(released)empty=tries=0;
@@ -7806,7 +7812,7 @@ void XE::display13TCReleaseTick(void *,void *) {
  const auto left=__atomic_load_n(&display13TCReleaseLeft,__ATOMIC_ACQUIRE);
  if(left) {
   uint32_t expected=left;__atomic_compare_exchange_n(&display13TCReleaseLeft,&expected,left-1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
-  if(!(left%10))SYSLOG("igfx","WEX tc watch: %u s left, phases 0x%x, again %u",left,phases,again);
+  if(!(left%10))IOLog("WEX tc watch: %u s left, phases 0x%x, again %u\n",left,phases,again);
  } else if(!again) {
   __atomic_store_n(&display13TCReleaseArmed,false,__ATOMIC_RELEASE);
   // An event between the load above and this store found the flag set and did not enter the call.
