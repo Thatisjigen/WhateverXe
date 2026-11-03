@@ -6189,7 +6189,9 @@ static uint32_t display13GammaEvents[48][5],display13GammaEventCount;
 // Sleep, red: the panel's EDID declares 8 bits per color and the framebuffer still offers WindowServer a second depth, 30 bits, which it takes.
 // The frame kept for the wake, what the plane shows until WindowServer's first one, is in ARGB8888 whatever the depth: at 30 bits its alpha byte lands in
 // red, so black reads as pure red and the rest as solarized colors. And each rearrangement of the displays goes through both depths. So a display whose
-// EDID says 8 bits gets 8 bits, as the other outputs. By framebuffer, from what the framebuffer itself reads; WEXDisplay13PanelDepth = {depths hidden, bits of FB0, FB1, FB2}.
+// EDID says 8 bits gets 8 bits, as the other outputs. WindowServer builds its list of modes before anyone reads the EDID, so the first answer must already be
+// right: by framebuffer, from the EDID injected for that connector (AAPLnn,override-no-connect), else from what the framebuffer reads. Its own modes it checks with
+// getPixelInformation, so that refuses the deeper depth too. WEXDisplay13PanelDepth = {depths hidden or refused, bits of FB0, FB1, FB2}.
 static uint32_t display13EDIDBits[3],display13PanelDepthRecord[4];
 
 // Sleep, red, a diagnostic with the trace boot-arg: what the pipes hold through a wake, read only. Times count from the wake's
@@ -7351,7 +7353,13 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             KernelPatcher::RouteRequest route(modeInfo,wrapDisplay13FBModeInfo,orgDisplay13FBModeInfo);
             depth=patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
         }
-        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(held?4U:0U)|(depth?8U:0U),32);
+        const char *pixelInfo="__ZN21AppleIntelFramebuffer19getPixelInformationEiiiP18IOPixelInformation";
+        const auto x=patcher.solveSymbol<mach_vm_address_t>(index,pixelInfo,address,size);patcher.clearError();
+        if(depth && x==address+0x324A4 && !memcmp(reinterpret_cast<void *>(x),frame,sizeof(frame))) {
+            KernelPatcher::RouteRequest route(pixelInfo,wrapDisplay13FBPixelInfo,orgDisplay13FBPixelInfo);
+            depth=patcher.routeMultipleShort(index,&route,1,address,size) ? 2 : 1;patcher.clearError();
+        }
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(held?4U:0U)|(depth?8U:0U)|(depth==2?16U:0U),32);
     }
     if(adlnOutputWiring.typeC)display13TCReleaseSetup();
     display13FBDPHooksReady=true;display13FBPower.tcSupported=true;return processDisplay13Training(patcher,index,address,size);
@@ -8651,13 +8659,31 @@ uint32_t XE::wrapDisplay13FBDDC(IOService *fb,int connection,uint32_t block,uint
     }
     return result;
 }
+static uint32_t display13DisplayBits(IOService *fb) {
+    const auto index=Display13FBMemory::field<uint32_t>(fb,0x1DC);
+    if(index>=arrsize(display13EDIDBits))return 0;
+    if(!display13EDIDBits[index]) {
+        auto controller=static_cast<IOService *>(display13FBPower.controller);
+        auto pci=controller ? controller->getProvider() : nullptr;
+        char key[32];snprintf(key,sizeof(key),"AAPL%02u,override-no-connect",index);
+        auto edid=pci ? OSDynamicCast(OSData,pci->getProperty(key)) : nullptr;
+        if(edid && edid->getLength()==128) {
+            display13EDIDBits[index]=TGLPanelDepth::maximum(static_cast<const uint8_t *>(edid->getBytesNoCopy()),128);
+            display13PanelDepthRecord[1+index]=display13EDIDBits[index];
+        }
+    }
+    return display13EDIDBits[index];
+}
 uint32_t XE::wrapDisplay13FBModeInfo(IOService *fb,int mode,void *info) {
     const auto result=FunctionCast(wrapDisplay13FBModeInfo,callbackXE->orgDisplay13FBModeInfo)(fb,mode,info);
     if(result || !info || !fb)return result;
-    const auto index=Display13FBMemory::field<uint32_t>(fb,0x1DC);
     auto depths=reinterpret_cast<uint32_t *>(info)+3; // IODisplayModeInformation.maxDepthIndex
-    if(index<arrsize(display13EDIDBits) && display13EDIDBits[index]==8 && *depths) {*depths=0;++display13PanelDepthRecord[0];}
+    if(*depths && display13DisplayBits(fb)==8) {*depths=0;++display13PanelDepthRecord[0];}
     return result;
+}
+uint32_t XE::wrapDisplay13FBPixelInfo(IOService *fb,int mode,int depth,int aperture,void *info) {
+    if(depth>0 && fb && display13DisplayBits(fb)==8) {++display13PanelDepthRecord[0];return kIOReturnUnsupported;}
+    return FunctionCast(wrapDisplay13FBPixelInfo,callbackXE->orgDisplay13FBPixelInfo)(fb,mode,depth,aperture,info);
 }
 uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,bool force) {
     auto config=Display13FBMemory::field<uint32_t *>(port,0x548);
