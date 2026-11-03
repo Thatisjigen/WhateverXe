@@ -10525,6 +10525,49 @@ void XE::stopDisplay13Engine(void *power,bool systemSuspend) {
 	if(acquiredGate)reinterpret_cast<void (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopOpen)(acquiredGate);
 }
 
+// Sleep, sleeptc on 0.7.0: a DP Alt port still connected at sleep keeps its TC AUX domain referenced; after S3 the
+// Type-C subsystem is reset, Display13TC::Aux::prepare fails and the wake restore stops with UnqualifiedTCAUX on domain 12, which
+// leaves the whole display dark. This override only comes at a system sleep. Release such a port here, as a hot unplug
+// does; its sink comes back through HPD at wake. With the pipes off the link can still hold its DDI reference and PLL: stop it first,
+// as display13TCReleaseStep does. WEXDisplay13SleepTC = {ports released, tc, link stop (0 not needed, 1 done, 2 refused), mode 0 result,
+// phase after, native DDI refs, native AUX refs, DDI buffer}.
+void XE::releaseDisplay13TCForSleep() {
+ auto self=callbackXE;auto &c=display13FBPower;
+ if(!c.lock || !self->display13FBTCHooksReady)return;
+ static uint32_t record[8];
+ for(unsigned tc=0;tc<4;++tc) {
+  const auto ddi=tc+3;uint32_t stop=0;
+  IOLockLock(c.lock);
+  auto port=c.tcObject[tc];
+  if(!port || !(self->adlnOutputWiring.typeC&(1U<<ddi)) || c.tcBusy[tc] || c.tcMode[tc].phase==Display13TC::Mode::Phase::Idle) {
+   IOLockUnlock(c.lock);continue;
+  }
+  port->retain();
+  Display13FBTCIO io{port,tc};Display13TC::Port p;
+  const bool resolved=Display13TC::Port::resolve(ddi,p);
+  if(resolved && !c.bridge.nativeAUXRefs(ddi) && io.quiescent(ddi)) {
+   const auto pll=io.read(p.pll);
+   if(pll!=UINT32_MAX && ((pll&0xcc000000U) || c.bridge.nativeDDIRefs(ddi))) {
+    for(unsigned pipe=0;pipe<3;++pipe) {
+     auto &deferred=display13DeferredClocks[pipe];if(deferred.port==port)deferred={};
+     const auto clock=io.read(0x46140+4*pipe);
+     if(clock!=UINT32_MAX && (clock>>28)==ddi+3)io.write(0x46140+4*pipe,clock&0x0fffffffU);
+    }
+    stop=Display13TC::Clock::stopLink(io,p)?1:2;
+    if(stop==1){c.tcSignalReady[tc]=false;c.tcDPLink[tc]={};}
+   }
+  }
+  IOLockUnlock(c.lock);
+  const auto result=wrapDisplay13TCMode(port,0);
+  IOLockLock(c.lock);
+  record[0]+=!result;record[1]=tc;record[2]=stop;record[3]=result;record[4]=static_cast<uint32_t>(c.tcMode[tc].phase);
+  record[5]=c.bridge.nativeDDIRefs(ddi);record[6]=c.bridge.nativeAUXRefs(ddi);record[7]=resolved && c.tcObject[tc]==port?io.read(p.buffer):UINT32_MAX;
+  IOLockUnlock(c.lock);port->release();
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepTC",record,sizeof(record));
+  IOLog("WEX sleep tc: ddi %u link stop %u mode 0 result 0x%x phase %u refs %u/%u\n",ddi,stop,result,record[4],record[5],record[6]);
+ }
+}
+
 void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	auto &c=display13FBPower;if(!c.lock || power!=c.power || !c.controller)return;
 	// The last hwShutdown can suspend the power banks before returning.
@@ -10536,6 +10579,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	// override(true) is only reached by the donor's simulator backend; our
 	// physical object has simulator=0. Do not force unrelated DDI/AUX domains.
 	if(!enable)stopDisplay13Engine(power,true);
+	if(!enable)releaseDisplay13TCForSleep();
 	uint64_t record[32] {},suspendIRQ[24] {};Display13Power::Result result;
 	IOWorkLoop *acquiredGate=nullptr;IOLockLock(c.lock);
 	if(callbackXE->display13FBLifecycleHooksReady && !enable && c.bridge.begun && !c.bridge.state.faulted &&
