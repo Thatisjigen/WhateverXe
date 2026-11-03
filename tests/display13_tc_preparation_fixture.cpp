@@ -110,6 +110,18 @@ int main(){
   if(result==0){assert(c.tcMode[ddi-3].ownership.active && c.tcMode[ddi-3].auxLease.owner);if(fault==1)assert(map.regs[0x64000+256*ddi]==before.at(0x64000+256*ddi));}
   for(unsigned other=3;other<=6;++other)if(other!=ddi){assert(map.regs[0x64000+256*other]==before.at(0x64000+256*other));assert(!c.tcMode[other-3].controller);}
   assert(!locked);++cases;
+  if(alt && fault==0) {
+   // A replug that finds the refused disconnect pending finishes it and connects on the new orientation.
+   auto &mode=c.tcMode[ddi-3];Display13TC::Port phy;Display13TC::Port::resolve(ddi,phy);
+   map.regs[phy.pll]=0;map.regs[0x64310+256*(ddi-3)]=0;map.regs[phy.laneAssignment()]=12U<<(8*(phy.tc&1));
+   mode.disconnectPending=true;const auto calls=nativeCalls;
+   assert(XE::wrapDisplay13TCMode(p,3)==0);
+   assert(!mode.disconnectPending && mode.lanes.mask==12 && nativeCalls==calls+2 && !locked);
+   // Not quiescent: the live port with the same lanes is re-accepted, without the native mode 0.
+   map.regs[0x64310+256*(ddi-3)]=0x80000000;mode.disconnectPending=true;
+   assert(XE::wrapDisplay13TCMode(p,3)==0);
+   assert(!mode.disconnectPending && mode.lanes.mask==12 && nativeCalls==calls+2 && !locked);
+  }
  }
  puts("PASS real TC mode entry: HDMI/fixedDP cold and validated GOP, missing route/identity/ownership refusal, mandatory power/ownership/AUX ordering and peer preservation; simulated MMIO");
 }
