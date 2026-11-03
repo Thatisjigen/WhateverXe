@@ -7696,7 +7696,7 @@ void XE::display13TrainGate(uint32_t where,void *port,uint32_t pipe) {
 // releasing it removed both. Linux does this job from a delayed work 1 s after the last link reference goes
 // (disconnect_phy_work, intel_tc.c). Retry from a 1 s thread call, armed by every DP Alt event and every refused mode 0;
 // the same ticks leave a line in the log for as long as the watch lasts, so a death shows the last state before it.
-static constexpr uint32_t display13TCReleaseWatch=120,display13TCReleaseEmptyTicks=3,display13TCReleaseLimit=600;
+static constexpr uint32_t display13TCReleaseWatch=120,display13TCReleaseEmptyTicks=3,display13TCReleaseLastResort=10,display13TCReleaseLimit=600;
 static thread_call_t display13TCReleaseCall;
 static bool display13TCReleaseArmed;
 static uint32_t display13TCReleaseLeft,display13TCReleaseSeq,display13TCReleaseEmpty[4],display13TCReleaseTries[4];
@@ -7747,6 +7747,16 @@ bool XE::display13TCReleaseStep(unsigned tc,bool gated) {
    }
    level=Display13TC::Clock::stopLink(io,p)?2:0x12;
    if(level==2){c.tcSignalReady[tc]=false;c.tcDPLink[tc]={};}
+  }
+ }
+ // Last resort, for a machine that otherwise dies within the minute: a bridge or TC bank latch refuses even the target, and
+ // the leases cannot be released under it. Hand back the PHY alone, buffer off as Ownership::release demands. The port stays
+ // dead until a reboot, and the record says whether the machine outlives the ownership bit with the leases still held.
+ if(result && empty>=display13TCReleaseLastResort && !c.tcBusy[tc] && mode.phase!=Display13TC::Mode::Phase::Idle) {
+  const auto buffer=io.read(p.buffer);
+  if(buffer!=UINT32_MAX && !(buffer&0x80000000U) && (buffer&64)) {
+   io.write(p.buffer,buffer&~64U);level=3;
+   SYSLOG("igfx","WEX tc release: ddi %u PHY handed back after %u s without the mode 0, buffer 0x%x",ddi,empty,buffer);
   }
  }
  const bool released=mode.phase==Display13TC::Mode::Phase::Idle;

@@ -73,7 +73,7 @@ unsigned XE::wrapDisplay13TCMode(OSObject*p,unsigned wanted){
  if(result.status==Status::Complete){c.tcObject[d-3]=nullptr;p->release();return 0;}return 1;
 }
 // PRODUCTION_DRAIN
-static constexpr uint32_t display13TCReleaseEmptyTicks=3,display13TCReleaseLimit=600;
+static constexpr uint32_t display13TCReleaseEmptyTicks=3,display13TCReleaseLastResort=10,display13TCReleaseLimit=600;
 static uint32_t display13TCReleaseSeq,display13TCReleaseEmpty[4],display13TCReleaseTries[4];
 struct Display13DeferredClock {void *port {};uint32_t value {};bool pending {};};
 static Display13DeferredClock display13DeferredClocks[3];
@@ -172,6 +172,14 @@ int main(){
   }
   assert(!step(true)&&mode.phase==Mode::Phase::Idle&&!io.nativeMode()&&!(map.regs[p.buffer]&64)&&!c.tcObject[p.tc]);
   assert(!step(true)&&!display13TCReleaseEmpty[p.tc]&&!display13TCReleaseTries[p.tc]);
+  // A latch refuses the mode 0 for good: after 10 s without a sink the PHY alone goes back, never with the buffer on.
+  map.regs[p.ready]=0x1d;map.regs[0x44470]=1U<<(16+p.tc);c.tcObject[p.tc]=&port;port.refs=2;
+  assert(mode.connect(io,who,obj,d,3).status==Status::Complete);
+  map.regs[0x44470]=0;map.regs[0x64310+256*p.tc]=0x80000000;map.regs[p.buffer]|=1U<<31;
+  while(display13TCReleaseEmpty[p.tc]<9)assert(step(true)&&(map.regs[p.buffer]&64));
+  assert(step(true)&&(map.regs[p.buffer]&64));
+  map.regs[p.buffer]&=~(1U<<31);assert(step(true)&&!(map.regs[p.buffer]&64)&&mode.phase==Mode::Phase::Active);
+  display13TCReleaseEmpty[p.tc]=display13TCReleaseTries[p.tc]=0;
  }
  puts("PASS real TC owner IO: lost HPD/mode/assignment, retained identity and power, clock stop then mode release, new orientation on reconnect, retry tick");
 }
