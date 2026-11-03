@@ -426,6 +426,8 @@ private:
     static void wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value);
     mach_vm_address_t orgDisplay13FBModeInfo {},orgDisplay13FBPixelInfo {};
     static uint32_t wrapDisplay13FBPixelInfo(IOService *fb,int mode,int depth,int aperture,void *info);
+    mach_vm_address_t orgDisplay13PlaneUpdate {};
+    static void wrapDisplay13PlaneUpdate(void *plane,bool arm);
     static uint32_t wrapDisplay13FBModeInfo(IOService *fb,int mode,void *info);
     static void holdDisplay13TCWake(IOService *fb);
     mach_vm_address_t orgAlderLakeNGamma10 {},adlnGammaTableUpdate {},orgAlderLakeNPreGamma {};
