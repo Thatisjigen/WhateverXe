@@ -80,6 +80,8 @@ uint32_t XE::wrapDisplay13SetPowerState(IOService *fb,uint32_t state) {
                 return callbackXE->dsiNativeWriterHooksReady && dsiNativeUpdateAllowed(fb) ? kIOReturnSuccess : kIOReturnNotReady;
             }
         }
+        // A DP Alt port released at sleep: give its sink time to come back before this framebuffer asks for it.
+        if(state==2)holdDisplay13TCWake(fb);
         if(state==2 && !prepareDisplay13Wake(fb))return kIOReturnNotReady;
         const bool enteringWake=state==2 && callbackXE->ownedDisplay13Framebuffer(fb) &&
             Display13FBMemory::field<uint32_t>(fb,0x4284)!=2;
