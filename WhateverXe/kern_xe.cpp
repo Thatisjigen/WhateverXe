@@ -7808,11 +7808,27 @@ bool XE::display13TCReleaseStep(unsigned tc,bool gated) {
  if(!mode.disconnectPending && empty<display13TCReleaseEmptyTicks) {tries=0;return empty!=0;}
  if(tries>=display13TCReleaseLimit)return false;
  ++tries;
- uint32_t result=UINT32_MAX;const uint32_t level=gated && !c.tcBusy[tc];
+ uint32_t result=UINT32_MAX,level=gated && !c.tcBusy[tc];
  if(level) {
   port->retain();IOLockUnlock(c.lock);
   result=wrapDisplay13TCMode(port,0);port->release();
   IOLockLock(c.lock);
+ }
+ // The native clock stop was refused or never came (a latch makes display13SSTPort null, and display13StopTranscoder then
+ // refuses it): with no sink, no transcoder on the DDI and the buffer off, nothing is left to order against. stopLink keeps
+ // its own checks and never puts an absent DDI reference, so a repeat is harmless; the next tick does the mode 0.
+ if(result && level && empty>=display13TCReleaseEmptyTicks && c.tcObject[tc]==port &&
+    !c.tcBusy[tc] && !c.bridge.nativeAUXRefs(ddi) && io.quiescent(ddi)) {
+  const auto pll=io.read(p.pll);
+  if(pll!=UINT32_MAX && ((pll&0xcc000000U) || c.bridge.nativeDDIRefs(ddi))) {
+   for(unsigned pipe=0;pipe<3;++pipe) {
+    auto &deferred=display13DeferredClocks[pipe];if(deferred.port==port)deferred={};
+    const auto clock=io.read(0x46140+4*pipe);
+    if(clock!=UINT32_MAX && (clock>>28)==ddi+3)io.write(0x46140+4*pipe,clock&0x0fffffffU);
+   }
+   level=Display13TC::Clock::stopLink(io,p)?2:0x12;
+   if(level==2){c.tcSignalReady[tc]=false;c.tcDPLink[tc]={};}
+  }
  }
  const bool released=mode.phase==Display13TC::Mode::Phase::Idle;
  const uint32_t faults=(c.memoryFaulted?1:0)|(c.clockFaulted?2:0)|(c.bridge.state.faulted?4:0)|(c.tcBankFaulted?8:0)|(c.panelFaulted?16:0);
