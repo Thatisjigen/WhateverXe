@@ -7195,6 +7195,32 @@ uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing
     return result;
 }
 
+// The donor's getDPCDInfo caches MSTM_CAP (DPCD 0x21 bit 0) at port+0x1E, and setupPort and setupClocks copy it into the
+// port's MST mode at +0x117. The Acer's USB-C dock is a Realtek MST branch, while display 13 drives SST only: with +0x117
+// set, framebufferLinkRequirements comes back empty, wrapDisplay13PortTraining returns NotReady and display13SSTPort no
+// longer knows the port, so the lease of a cold connect fails and its clock stop is refused. Hide the capability on the
+// typeC ports after every read, also a failed one, which may have stored it: the donor then keeps MSTM_CTRL at 0.
+uint64_t XE::wrapDisplay13DPCDInfo(void *raw) {
+    auto s=callbackXE;const auto result=FunctionCast(wrapDisplay13DPCDInfo,s->orgDisplay13DPCDInfo)(raw);
+    auto port=static_cast<OSObject *>(raw);
+    auto config=port && port->getMetaClass()->getClassSize()>=0x580 ? Display13FBMemory::field<uint32_t *>(port,0x548) : nullptr;
+    if(!config || config[0]>=7 || !(s->adlnOutputWiring.typeC&(1U<<config[0])))return result;
+    auto bytes=static_cast<uint8_t *>(raw);const uint32_t seen=bytes[0x1E];
+    static uint32_t reads,hidden;
+    const auto calls=__atomic_add_fetch(&reads,1,__ATOMIC_RELAXED);
+    auto root=IORegistryEntry::getRegistryRoot();
+    if(seen) {
+        bytes[0x1E]=0;
+        if(__atomic_add_fetch(&hidden,1,__ATOMIC_RELAXED)==1) {
+            SYSLOG("igfx","WEX typeC: ddi %u sink is MST-capable, capability hidden (SST only)",config[0]);
+            root->setProperty("WEXDisplay13SSTMasked",config[0],32);
+        }
+    }
+    uint32_t record[]={calls,__atomic_load_n(&hidden,__ATOMIC_RELAXED),config[0],seen,bytes[0x117]};
+    root->setProperty("WEXDisplay13DPCD",record,sizeof(record));
+    return result;
+}
+
 bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
     using namespace Display13TC::Native;
     // Do not alter the successful Combo machines' native mode-return behavior.
@@ -7255,6 +7281,18 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
         const bool applied=patcher.getError()==KernelPatcher::Error::NoError &&
             !memcmp(reinterpret_cast<void *>(address+change.offset),change.after,change.size);
         patcher.clearError();if(!applied)return false;
+    }
+    // Optional: on a mismatch only this route is skipped and an MST-capable sink stays dark, as before.
+    if(adlnOutputWiring.typeC) {
+        const char *info="__ZN14AppleIntelPort11getDPCDInfoEv";
+        const uint8_t frame[]={0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56};
+        const auto f=patcher.solveSymbol<mach_vm_address_t>(index,info,address,size);patcher.clearError();
+        uint32_t routed=0;
+        if(f==address+0x1DE0E && !memcmp(reinterpret_cast<void *>(f),frame,sizeof(frame))) {
+            KernelPatcher::RouteRequest route(info,wrapDisplay13DPCDInfo,orgDisplay13DPCDInfo);
+            routed=patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
+        }
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",routed?2U:0U,32);
     }
     display13FBDPHooksReady=true;display13FBPower.tcSupported=true;return processDisplay13Training(patcher,index,address,size);
 }
