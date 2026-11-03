@@ -6194,7 +6194,7 @@ static uint32_t display13EDIDBits[3],display13PanelDepthRecord[4];
 
 // Sleep, red, a diagnostic with the trace boot-arg: what the pipes hold through a wake, read only. Times count from the wake's
 // power restore. From the first modeset, 128 samples 100 ms apart, until the next sleep. WEXDisplay13WakeScanout, each sample = {ms, wells,
-// A: PLANE_CTL, SURF, SURFLIVE, STRIDE, frame counter, GAMMA_MODE, GGTT entry of SURF, first word there after 3 s if the aperture reaches it,
+// A: PLANE_CTL, SURF, SURFLIVE, STRIDE, frame counter, GAMMA_MODE, GGTT entry of SURF, 0,
 // B: PLANE_CTL, SURF, GAMMA_MODE, A: cursor control, plane 2 control, TRANSCONF}. A change of A's plane also goes to the log, to line it up
 // with the framebuffer's own lines.
 static bool display13ScanoutArmed,display13ScanoutStop;
@@ -6202,59 +6202,13 @@ static thread_call_t display13ScanoutCall;
 static uint32_t display13Scanout[128][16];
 static unsigned display13ScanoutNext;
 static uint64_t display13ScanoutStart;
-static IOMemoryMap *display13ApertureMap;
-static constexpr uint32_t display13StolenBytes=0x800000;
 static uint32_t display13ScanoutMs() {
 	uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-display13ScanoutStart,&ns);return static_cast<uint32_t>(ns/1000000);
 }
-// Sleep, red: while its SURF is 0, from the modeset of a wake to WindowServer's first frame and in the modesets of a rearrangement,
-// the panel's plane shows the first pages of the framebuffer's stolen pool. Something writes a frame of the desktop there after the pipe is off, in
-// some wakes and not in others (found at 4 s after a wake right after the sleep, not after a dark wake of 17 s); wrapDisplay13FBModeInfo keeps its
-// format right. The firmware's boot image is there too until cleared, in another layout. So the pool goes back to zeros once the pipe that shows it is
-// off, which is invisible, and what a wake then shows is a frame of this session or black. The CPU reaches stolen memory only through the aperture, and
-// the GPU is running then. Only if the GGTT still maps the pool linearly. The records, WEXDisplay13StolenSleep at that moment and, with the trace boot-arg,
-// WEXDisplay13StolenWake 3 s after the modeset of a wake, not cleared, a word per page: {ms, words, zeros, first other word, how many like it, OR, AND,
-// 1 if cleared, words left after clearing, 16 raw words}.
-static thread_call_t display13StolenCall;
-static void display13StolenSample(const char *key,bool clear) {
-	auto &c=display13FBPower;auto controller=static_cast<IOService *>(c.controller);
-	if(!controller || !c.map || c.map->getLength()!=0x1000000 || !c.map->getVirtualAddress())return;
-	auto pci=OSDynamicCast(IOPCIDevice,controller->getProvider());
-	if(!pci || !(pci->configRead16(4)&2))return;
-	if(!display13ApertureMap) {
-		auto aperture=pci->getDeviceMemoryWithRegister(0x18);
-		if(aperture && aperture->getLength()==0x10000000)
-			display13ApertureMap=aperture->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapInhibitCache,0,display13StolenBytes);
-	}
-	if(!display13ApertureMap || !display13ApertureMap->getVirtualAddress() || display13ApertureMap->getLength()!=display13StolenBytes)return;
-	const auto p=Display13FBMemory::pool(controller);
-	const auto regs=c.map->getVirtualAddress();const auto memory=display13ApertureMap->getVirtualAddress();
-	bool linear=p.state==1 && p.physical && p.bytes>=display13StolenBytes;
-	for(uint32_t page=0;linear && page<display13StolenBytes/4096;++page)
-		linear=*reinterpret_cast<volatile uint64_t *>(regs+0x800000+8*page)==((p.physical+uint64_t(page)*4096)|1);
-	if(!linear) {IOLog("WEX red: %s, the pool is not mapped linearly\n",key);return;}
-	uint32_t r[25] {display13ScanoutMs()};r[6]=UINT32_MAX;
-	for(uint32_t off=0;off<display13StolenBytes;off+=4096) {
-		const auto v=*reinterpret_cast<volatile uint32_t *>(memory+off);++r[1];
-		if(!v)++r[2];
-		else {if(!r[3])r[3]=v;if(v==r[3])++r[4];}
-		r[5]|=v;r[6]&=v;
-		if(!(off%0x80000))r[9+off/0x80000]=v;
-	}
-	if(clear && r[2]!=r[1] && r[6]!=UINT32_MAX) {
-		for(uint32_t off=0;off<display13StolenBytes;off+=8)*reinterpret_cast<volatile uint64_t *>(memory+off)=0;
-		r[7]=1;
-		for(uint32_t off=0;off<display13StolenBytes;off+=4096)if(*reinterpret_cast<volatile uint32_t *>(memory+off))++r[8];
-	}
-	IORegistryEntry::getRegistryRoot()->setProperty(key,r,sizeof(r));
-	IOLog("WEX red: %s +%u ms zeros %u/%u first 0x%x x%u or 0x%x and 0x%x cleared %u left %u\n",key,r[0],r[2],r[1],r[3],r[4],r[5],r[6],r[7],r[8]);
-}
-static void display13StolenFire(thread_call_param_t,thread_call_param_t) {display13StolenSample("WEXDisplay13StolenSleep",true);}
 static void display13ScanoutTick(thread_call_param_t,thread_call_param_t) {
 	auto &c=display13FBPower;constexpr unsigned samples=arrsize(display13Scanout);
 	if(!c.lock || !c.map || display13ScanoutNext>=samples)return;
 	if(!__atomic_load_n(&display13ScanoutStop,__ATOMIC_ACQUIRE)) {
-		if(display13ScanoutNext==30)display13StolenSample("WEXDisplay13StolenWake",false);
 		auto &r=display13Scanout[display13ScanoutNext];r[0]=display13ScanoutMs();
 		IOLockLock(c.lock);
 		const auto base=c.map->getVirtualAddress();
@@ -6266,8 +6220,6 @@ static void display13ScanoutTick(thread_call_param_t,thread_call_param_t) {
 				for(unsigned i=0;i<arrsize(regs);++i)r[2+i]=rd(regs[i]);
 				r[8]=rd(0x800000+(r[3]>>12)*8);
 				r[13]=rd(0x70080);r[14]=rd(0x70280);r[15]=rd(0x70008);
-				if((r[3]&~4095U)<display13StolenBytes && display13ScanoutNext>=30 && display13ApertureMap && (r[8]&1))
-					r[9]=*reinterpret_cast<volatile uint32_t *>(display13ApertureMap->getVirtualAddress()+(r[3]&~4095U));
 			}
 			if(Display13FBIRQ::powered(r[1],1)) {r[10]=rd(0x71180);r[11]=rd(0x7119C);r[12]=rd(0x4AC80);}
 		}
@@ -7889,7 +7841,6 @@ static uint32_t display13TCReleaseLeft,display13TCReleaseSeq,display13TCReleaseE
 void XE::display13TCReleaseSetup() {
  if(!display13TCReleaseCall)display13TCReleaseCall=thread_call_allocate(display13TCReleaseTick,nullptr);
  if(!display13ScanoutCall && display13TraceEnabled)display13ScanoutCall=thread_call_allocate(display13ScanoutTick,nullptr);
- if(!display13StolenCall)display13StolenCall=thread_call_allocate(display13StolenFire,nullptr);
  IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13TCReleaseReady",display13TCReleaseCall!=nullptr);
 }
 
@@ -8415,9 +8366,6 @@ void XE::wrapAlderLakeNGamma10(void *path,void *transaction,uint32_t control) {
 
 void XE::wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value) {
     if(display13DeferClock(access,reg,value,reinterpret_cast<uintptr_t>(__builtin_return_address(0))))return;
-    // Sleep, red: pipe A going off, not a write that leaves it off.
-    if(reg==0x70008 && !(value&(1U<<31)) && display13StolenCall && access==display13FBPower.access && display13FBPower.map &&
-       (*reinterpret_cast<volatile uint32_t *>(display13FBPower.map->getVirtualAddress()+0x70008)&(1U<<31)))thread_call_enter(display13StolenCall);
     // DISPLAY13_COMBO_FRACTION: qualified nominal writer, physical reference,
     // retained controller/manager. No MMIO or other port's PLL inference.
     if(callbackXE->display13FramebufferRequested && callbackXE->xeProfile.display==XELP::Display::XeLPD &&
