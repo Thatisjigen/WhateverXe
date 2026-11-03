@@ -6174,51 +6174,111 @@ static uint32_t display13ReplayPulse(Display13FBIRQIO &io) {
 	return pulse;
 }
 
-// Sleep, red, a diagnostic: the panel shows red from the modeset of a wake to WindowServer's first frame, about 1.4 s.
-// What pipe A holds meanwhile, read only, 16 samples 150 ms apart from the first modeset after a sleep. WEXDisplay13WakeScanout, each sample =
-// {ms, wells, PLANE_CTL, PLANE_COLOR_CTL, SURF, SURFLIVE, STRIDE, PIPE_BOTTOM_COLOR, GAMMA_MODE, CSC_MODE, PIPE_MISC, TRANSCONF, DE pipe IIR,
-// GGTT entry of SURF low, high, first word of that page, then the same 1 MiB into the surface: entry low, high, word}. Memory is read as
-// adlnObserveScanoutPixels reads it, through the direct map with nofault_copy: a page it cannot reach leaves the word at 0.
-static bool display13ScanoutArmed;
+// Sleep, palette: the palette RAM does not survive S3, and the native wake enables the pipe's gamma again without reloading
+// the table, which it reloads only at the next gamma change: WindowServer's fade, or never if the wake hangs before it. Until then every pixel
+// goes through whatever the RAM holds. So a copy of what the native driver last wrote goes back before the pipe is lit.
+static Display13Color::PaletteShadow display13Palette[3];
+static uint32_t display13PalettePending,display13PaletteVerify; // By pipe: the RAM may be lost, the copy went back and is not checked yet.
+// The same, a diagnostic. WEXDisplay13WakePalette, by pipe = {ms, by what: 1 plane enable, 2 GAMMA_MODE, 3 end of the modeset, entries different from
+// the copy before, after, the RAM at 0, 1, 512, 1023 before, the copy at the same four, 1 if it had to be written again}.
+// WEXDisplay13WakeGamma, each native upload from the wake = {ms, pipe, control, words, top of the table}.
+static uint32_t display13PaletteRecord[3][13],display13PaletteEvents[48][5],display13PaletteEventCount;
+
+// Sleep, red, a diagnostic with the trace boot-arg: what the pipes hold through a wake, read only. Times count from the wake's
+// power restore. From the first modeset, 128 samples 100 ms apart, until the next sleep. WEXDisplay13WakeScanout, each sample = {ms, wells,
+// A: PLANE_CTL, SURF, SURFLIVE, STRIDE, frame counter, GAMMA_MODE, GGTT entry of SURF, first word there after 3 s if the aperture reaches it,
+// B: PLANE_CTL, SURF, GAMMA_MODE, A: cursor control, plane 2 control, TRANSCONF}. A change of A's plane also goes to the log, to line it up
+// with the framebuffer's own lines.
+static bool display13ScanoutArmed,display13ScanoutStop;
 static thread_call_t display13ScanoutCall;
-static uint32_t display13Scanout[16][19];
+static uint32_t display13Scanout[128][16];
 static unsigned display13ScanoutNext;
 static uint64_t display13ScanoutStart;
+static IOMemoryMap *display13ApertureMap;
+static constexpr uint32_t display13StolenBytes=0x800000;
+static uint32_t display13ScanoutMs() {
+	uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-display13ScanoutStart,&ns);return static_cast<uint32_t>(ns/1000000);
+}
+// What a plane shows while its SURF is 0: the first pages of the framebuffer's stolen pool, the firmware's old frame unless someone cleared it.
+// The CPU reaches stolen memory only through the aperture, so only 3 s after the modeset, with the GPU running again. WEXDisplay13StolenWake, a word
+// per page: {ms, words, zeros, first other word, how many like it, OR, AND, 1 if cleared, words left after clearing, 16 raw words}.
+// Whatever is there is of no use: clear it. Only if the GGTT still maps the pool linearly.
+static void display13StolenSample(const char *key) {
+	auto &c=display13FBPower;auto controller=static_cast<IOService *>(c.controller);
+	if(!display13ScanoutCall || !controller || !c.map || c.map->getLength()!=0x1000000 || !c.map->getVirtualAddress())return;
+	auto pci=OSDynamicCast(IOPCIDevice,controller->getProvider());
+	if(!pci || !(pci->configRead16(4)&2))return;
+	if(!display13ApertureMap) {
+		auto aperture=pci->getDeviceMemoryWithRegister(0x18);
+		if(aperture && aperture->getLength()==0x10000000)
+			display13ApertureMap=aperture->createMappingInTask(kernel_task,0,kIOMapAnywhere|kIOMapInhibitCache,0,display13StolenBytes);
+	}
+	if(!display13ApertureMap || !display13ApertureMap->getVirtualAddress() || display13ApertureMap->getLength()!=display13StolenBytes)return;
+	const auto p=Display13FBMemory::pool(controller);
+	const auto regs=c.map->getVirtualAddress();const auto memory=display13ApertureMap->getVirtualAddress();
+	bool linear=p.state==1 && p.physical && p.bytes>=display13StolenBytes;
+	for(uint32_t page=0;linear && page<display13StolenBytes/4096;++page)
+		linear=*reinterpret_cast<volatile uint64_t *>(regs+0x800000+8*page)==((p.physical+uint64_t(page)*4096)|1);
+	if(!linear) {IOLog("WEX red: %s, the pool is not mapped linearly\n",key);return;}
+	uint32_t r[25] {display13ScanoutMs()};r[6]=UINT32_MAX;
+	for(uint32_t off=0;off<display13StolenBytes;off+=4096) {
+		const auto v=*reinterpret_cast<volatile uint32_t *>(memory+off);++r[1];
+		if(!v)++r[2];
+		else {if(!r[3])r[3]=v;if(v==r[3])++r[4];}
+		r[5]|=v;r[6]&=v;
+		if(!(off%0x80000))r[9+off/0x80000]=v;
+	}
+	if(r[2]!=r[1] && r[6]!=UINT32_MAX) {
+		for(uint32_t off=0;off<display13StolenBytes;off+=8)*reinterpret_cast<volatile uint64_t *>(memory+off)=0;
+		r[7]=1;
+		for(uint32_t off=0;off<display13StolenBytes;off+=4096)if(*reinterpret_cast<volatile uint32_t *>(memory+off))++r[8];
+	}
+	IORegistryEntry::getRegistryRoot()->setProperty(key,r,sizeof(r));
+	IOLog("WEX red: %s +%u ms zeros %u/%u first 0x%x x%u or 0x%x and 0x%x cleared %u left %u\n",key,r[0],r[2],r[1],r[3],r[4],r[5],r[6],r[7],r[8]);
+}
 static void display13ScanoutTick(thread_call_param_t,thread_call_param_t) {
-	auto &c=display13FBPower;if(!c.lock || !c.map || display13ScanoutNext>=16)return;
-	auto &r=display13Scanout[display13ScanoutNext];uint64_t ns=0;
-	absolutetime_to_nanoseconds(mach_absolute_time()-display13ScanoutStart,&ns);r[0]=static_cast<uint32_t>(ns/1000000);
-	IOLockLock(c.lock);
-	const auto base=c.map->getVirtualAddress();const bool mapped=base && c.map->getLength()==0x1000000;
-	auto rd=[&](uint32_t reg) {return *reinterpret_cast<volatile uint32_t *>(base+reg);};
-	if(mapped) {
-		r[1]=rd(0x45404);
-		if(Display13FBIRQ::powered(r[1],0)) {
-			constexpr uint32_t regs[] {0x70180,0x701CC,0x7019C,0x701AC,0x70188,0x70034,0x4A480,0x49028,0x70030,0x70008,0x44408};
-			for(unsigned i=0;i<arrsize(regs);++i)r[2+i]=rd(regs[i]);
-			for(unsigned n=0;n<2;++n) {
-				auto q=r+13+3*n;
-				const uint64_t entry=0x800000+((uint64_t(r[4])+(n ? 0x100000 : 0))>>12)*8;
-				if(entry+8>0x1000000)continue;
-				q[0]=rd(static_cast<uint32_t>(entry));q[1]=rd(static_cast<uint32_t>(entry+4));
-				const auto phys=((uint64_t(q[1])<<32)|q[0])&0x7FFFFFF000ULL;
-				if(!(q[0]&1) || !phys || !tglVM.enabled || !tglVM.nofault || !tglVM.directBase || phys>UINT64_MAX-tglVM.directBase)continue;
-				const auto cpu=tglVM.directBase+phys;
-				if(cpu<tglVM.directBase || cpu>=tglVM.directEnd || tglVM.directEnd-cpu<4)continue;
-				tglVM.nofault(cpu,reinterpret_cast<uintptr_t>(q+2),4);
+	auto &c=display13FBPower;constexpr unsigned samples=arrsize(display13Scanout);
+	if(!c.lock || !c.map || display13ScanoutNext>=samples)return;
+	if(!__atomic_load_n(&display13ScanoutStop,__ATOMIC_ACQUIRE)) {
+		if(display13ScanoutNext==30)display13StolenSample("WEXDisplay13StolenWake");
+		auto &r=display13Scanout[display13ScanoutNext];r[0]=display13ScanoutMs();
+		IOLockLock(c.lock);
+		const auto base=c.map->getVirtualAddress();
+		auto rd=[&](uint32_t reg) {return *reinterpret_cast<volatile uint32_t *>(base+reg);};
+		if(base && c.map->getLength()==0x1000000) {
+			r[1]=rd(0x45404);
+			if(Display13FBIRQ::powered(r[1],0)) {
+				constexpr uint32_t regs[] {0x70180,0x7019C,0x701AC,0x70188,0x70040,0x4A480};
+				for(unsigned i=0;i<arrsize(regs);++i)r[2+i]=rd(regs[i]);
+				r[8]=rd(0x800000+(r[3]>>12)*8);
+				r[13]=rd(0x70080);r[14]=rd(0x70280);r[15]=rd(0x70008);
+				if((r[3]&~4095U)<display13StolenBytes && display13ScanoutNext>=30 && display13ApertureMap && (r[8]&1))
+					r[9]=*reinterpret_cast<volatile uint32_t *>(display13ApertureMap->getVirtualAddress()+(r[3]&~4095U));
 			}
+			if(Display13FBIRQ::powered(r[1],1)) {r[10]=rd(0x71180);r[11]=rd(0x7119C);r[12]=rd(0x4AC80);}
+		}
+		IOLockUnlock(c.lock);
+		const auto last=display13ScanoutNext ? display13Scanout[display13ScanoutNext-1] : nullptr;
+		if(!last || last[2]!=r[2] || last[3]!=r[3])
+			IOLog("WEX red: +%u ms pipe A plane 0x%x surf 0x%x gamma 0x%x word 0x%x\n",r[0],r[2],r[3],r[7],r[9]);
+		if(++display13ScanoutNext<samples) {
+			uint64_t deadline;clock_interval_to_deadline(100,kMillisecondScale,&deadline);
+			thread_call_enter_delayed(display13ScanoutCall,deadline);
+			return;
 		}
 	}
-	IOLockUnlock(c.lock);
-	if(++display13ScanoutNext<16) {
-		uint64_t deadline;clock_interval_to_deadline(150,kMillisecondScale,&deadline);
-		thread_call_enter_delayed(display13ScanoutCall,deadline);
-	} else IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13WakeScanout",display13Scanout,sizeof(display13Scanout));
+	display13ScanoutNext=samples;
+	auto root=IORegistryEntry::getRegistryRoot();
+	root->setProperty("WEXDisplay13WakeScanout",display13Scanout,sizeof(display13Scanout));
+	root->setProperty("WEXDisplay13WakePalette",display13PaletteRecord,sizeof(display13PaletteRecord));
+	root->setProperty("WEXDisplay13WakeGamma",display13PaletteEvents,sizeof(display13PaletteEvents));
 }
 
 static void display13ScanoutBegin() {
 	if(!display13ScanoutCall || !__atomic_exchange_n(&display13ScanoutArmed,false,__ATOMIC_ACQ_REL))return;
-	display13ScanoutNext=0;display13ScanoutStart=mach_absolute_time();memset(display13Scanout,0,sizeof(display13Scanout));
+	if(!display13ScanoutStart)display13ScanoutStart=mach_absolute_time();
+	display13ScanoutNext=0;memset(display13Scanout,0,sizeof(display13Scanout));
+	__atomic_store_n(&display13ScanoutStop,false,__ATOMIC_RELEASE);
 	thread_call_enter(display13ScanoutCall);
 }
 
@@ -7140,6 +7200,7 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
     return result.status;
 }
 
+static void display13PaletteAfterMode();
 // Sleep, sleepirq: set when the sleep override, not the donor, turned display interrupts off; cleared once
 // they are on again.
 static bool display13SleepIRQOff {};
@@ -7196,6 +7257,7 @@ uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing
     const auto result=Display13TC::finishMode(
         [&](){return FunctionCast(wrapDisplay13TCSetMode,self->orgDisplay13TCSetMode)(controller,fb,timing);},
         [&](){reinterpret_cast<void (*)(void *,void *,uint32_t)>(self->display13TCNotify)(controller,fb,1);});
+    display13PaletteAfterMode();
     display13ScanoutBegin();
     // Sleep, sleepirq2: the wake restore cannot turn display interrupts back on in the dual-output wiring
     // (no pipe active yet: readActivePipes -> Topology). The first completed modeset after the
@@ -8120,6 +8182,95 @@ struct AlderLakeNGammaObservation {
     uint32_t writes[1024] {};
 };
 static AlderLakeNGammaObservation adlnGammaObservations[4];
+// Sleep, palette. The index register is one for the whole table, so never in the middle of another thread's upload.
+static bool display13PaletteBusy(unsigned pipe) {
+	const auto self=reinterpret_cast<uintptr_t>(current_thread());
+	for(auto &slot:adlnGammaObservations) {
+		const auto thread=__sync_fetch_and_add(&slot.thread,0);
+		if(thread && thread!=self && slot.indexReg==Display13Color::postIndex(pipe))return true;
+	}
+	return false;
+}
+static void display13PaletteLoad(uintptr_t base,unsigned pipe) {
+	const auto index=reinterpret_cast<volatile uint32_t *>(base+Display13Color::postIndex(pipe));
+	auto data=index+1;
+	*index=0x8000;
+	for(const auto value:display13Palette[pipe].table)*data=value;
+	*index=0;
+}
+static uint32_t display13PaletteCompare(uintptr_t base,unsigned pipe,uint32_t *ram=nullptr) {
+	const auto index=reinterpret_cast<volatile uint32_t *>(base+Display13Color::postIndex(pipe));
+	auto data=index+1;uint32_t different=0;
+	*index=0x8000;
+	for(unsigned i=0;i<1024;++i) {
+		const uint32_t value=*data;
+		if((value&0x3FFFFFFF)!=(display13Palette[pipe].table[i]&0x3FFFFFFF))++different;
+		if(ram) {
+			if(!i)ram[0]=value;else if(i==1)ram[1]=value;else if(i==512)ram[2]=value;else if(i==1023)ram[3]=value;
+		}
+	}
+	*index=0;
+	return different;
+}
+static void display13PaletteRestore(uintptr_t base,unsigned pipe,uint32_t source) {
+	const auto bit=1U<<pipe;auto &shadow=display13Palette[pipe];
+	if(!base || !shadow.complete || !(__atomic_load_n(&display13PalettePending,__ATOMIC_ACQUIRE)&bit) || display13PaletteBusy(pipe))return;
+	if(!(__atomic_fetch_and(&display13PalettePending,~bit,__ATOMIC_ACQ_REL)&bit))return;
+	if(display13TraceEnabled) {
+		auto &r=display13PaletteRecord[pipe];
+		r[0]=display13ScanoutStart ? display13ScanoutMs() : 0;r[1]=source;r[2]=display13PaletteCompare(base,pipe,r+4);
+		r[8]=shadow.table[0];r[9]=shadow.table[1];r[10]=shadow.table[512];r[11]=shadow.table[1023];
+	}
+	display13PaletteLoad(base,pipe);
+	__atomic_fetch_or(&display13PaletteVerify,bit,__ATOMIC_ACQ_REL);
+}
+// A native write on its way to the hardware: the copy follows the palette, and a pipe coming back gets its table first.
+static void display13PaletteWrite(void *access,uint64_t reg,uint32_t value) {
+	auto &c=display13FBPower;
+	if(access!=c.access)return;
+	if(reg<=0x4B480) {
+		const auto pipe=static_cast<unsigned>((reg-0x4A400)>>11);
+		if(pipe>=3)return;
+		switch(reg&0x7FF) {
+		case 0x400:display13Palette[pipe].index(value);break;
+		case 0x404:display13Palette[pipe].data(value);break;
+		case 0x480:if(c.map)display13PaletteRestore(c.map->getVirtualAddress(),pipe,2);break;
+		}
+		return;
+	}
+	if(reg<0x70008)return;
+	const auto pipe=static_cast<unsigned>((reg-0x70000)>>12);
+	if(pipe>=3)return;
+	switch(reg&0xFFF) {
+	case 0x008:if(!(value&(1U<<31)))__atomic_fetch_or(&display13PalettePending,1U<<pipe,__ATOMIC_ACQ_REL);break;
+	case 0x180:if((value&(1U<<31)) && c.map)display13PaletteRestore(c.map->getVirtualAddress(),pipe,1);break;
+	}
+}
+// The end of a modeset: a lit pipe that no plane or gamma write has brought here gets its table now, and the RAM must hold it.
+static void display13PaletteAfterMode() {
+	auto &c=display13FBPower;
+	const auto base=c.map ? c.map->getVirtualAddress() : 0;
+	if(!base || c.map->getLength()!=0x1000000)return;
+	const auto wells=*reinterpret_cast<volatile uint32_t *>(base+0x45404);
+	if(wells==UINT32_MAX)return;
+	for(unsigned pipe=0;pipe<3;++pipe) {
+		const auto bit=1U<<pipe;
+		if(!Display13FBIRQ::powered(wells,pipe) || !(*reinterpret_cast<volatile uint32_t *>(base+0x70008+0x1000*pipe)&(1U<<30)))continue;
+		display13PaletteRestore(base,pipe,3);
+		if(!(__atomic_load_n(&display13PaletteVerify,__ATOMIC_ACQUIRE)&bit) || display13PaletteBusy(pipe))continue;
+		__atomic_fetch_and(&display13PaletteVerify,~bit,__ATOMIC_ACQ_REL);
+		const auto different=display13PaletteCompare(base,pipe);
+		display13PaletteRecord[pipe][3]=different;
+		if(different) {display13PaletteLoad(base,pipe);display13PaletteRecord[pipe][12]=1;}
+	}
+}
+static void display13PaletteEvent(unsigned pipe,uint32_t control,uint32_t words,uint32_t top) {
+	if(!display13ScanoutCall || !display13ScanoutStart)return;
+	const auto n=__atomic_fetch_add(&display13PaletteEventCount,1,__ATOMIC_ACQ_REL);
+	if(n>=arrsize(display13PaletteEvents))return;
+	auto &e=display13PaletteEvents[n];
+	e[0]=display13ScanoutMs();e[1]=pipe;e[2]=control;e[3]=words;e[4]=top;
+}
 struct AlderLakeNPreGammaUpload {
     uintptr_t thread {};void *access {};uint32_t dataReg {};
     Display13Color::PreGammaStream stream;uint32_t source[35] {};
@@ -8293,6 +8444,7 @@ void XE::wrapAlderLakeNGamma10(void *path,void *transaction,uint32_t control) {
         r[105]=slot->maxWrites;r[106]=slot->maxFailure;
         for(unsigned i=0;i<6;++i) {r[107+i]=slot->maxOriginal[i];r[113+i]=slot->maxActual[i];}
     }
+    if(slot && slot->dataWrites && r[3]<3)display13PaletteEvent(static_cast<unsigned>(r[3]),control,slot->dataWrites,slot->writes[1023]);
     static uint32_t pipeCalls[3] {},uploadCalls[3] {};
     if(p && fb && r[3]<3) {
         const auto pipe=static_cast<unsigned>(r[3]);
@@ -8316,6 +8468,7 @@ void XE::wrapAlderLakeNGamma10(void *path,void *transaction,uint32_t control) {
 
 void XE::wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value) {
     if(display13DeferClock(access,reg,value,reinterpret_cast<uintptr_t>(__builtin_return_address(0))))return;
+    if(reg>=0x4A400 && reg<=0x72180)display13PaletteWrite(access,reg,value);
     // DISPLAY13_COMBO_FRACTION: qualified nominal writer, physical reference,
     // retained controller/manager. No MMIO or other port's PLL inference.
     if(callbackXE->display13FramebufferRequested && callbackXE->xeProfile.display==XELP::Display::XeLPD &&
@@ -10597,6 +10750,10 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 		clock_interval_to_absolutetime_interval(5,kSecondScale,&display13ReplayGap);
 		clock_interval_to_absolutetime_interval(60,kSecondScale,&display13ReplayWindow);
 		display13ReplayDue=0;display13ReplayTries=0;
+		__atomic_fetch_or(&display13PalettePending,7U,__ATOMIC_ACQ_REL);
+		__atomic_store_n(&display13ScanoutStop,true,__ATOMIC_RELEASE);
+		display13ScanoutStart=0;display13PaletteEventCount=0;
+		memset(display13PaletteRecord,0,sizeof(display13PaletteRecord));memset(display13PaletteEvents,0,sizeof(display13PaletteEvents));
 		__atomic_store_n(&display13ScanoutArmed,true,__ATOMIC_RELEASE);
 	}
 	// Sleep, sleepirq: the donor reaches the sleep override with the display interrupt master still on
@@ -10629,6 +10786,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 }
 void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 	auto &c=display13FBPower;if(!c.lock || power!=c.power || !c.controller)return;
+	if(__atomic_load_n(&display13ScanoutArmed,__ATOMIC_ACQUIRE))display13ScanoutStart=mach_absolute_time();
 	uint64_t record[32] {};Display13Power::Result result;IOLockLock(c.lock);
 	if(callbackXE->display13FBLifecycleHooksReady && c.bridge.begun && !c.bridge.state.faulted && !c.clockFaulted &&
 		Display13Power::objectAssociations(power,0x80,c.controller,0x1C20)) {
