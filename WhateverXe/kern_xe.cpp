@@ -7499,6 +7499,23 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             black=display13PlaneWatchCall && patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
         }
         IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(depth?8U:0U)|(depth==2?16U:0U)|(black?32U:0U),32);
+        // HDR. Off without the boot-args, each its own step. WEXHDRReady: 1 the donor's validation (-wex-hdr-modes), 2 the sysctl's text (-wex-hdr-sgx).
+        uint32_t hdrReady=0;
+        if(checkKernelArgument("-wex-hdr-modes")) {
+            const char *validate="__ZN21AppleIntelFramebuffer22validateDetailedTimingEPvy";
+            const auto v=patcher.solveSymbol<mach_vm_address_t>(index,validate,address,size);patcher.clearError();
+            if(v==address+0x2FFCA && !memcmp(reinterpret_cast<void *>(v),frame,sizeof(frame))) {
+                KernelPatcher::RouteRequest route(validate,wrapHDRValidateTiming,orgHDRValidateTiming);
+                if(patcher.routeMultipleShort(index,&route,1,address,size))hdrReady|=1;
+                patcher.clearError();
+            }
+        }
+        if(checkKernelArgument("-wex-hdr-sgx")) {
+            KernelPatcher::RouteRequest names("_cpuid_get_leaf7_feature_names",wrapHDRLeaf7Names,orgHDRLeaf7Names);
+            if(patcher.routeMultiple(KernelPatcher::KernelID,&names,1))hdrReady|=2;
+            patcher.clearError();
+        }
+        if(hdrReady)IORegistryEntry::getRegistryRoot()->setProperty("WEXHDRReady",hdrReady,32);
     }
     if(adlnOutputWiring.typeC)display13TCReleaseSetup();
     display13FBDPHooksReady=true;display13FBPower.tcSupported=true;return processDisplay13Training(patcher,index,address,size);
@@ -8824,6 +8841,28 @@ uint32_t XE::wrapDisplay13FBModeInfo(IOService *fb,int mode,void *info) {
 uint32_t XE::wrapDisplay13FBPixelInfo(IOService *fb,int mode,int depth,int aperture,void *info) {
     if(depth>0 && fb && display13DisplayBits(fb)==8) {++display13PanelDepthRecord[0];return kIOReturnUnsupported;}
     return FunctionCast(wrapDisplay13FBPixelInfo,callbackXE->orgDisplay13FBPixelInfo)(fb,mode,depth,aperture,info);
+}
+// macOS refuses HDR on an external display twice before the donor has any say. CoreDisplay's CGXIsHDRSupported, and EnableEDR with it, takes "SGX"
+// in machdep.cpu.leaf7_features as the sign of Skylake or later, and client CPUs of this age no longer have it. Only the text of that sysctl changes here,
+// its one caller in the kernel; no CPU feature does. Then AGDP's validateMode refuses an HDR timing unless bit 3 of its copy of DPCD 0x2210 is set for the
+// port, and it reads that register for the built-in port alone: an external port always fails, whatever the sink declares. The donor does not look at
+// dynamicRange when it validates, so AGDP judges the timing as SDR and WindowServer gets its HDR10 back. WEXHDRValidate = {HDR10 timings seen, accepted, last result}.
+static uint32_t hdrValidateRecord[3];
+char *XE::wrapHDRLeaf7Names(uint64_t features,char *buffer,uint32_t length) {
+    return FunctionCast(wrapHDRLeaf7Names,callbackXE->orgHDRLeaf7Names)(features|(1ULL<<2),buffer,length); // CPUID_LEAF7_FEATURE_SGX
+}
+uint32_t XE::wrapHDRValidateTiming(IOService *fb,void *description,unsigned long long size) {
+    const auto original=FunctionCast(wrapHDRValidateTiming,callbackXE->orgHDRValidateTiming);
+    if(!description || size!=0xCC)return original(fb,description,size);
+    // IOFBDisplayModeDescription: timingInfo.detailedInfo.v2.dynamicRange. 2 kIODynamicRangeHDR10, 1 kIODynamicRangeSDR.
+    auto range=reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(description)+0xBA);
+    if(*range!=2)return original(fb,description,size);
+    *range=1;
+    const auto result=original(fb,description,size);
+    *range=2;
+    ++hdrValidateRecord[0];hdrValidateRecord[1]+=result==kIOReturnSuccess;hdrValidateRecord[2]=result;
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXHDRValidate",hdrValidateRecord,sizeof(hdrValidateRecord));
+    return result;
 }
 uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,bool force) {
     auto config=Display13FBMemory::field<uint32_t *>(port,0x548);

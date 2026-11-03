@@ -429,6 +429,9 @@ private:
     mach_vm_address_t orgDisplay13PlaneUpdate {};
     static void wrapDisplay13PlaneUpdate(void *plane,bool arm);
     static uint32_t wrapDisplay13FBModeInfo(IOService *fb,int mode,void *info);
+    mach_vm_address_t orgHDRValidateTiming {},orgHDRLeaf7Names {};
+    static uint32_t wrapHDRValidateTiming(IOService *fb,void *description,unsigned long long size);
+    static char *wrapHDRLeaf7Names(uint64_t features,char *buffer,uint32_t length);
     static void holdDisplay13TCWake(IOService *fb);
     mach_vm_address_t orgAlderLakeNGamma10 {},adlnGammaTableUpdate {},orgAlderLakeNPreGamma {};
     bool processDisplay13FramebufferColor(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
