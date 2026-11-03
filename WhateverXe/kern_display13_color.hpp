@@ -25,19 +25,6 @@ inline uint32_t observationRegister(unsigned pipe,uint32_t reg) {
         (reg>=0x4A400 && reg<0x4A800) ? 0x800*pipe : 0x1000*pipe;
     return reg+bank;
 }
-// Sleep, palette: the post-CSC palette as the native driver last wrote it, following the palette's own index register.
-// complete: a whole table has been written at least once.
-struct PaletteShadow {
-    uint32_t table[1024] {},cursor {},run {};
-    bool increment {},complete {};
-    void index(uint32_t value) {cursor=value&1023;increment=(value&0x8000)!=0;run=0;}
-    void data(uint32_t value) {
-        table[cursor]=value;
-        if(!increment)return;
-        cursor=(cursor+1)&1023;
-        if(++run>=1024)complete=true;
-    }
-};
 // Display12 has 33 uniform knots [0,1] plus two extended-range knots.
 // Display13 has 129 uniform knots plus the SAME two extended-range knots.
 // Linear subdivision preserves the donor curve instead of replacing it with

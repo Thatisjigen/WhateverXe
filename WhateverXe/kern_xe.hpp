@@ -397,6 +397,8 @@ private:
     static uint32_t wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,bool force);
     static uint32_t wrapDisplay13GMBusRead(void *access,uint64_t reg);
     static void wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value);
+    mach_vm_address_t orgDisplay13FBPowerState {};
+    static uint32_t wrapDisplay13FBPowerState(IOService *fb,uint32_t state);
     mach_vm_address_t orgAlderLakeNGamma10 {},adlnGammaTableUpdate {},orgAlderLakeNPreGamma {};
     bool processDisplay13FramebufferColor(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size);
     static void wrapAlderLakeNGamma10(void *path,void *transaction,uint32_t control);
