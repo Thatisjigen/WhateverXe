@@ -375,6 +375,7 @@ private:
     static void display13TCReleaseArm();
     static void display13TCReleaseTick(void *,void *);
     static bool display13TCReleaseStep(unsigned,bool);
+    static void releaseDisplay13TCForSleep();
     static void wrapDisplay13TCEnableClocks(void *,void *,void *,uint32_t *);
     static void wrapDisplay13TCDisableClocks(void *,void *,void *);
     static uint32_t wrapDisplay13TCSignal(void *,uint32_t,uint32_t,void *);
