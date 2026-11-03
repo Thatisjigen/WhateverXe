@@ -11256,7 +11256,9 @@ static bool gpuResetTraceSerialize(void *,void *,OSSerialize *serializer) {
  for(uint32_t i=n-used;i<n;++i)out->appendBytes(&gpuResetTraceRing[i%arrsize(gpuResetTraceRing)],sizeof(GPUResetTraceEntry));
  const bool result=out->serialize(serializer);out->release();return result;
 }
-// -wex-reset-restore: on this GPU the hung work sits on the donor's second
+// -wex-reset-recover (retropineaple's -wex-reset-restore: with "-restore" in the boot-args crash reports went to /mnt5 and
+// ReportCrash aborted, on every boot that carried it and none other, so the name changes here):
+// on this GPU the hung work sits on the donor's second
 // ring (0x1A000 block), whose reset uses the render GDRST domain (mask 2) but
 // whose restore list only names its own 0x1A000 registers. The render
 // engine's mode, status-page and chicken registers are therefore cleared and
@@ -11559,7 +11561,7 @@ static bool gpuResetTraceInstall(KernelPatcher &patcher,size_t index,mach_vm_add
   patcher.clearError();
  }
  __atomic_store_n(&gpuResetTraceOn,ready,__ATOMIC_RELEASE);
- if(ready && checkKernelArgument("-wex-reset-restore")) {
+ if(ready && checkKernelArgument("-wex-reset-recover")) {
   static const uint8_t wake[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
   auto at=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator13SafeForceWakeEbj",address,size);
   patcher.clearError();
@@ -11616,7 +11618,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  const bool surfaceABIReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,false);
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
- if(checkKernelArgument("-wex-reset-trace") || checkKernelArgument("-wex-reset-restore"))
+ if(checkKernelArgument("-wex-reset-trace") || checkKernelArgument("-wex-reset-recover"))
   gpuResetTraceInstall(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.
