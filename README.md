@@ -84,6 +84,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - GPU selection is automatic; a `device-id` override is normally unnecessary.
 - Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P select tiling automatically. Do not use `-yTileDisable`; `AAPL,GfxYTile` is unnecessary.
 - Temporary development diagnostic: `-wex-reset-trace` records each GPU hang recovery step (channel restart, engine reset, scheduler reset and resume, command-streamer reset) with the render engine's reset and ring registers in the `WEXGPUResetTrace` registry property. It does not change recovery.
+- On a machine with a USB-C DP Alt output, the panel's plane stays off from a modeset to WindowServer's next frame, so its base memory, an old image, is not shown. `-wex-panel-base-visible` shows it as before.
 - Experimental: `-wex-reset-recover` saves the render engine's mode, status-page, chicken and user-mode whitelist registers and its cache-control (MOCS and L3) tables just before a render-domain GPU hang reset and writes them back after the reset, before work is replayed, on GPUs where the reset clears them, and completes stamps whose work the reset lost: two seconds after the reset, and later whenever a waiter times out on one that has stopped moving. It also enables the reset trace.
 
 ## Tested features and known issues

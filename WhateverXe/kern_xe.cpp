@@ -6250,6 +6250,60 @@ static void display13ScanoutBegin() {
 	thread_call_enter(display13ScanoutCall);
 }
 
+// Sleep, black. From a modeset to WindowServer's next frame the panel's plane stays on its framebuffer's base memory: at wake and
+// whenever the displays are rearranged. That memory holds an old image, the boot logo or a desktop frame, and clearing it would take the
+// aperture, first suspect of an earlier panic. So the plane stays off in that interval and the pipe shows black. Only the
+// write of the control changes, the cache keeps its enable bit, and the flip programs the control again. Not before the first real frame of
+// this boot, so the boot screen and a panic's text stay visible; if no flip comes within 10 s the watch turns the plane back on.
+// WEXDisplay13PlaneBlack = {writes turned off, flips that put back the cached enable, turned on by the watch, PIPE_BOTTOM_COLOR_A}.
+static void *display13PanelPlane;
+static bool display13PlaneOff;
+static thread_call_t display13PlaneWatchCall;
+static uint32_t display13PlaneRecord[4];
+static void display13PlaneWatch(thread_call_param_t,thread_call_param_t) {
+	auto &c=display13FBPower;
+	if(!c.lock || !c.map)return;
+	IOLockLock(c.lock);
+	const auto base=c.map->getVirtualAddress();
+	auto reg=[&](uint32_t r)->volatile uint32_t & {return *reinterpret_cast<volatile uint32_t *>(base+r);};
+	if(base && c.map->getLength()==0x1000000 && Display13FBIRQ::powered(reg(0x45404),0)) {
+		const uint32_t control=reg(0x70180);
+		display13PlaneRecord[3]=reg(0x70034);
+		if(control!=UINT32_MAX && control && !(control&0x80000000U)) {
+			reg(0x70180)=control|0x80000000U;
+			reg(0x7019C)=reg(0x7019C);
+			++display13PlaneRecord[2];
+		}
+	}
+	IOLockUnlock(c.lock);
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13PlaneBlack",display13PlaneRecord,sizeof(display13PlaneRecord));
+}
+static uint32_t display13PanelPlaneControl(uint32_t value) {
+	const auto plane=__atomic_load_n(&display13PanelPlane,__ATOMIC_ACQUIRE);
+	if(!plane || !(value&0x80000000U))return value;
+	const auto fb=Display13FBMemory::field<const void *>(plane,0x68);
+	if(!fb || Display13FBMemory::field<uint32_t>(plane,0x120)!=Display13FBMemory::field<uint32_t>(fb,0x4330))return value;
+	__atomic_store_n(&display13PlaneOff,true,__ATOMIC_RELEASE);
+	++display13PlaneRecord[0];
+	uint64_t deadline;clock_interval_to_deadline(10,kSecondScale,&deadline);
+	thread_call_enter_delayed(display13PlaneWatchCall,deadline);
+	return value&~0x80000000U;
+}
+void XE::wrapDisplay13PlaneUpdate(void *plane,bool arm) {
+	if(Display13FBMemory::field<uint32_t>(plane,0x98)==0x70180) {
+		const auto fb=Display13FBMemory::field<const void *>(plane,0x68);
+		if(fb && Display13FBMemory::field<uint32_t>(plane,0x120)!=Display13FBMemory::field<uint32_t>(fb,0x4330)) {
+			__atomic_store_n(&display13PanelPlane,plane,__ATOMIC_RELEASE);
+			// The cache may have read the register while it was off: hwUpdateRegCache, when a path is allocated.
+			if(__atomic_exchange_n(&display13PlaneOff,false,__ATOMIC_ACQ_REL)) {
+				auto &control=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(plane)+0x100);
+				if(!(control&0x80000000U)) {control|=0x80000000U;++display13PlaneRecord[1];}
+			}
+		}
+	}
+	FunctionCast(wrapDisplay13PlaneUpdate,callbackXE->orgDisplay13PlaneUpdate)(plane,arm);
+}
+
 void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t *aux,uint32_t *hotplug) {
 	// Original ProcessInterrupt holds c+90 here. Keep its real VBL/flip and
 	// DSB busy retirement, atomic E08/E0C/E10 queue and native SW source.
@@ -7359,7 +7413,16 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             KernelPatcher::RouteRequest route(pixelInfo,wrapDisplay13FBPixelInfo,orgDisplay13FBPixelInfo);
             depth=patcher.routeMultipleShort(index,&route,1,address,size) ? 2 : 1;patcher.clearError();
         }
-        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(held?4U:0U)|(depth?8U:0U)|(depth==2?16U:0U),32);
+        // Sleep, black. Optional: on a mismatch, or with -wex-panel-base-visible, a modeset shows the base memory, as before.
+        const char *planeUpdate="__ZN15AppleIntelPlane11updatePlaneEb";
+        const auto p=patcher.solveSymbol<mach_vm_address_t>(index,planeUpdate,address,size);patcher.clearError();
+        uint32_t black=0;
+        if(!checkKernelArgument("-wex-panel-base-visible") && p==address+0x1B68 && !memcmp(reinterpret_cast<void *>(p),frame,sizeof(frame))) {
+            display13PlaneWatchCall=thread_call_allocate(display13PlaneWatch,nullptr);
+            KernelPatcher::RouteRequest route(planeUpdate,wrapDisplay13PlaneUpdate,orgDisplay13PlaneUpdate);
+            black=display13PlaneWatchCall && patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
+        }
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(held?4U:0U)|(depth?8U:0U)|(depth==2?16U:0U)|(black?32U:0U),32);
     }
     if(adlnOutputWiring.typeC)display13TCReleaseSetup();
     display13FBDPHooksReady=true;display13FBPower.tcSupported=true;return processDisplay13Training(patcher,index,address,size);
@@ -8393,6 +8456,7 @@ void XE::wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value) {
            access==display13FBPower.access && cursorBase && Display13FBMemory::field<uintptr_t>(access,0x50)==cursorBase)
             value=Display13Cursor::controlWrite(reg,value);
     }
+    if(reg==0x70180)value=display13PanelPlaneControl(value);
     const auto caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     adlnObserveGMBus(true,reg,value,caller,callbackXE->adlnGMBusFunction);
     if(reg>=0x4A484 && reg<=0x4B488) {
