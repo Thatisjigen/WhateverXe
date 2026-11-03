@@ -77,3 +77,9 @@ if len(sys.argv)>1:
  assert b[0x339e4]==0xe8 and 0x339e9+int.from_bytes(b[0x339e5:0x339e9],'little',signed=True)==0x5173a
  assert 0x51d29+int.from_bytes(b[0x51d25:0x51d29],'little',signed=True)==0x5b464
 print('PASS shutdown mode0: live-port exclusion, gate contention, native errors, retry/idempotence, cleanup before power suspend, donor power-off/restart callsites')
+# tcreplay: the port released at sleep is remembered, and the pulse only goes out once a pipe is lit.
+release=s[s.index('void XE::releaseDisplay13TCForSleep('):s.index('void XE::wrapAlderLakeNPowerOverride(')]
+assert '__atomic_fetch_or(&display13ReplayPorts,1U<<tc' in release
+pulse=s[s.index('static uint32_t display13ReplayPulse('):s.index('static bool display13ScanoutArmed')]
+assert 'display13FBIRQ.state.active' in pulse and 'Phase::Idle' in pulse and 'display13ReplayEnd' in pulse
+assert '*aux|=pulse' in s[s.index('void XE::wrapDisplay13FBProcessDE('):s.index('bool XE::processDisplay13FramebufferGTT(')]
