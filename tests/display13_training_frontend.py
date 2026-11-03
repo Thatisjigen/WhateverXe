@@ -21,6 +21,7 @@ code=code.replace('struct XE {','''struct XE {
  unsigned trainingLeaseDP13Mask=0;IORecursiveLock *tglPathPoolLock=nullptr;
  uintptr_t orgDisplay13PortTraining=0,orgTGLPathLookup=0,tglPortByDDI=0,display13DPImage=0;
  static uint32_t wrapDisplay13PortTraining(void*,void*);
+ static void display13TrainGate(uint32_t,void*,uint32_t){}
  static bool display13DeferClock(void*,uint64_t,uint32_t,uintptr_t);
 '''.replace('LEASE',lease))
 code=code.replace('static bool display13StopTranscoder(void*){assert(false);return false;}','static bool display13StopTranscoder(void*);')
