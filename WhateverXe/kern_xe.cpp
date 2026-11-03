@@ -6186,6 +6186,11 @@ static uint32_t display13ReplayPulse(Display13FBIRQIO &io) {
 // Sleep, red, a diagnostic with the trace boot-arg. WEXDisplay13WakeGamma, each native palette upload from the wake = {ms, pipe, control, words,
 // top of the table}. The native wake loads the table itself: zeros with the first GAMMA_MODE write, the real table about 300 ms later.
 static uint32_t display13GammaEvents[48][5],display13GammaEventCount;
+// Sleep, red: the panel's EDID declares 8 bits per color and the framebuffer still offers WindowServer a second depth, 30 bits, which it takes.
+// The frame kept for the wake, what the plane shows until WindowServer's first one, is in ARGB8888 whatever the depth: at 30 bits its alpha byte lands in
+// red, so black reads as pure red and the rest as solarized colors. And each rearrangement of the displays goes through both depths. So a display whose
+// EDID says 8 bits gets 8 bits, as the other outputs. By framebuffer, from what the framebuffer itself reads; WEXDisplay13PanelDepth = {depths hidden, bits of FB0, FB1, FB2}.
+static uint32_t display13EDIDBits[3],display13PanelDepthRecord[4];
 
 // Sleep, red, a diagnostic with the trace boot-arg: what the pipes hold through a wake, read only. Times count from the wake's
 // power restore. From the first modeset, 128 samples 100 ms apart, until the next sleep. WEXDisplay13WakeScanout, each sample = {ms, wells,
@@ -6202,16 +6207,16 @@ static constexpr uint32_t display13StolenBytes=0x800000;
 static uint32_t display13ScanoutMs() {
 	uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-display13ScanoutStart,&ns);return static_cast<uint32_t>(ns/1000000);
 }
-// Sleep, red: while its SURF is 0, from the modeset of a wake to WindowServer's first frame (about 1.6 s) and in the modesets of a
-// rearrangement, the panel's plane shows the first pages of the framebuffer's stolen pool. They hold an old frame of the desktop in ARGB8888, and
-// the plane has the framebuffer's depth: at 30 bits (92001008) the alpha byte lands in the red channel, so a black pixel, 0xFF000000, reads as pure
-// red and anything else as a colored mess. So the pool goes back to zeros, black at any depth, once the pipe that shows it is off: that is after
-// WindowServer's images for the sleep (displayWillSleepWithImages), and invisible. The CPU reaches stolen memory only through the aperture, and the
-// GPU is running then. Only if the GGTT still maps the pool linearly. The records, WEXDisplay13StolenSleep at that moment and, with the trace boot-arg,
-// WEXDisplay13StolenWake 3 s after the modeset of a wake, a word per page: {ms, words, zeros, first other word, how many like it, OR, AND, 1 if cleared,
-// words left after clearing, 16 raw words}.
+// Sleep, red: while its SURF is 0, from the modeset of a wake to WindowServer's first frame and in the modesets of a rearrangement,
+// the panel's plane shows the first pages of the framebuffer's stolen pool. Something writes a frame of the desktop there after the pipe is off, in
+// some wakes and not in others (found at 4 s after a wake right after the sleep, not after a dark wake of 17 s); wrapDisplay13FBModeInfo keeps its
+// format right. The firmware's boot image is there too until cleared, in another layout. So the pool goes back to zeros once the pipe that shows it is
+// off, which is invisible, and what a wake then shows is a frame of this session or black. The CPU reaches stolen memory only through the aperture, and
+// the GPU is running then. Only if the GGTT still maps the pool linearly. The records, WEXDisplay13StolenSleep at that moment and, with the trace boot-arg,
+// WEXDisplay13StolenWake 3 s after the modeset of a wake, not cleared, a word per page: {ms, words, zeros, first other word, how many like it, OR, AND,
+// 1 if cleared, words left after clearing, 16 raw words}.
 static thread_call_t display13StolenCall;
-static void display13StolenSample(const char *key) {
+static void display13StolenSample(const char *key,bool clear) {
 	auto &c=display13FBPower;auto controller=static_cast<IOService *>(c.controller);
 	if(!controller || !c.map || c.map->getLength()!=0x1000000 || !c.map->getVirtualAddress())return;
 	auto pci=OSDynamicCast(IOPCIDevice,controller->getProvider());
@@ -6236,7 +6241,7 @@ static void display13StolenSample(const char *key) {
 		r[5]|=v;r[6]&=v;
 		if(!(off%0x80000))r[9+off/0x80000]=v;
 	}
-	if(r[2]!=r[1] && r[6]!=UINT32_MAX) {
+	if(clear && r[2]!=r[1] && r[6]!=UINT32_MAX) {
 		for(uint32_t off=0;off<display13StolenBytes;off+=8)*reinterpret_cast<volatile uint64_t *>(memory+off)=0;
 		r[7]=1;
 		for(uint32_t off=0;off<display13StolenBytes;off+=4096)if(*reinterpret_cast<volatile uint32_t *>(memory+off))++r[8];
@@ -6244,12 +6249,12 @@ static void display13StolenSample(const char *key) {
 	IORegistryEntry::getRegistryRoot()->setProperty(key,r,sizeof(r));
 	IOLog("WEX red: %s +%u ms zeros %u/%u first 0x%x x%u or 0x%x and 0x%x cleared %u left %u\n",key,r[0],r[2],r[1],r[3],r[4],r[5],r[6],r[7],r[8]);
 }
-static void display13StolenFire(thread_call_param_t,thread_call_param_t) {display13StolenSample("WEXDisplay13StolenSleep");}
+static void display13StolenFire(thread_call_param_t,thread_call_param_t) {display13StolenSample("WEXDisplay13StolenSleep",true);}
 static void display13ScanoutTick(thread_call_param_t,thread_call_param_t) {
 	auto &c=display13FBPower;constexpr unsigned samples=arrsize(display13Scanout);
 	if(!c.lock || !c.map || display13ScanoutNext>=samples)return;
 	if(!__atomic_load_n(&display13ScanoutStop,__ATOMIC_ACQUIRE)) {
-		if(display13ScanoutNext==30)display13StolenSample("WEXDisplay13StolenWake");
+		if(display13ScanoutNext==30)display13StolenSample("WEXDisplay13StolenWake",false);
 		auto &r=display13Scanout[display13ScanoutNext];r[0]=display13ScanoutMs();
 		IOLockLock(c.lock);
 		const auto base=c.map->getVirtualAddress();
@@ -6280,6 +6285,7 @@ static void display13ScanoutTick(thread_call_param_t,thread_call_param_t) {
 	auto root=IORegistryEntry::getRegistryRoot();
 	root->setProperty("WEXDisplay13WakeScanout",display13Scanout,sizeof(display13Scanout));
 	root->setProperty("WEXDisplay13WakeGamma",display13GammaEvents,sizeof(display13GammaEvents));
+	root->setProperty("WEXDisplay13PanelDepth",display13PanelDepthRecord,sizeof(display13PanelDepthRecord));
 }
 
 static void display13ScanoutBegin() {
@@ -7385,7 +7391,15 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             KernelPatcher::RouteRequest route(power,wrapDisplay13FBPowerState,orgDisplay13FBPowerState);
             held=patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
         }
-        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(held?4U:0U),32);
+        // Sleep, red. Optional as well: on a mismatch the panel keeps the depth WindowServer picks.
+        const char *modeInfo="__ZN21AppleIntelFramebuffer28getInformationForDisplayModeEiP24IODisplayModeInformation";
+        const auto i=patcher.solveSymbol<mach_vm_address_t>(index,modeInfo,address,size);patcher.clearError();
+        uint32_t depth=0;
+        if(i==address+0x32010 && !memcmp(reinterpret_cast<void *>(i),frame,sizeof(frame))) {
+            KernelPatcher::RouteRequest route(modeInfo,wrapDisplay13FBModeInfo,orgDisplay13FBModeInfo);
+            depth=patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
+        }
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(held?4U:0U)|(depth?8U:0U),32);
     }
     if(adlnOutputWiring.typeC)display13TCReleaseSetup();
     display13FBDPHooksReady=true;display13FBPower.tcSupported=true;return processDisplay13Training(patcher,index,address,size);
@@ -8682,7 +8696,20 @@ uint32_t XE::wrapAlderLakeNConnectionAttr(IOService *fb,int connection,uint32_t 
 uint32_t XE::wrapDisplay13FBDDC(IOService *fb,int connection,uint32_t block,uint32_t segment,uint32_t type,uint8_t *data,uint64_t *length) {
     uint64_t r[16] {1,3,0,block,type};adlnFrontendSnapshot(fb,r);adlnPublishFrontend("DDC","Entry",r);
     const auto result=FunctionCast(wrapDisplay13FBDDC,callbackXE->orgDisplay13FBDDC)(fb,connection,block,segment,type,data,length);
-    r[5]=result;r[6]=length ? *length : 0;adlnFrontendSnapshot(fb,r);adlnPublishFrontend("DDC","Last",r);return result;
+    r[5]=result;r[6]=length ? *length : 0;adlnFrontendSnapshot(fb,r);adlnPublishFrontend("DDC","Last",r);
+    const auto index=static_cast<uint32_t>(r[2]);
+    if(!result && block==1 && data && length && *length>=128 && index<arrsize(display13EDIDBits)) {
+        display13EDIDBits[index]=TGLPanelDepth::maximum(data,128);display13PanelDepthRecord[1+index]=display13EDIDBits[index];
+    }
+    return result;
+}
+uint32_t XE::wrapDisplay13FBModeInfo(IOService *fb,int mode,void *info) {
+    const auto result=FunctionCast(wrapDisplay13FBModeInfo,callbackXE->orgDisplay13FBModeInfo)(fb,mode,info);
+    if(result || !info || !fb)return result;
+    const auto index=Display13FBMemory::field<uint32_t>(fb,0x1DC);
+    auto depths=reinterpret_cast<uint32_t *>(info)+3; // IODisplayModeInformation.maxDepthIndex
+    if(index<arrsize(display13EDIDBits) && display13EDIDBits[index]==8 && *depths) {*depths=0;++display13PanelDepthRecord[0];}
+    return result;
 }
 uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,bool force) {
     auto config=Display13FBMemory::field<uint32_t *>(port,0x548);
