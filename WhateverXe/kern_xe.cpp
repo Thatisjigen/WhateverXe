@@ -9969,11 +9969,12 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 void XE::wrapAlderLakeNPlaneWMSetup(OSObject *plane,OSObject *path) {adlnWMSetup(plane,path,false);}
 void XE::wrapDisplay13CursorWMSetup(OSObject *plane,OSObject *path) {adlnWMSetup(plane,path,true);}
 
-// -wex-adlp-edp: WM_LINETIME and the frame period follow the pipe's own pixel
-// clock (native base at path+0x118, doubled per fb+0x425c), not the rate that
+// WM_LINETIME and the frame period follow the pipe's own pixel clock (native
+// base at path+0x118, doubled per fb+0x425c), not the rate that
 // adjustPixelClockForWatermarks raises by the pipe-scaler downscale ratio (i915).
+// Without a downscale the two are equal, so a native-size mode is unchanged.
 static uint64_t display13LineTimePixel(IOService *fb,OSObject *path,uint64_t adjusted) {
-	if(!callbackXE->display13PanelDP || !fb || !path || fb->getMetaClass()->getClassSize()<0x4B90 ||
+	if(!fb || !path || fb->getMetaClass()->getClassSize()<0x4B90 ||
 	   path->getMetaClass()->getClassSize()<0x3730)return adjusted;
 	auto base=Display13FBMemory::field<uint64_t>(path,0x118);
 	if(Display13FBMemory::field<uint8_t>(fb,0x425c))base*=2;
