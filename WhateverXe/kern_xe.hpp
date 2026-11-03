@@ -387,6 +387,7 @@ private:
  static void wrapDisplay13DPPhyGating(void *,bool);
  static uint32_t wrapDisplay13DPLaneMask(void *);
  static uint64_t wrapDisplay13DPCDInfo(void *);
+ static void display13TrainGate(uint32_t,void *,uint32_t);
  mach_vm_address_t orgDisplay13DPCDInfo {};
  static void wrapDisplay13DPPortWrite(void *,uint32_t,uint32_t);
  mach_vm_address_t orgDisplay13DPLightUp {},display13DPTraining {},display13DPSDPs {};

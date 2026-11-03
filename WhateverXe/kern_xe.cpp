@@ -6973,7 +6973,8 @@ void XE::wrapDisplay13TCDisableClocks(void *controller,void *raw,void *other) {
     // transcoder stop before dropping DDI/PLL, including retry and abort paths.
     if(config && config[0]<7 && (self->adlnOutputWiring.dp&(1U<<config[0])) && self->display13ClockOrderReady &&
        !display13StopTranscoder(raw)) {
-        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13ClockStopRejected",true);return;
+        IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13ClockStopRejected",true);
+        display13TrainGate(3,raw,UINT32_MAX);return;
     }
     if(!c.lock)return;IOLockLock(c.lock);const auto ddi=display13TCTarget(port,true);bool ok=false;
     if(controller==c.controller && (!other || other==raw) && ddi<7 && !c.tcBusy[ddi-3]) {
@@ -7573,7 +7574,9 @@ bool XE::display13LeaseValidate(void *controller,void *port,uint32_t pipe) {
  Display13FBPowerIO io{c.map};
  const bool ok=bound && (pipe==UINT32_MAX || c.bridge.pipeHeld(io,pipe));
  if(ok)s->tglObservationController=controller;
- IOLockUnlock(c.lock);return ok;
+ IOLockUnlock(c.lock);
+ if(!ok)display13TrainGate(2,port,pipe);
+ return ok;
 }
 bool XE::display13LeasePower(void *power,uint32_t pg,bool acquire) {
  return adlnPowerReference(power,acquire?1:2,pg);
@@ -7630,7 +7633,7 @@ uint32_t XE::wrapDisplay13PortTraining(void *port,void *request) {
  IOLockLock(c.lock);auto p=display13SSTPort(port);
  const bool valid=p && p[0x115]==1 && !p[0x117] && p[0x10]<=1 && p[0x11A]<=1;
  if(valid)p[0x11A]&=p[0x10];
- IOLockUnlock(c.lock);if(!valid)return kIOReturnNotReady;
+ IOLockUnlock(c.lock);if(!valid){display13TrainGate(1,port,UINT32_MAX);return kIOReturnNotReady;}
  return FunctionCast(wrapDisplay13PortTraining,s->orgDisplay13PortTraining)(port,request);
 }
 // Deferred native clock writes are per pipe and protected by the display
@@ -7736,6 +7739,32 @@ uint8_t *XE::display13SSTPort(void *port) {
     Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) ||
     Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
  return p;
+}
+
+// Diagnostics only: which term refuses a port at a training gate, since the gates themselves only return false.
+// where: 1 wrapDisplay13PortTraining, 2 display13LeaseValidate, 3 clock stop refused. bits: 0x2 clockStopped, 0x4 clockFaulted,
+// 0x8 memoryFaulted, 0x10 panelFaulted, 0x20 bridge faulted, 0x40 bridge suspended, 0x200 port+0x117 (MST), 0x400 +0x120 is not
+// the DDI, 0x800 +0x578 is not the access object, 0x1000 +0x550 is not the expected mode, 0x2000 pipe not held.
+void XE::display13TrainGate(uint32_t where,void *port,uint32_t pipe) {
+ auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
+ if(!c.lock || !object || object->getMetaClass()->getClassSize()<0x624)return;
+ auto p=static_cast<uint8_t *>(port);auto config=Display13FBMemory::field<uint32_t *>(p,0x548);
+ const uint32_t ddi=config?config[0]:UINT32_MAX;
+ const uint32_t expected=ddi>=3 && ddi<7?((s->adlnOutputWiring.typeC&(1U<<ddi))?3U:4U):1U;
+ const auto mode=Display13FBMemory::field<uint32_t>(p,0x550);
+ IOLockLock(c.lock);
+ uint32_t bits=(c.clockStopped?0x2:0)|(c.clockFaulted?0x4:0)|(c.memoryFaulted?0x8:0)|(c.panelFaulted?0x10:0)|
+  (c.bridge.state.faulted?0x20:0)|(c.bridge.state.suspended?0x40:0)|(p[0x117]?0x200:0)|
+  (Display13FBMemory::field<uint32_t>(p,0x120)!=ddi?0x400:0)|(Display13FBMemory::field<void *>(p,0x578)!=c.access?0x800:0)|
+  (mode!=expected?0x1000:0);
+ if(pipe<3 && c.map) {Display13FBPowerIO power{c.map};if(!c.bridge.pipeHeld(power,pipe))bits|=0x2000;}
+ static uint32_t seq;const auto n=++seq;
+ uint32_t record[]={n,where,ddi,bits,p[0x115],p[0x117],p[0x10],p[0x11A],p[0x1E],mode,pipe,c.firstFaultLine};
+ IOLockUnlock(c.lock);
+ auto root=IORegistryEntry::getRegistryRoot();
+ root->setProperty("WEXDisplay13TrainGate",record,sizeof(record));
+ if(!root->getProperty("WEXDisplay13TrainGateFirst"))root->setProperty("WEXDisplay13TrainGateFirst",record,sizeof(record));
+ if(n<=16)SYSLOG("igfx","WEX train gate: where %u ddi %u bits 0x%x mst %u/%u mode %u pipe %u first fault line %u",where,ddi,bits,record[8],record[5],mode,pipe,record[11]);
 }
 
 // Acer ANV15-52: at the firmware handoff the eDP port on Combo A/B still has native mode 0, as the
