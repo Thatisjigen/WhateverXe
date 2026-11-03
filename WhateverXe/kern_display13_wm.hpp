@@ -292,14 +292,15 @@ inline TriggerSurfaces triggerSurfaces(const TriggerPacket *packets,uint32_t cou
 // charges its primary and cursor the downscale on top; the native
 // AppleIntelScaler::isSupportedByScaler admits such a mode up to nativeHz, which
 // is the two pixels per CDCLK of i915's intel_crtc_compute_min_cdclk.
+// Judge each consumer on its own: a cursor's plan is rebuilt only when the cursor
+// changes, so back at native size it can still carry the scaled rate. Its programmed
+// values are then the conservative ones, and refusing them would fault the owner.
 inline bool clockFits(const Snapshot &s,uint64_t nativeHz) {
     if(!s.primary || !s.pipePixelHz)return false;
-    const auto limit=s.primary->pixelHz>s.pipePixelHz ? nativeHz : nativeHz/2;
-    return s.primary->status==Status::Complete && nativeHz &&
-        s.primary->pixelHz && s.primary->pixelHz<=limit &&
+    const auto fits=[&](uint64_t hz) {return hz && hz<=(hz>s.pipePixelHz ? nativeHz : nativeHz/2);};
+    return s.primary->status==Status::Complete && nativeHz && fits(s.primary->pixelHz) &&
         s.pipePixelHz<=nativeHz/2 && s.pipeLineTime==pipeLineTime(s.primary->htotal,s.pipePixelHz) &&
-        (!s.cursorActive || (s.cursor && s.cursor->status==Status::Complete &&
-            s.cursor->pixelHz && s.cursor->pixelHz<=limit));
+        (!s.cursorActive || (s.cursor && s.cursor->status==Status::Complete && fits(s.cursor->pixelHz)));
 }
 enum class LatchCheck : uint32_t {None,Controls,OtherPlane,DSB,Clock,Registers,Live,Frame,AwaitingScanout,AwaitingFlip};
 struct Latch {
