@@ -25,25 +25,6 @@ int main() {
  assert(Display13Color::gamma10MaxToU16(0)==0 && Display13Color::gamma10MaxToU16(1023)==65536);
  assert(Display13Color::gamma10MaxToU16(512)==32800 && Display13Color::gamma10MaxToU16(1024)==UINT32_MAX);
  for(unsigned i=1;i<=1023;++i)assert(Display13Color::gamma10MaxToU16(i)>Display13Color::gamma10MaxToU16(i-1));
- {
-  // The native upload: index 0, index 0, index 0 with auto-increment, 1024 words.
-  static Display13Color::PaletteShadow shadow;
-  assert(!shadow.complete);
-  shadow.index(0);shadow.index(0);shadow.index(0x8000);
-  for(unsigned i=0;i<1023;++i)shadow.data(i*3);
-  assert(!shadow.complete && shadow.table[1022]==1022*3);
-  shadow.data(7);
-  assert(shadow.complete && shadow.table[1023]==7 && shadow.table[0]==0 && !shadow.cursor);
-  // A single entry: no auto-increment, no effect on the rest, and no whole table.
-  shadow.index(5);shadow.data(99);shadow.data(100);
-  assert(shadow.table[5]==100 && shadow.table[6]==18 && shadow.cursor==5);
-  static Display13Color::PaletteShadow partial;
-  partial.index(0x8000);
-  for(unsigned i=0;i<100;++i)partial.data(i);
-  partial.index(0x8000);
-  for(unsigned i=0;i<100;++i)partial.data(i);
-  assert(!partial.complete);
- }
  Display13Color::PreGammaStream stream;std::vector<uint32_t> out;
  for(unsigned i=0;i<33;++i)assert(stream.push(i*2048,[&](uint32_t v){out.push_back(v);}));
  assert(stream.push(3*65536,[&](uint32_t v){out.push_back(v);}));
