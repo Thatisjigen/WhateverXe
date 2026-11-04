@@ -83,6 +83,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - Add `SSDT-PNLF` for internal-display brightness control.
 - GPU selection is automatic; a `device-id` override is normally unnecessary.
 - Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P select tiling automatically. Do not use `-yTileDisable`; `AAPL,GfxYTile` is unnecessary.
+- Experimental: `-wex-system-sleep` puts back the display state a full system sleep resets and releases a connected USB-C DP Alt port at sleep. Checked on one Raptor Lake-H laptop with an NVIDIA GPU also running; with Intel alone that laptop still hangs after a sleep. Ignored with MIPI DSI.
 
 ## Tested features and known issues
 

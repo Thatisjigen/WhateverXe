@@ -80,6 +80,7 @@ struct XE {
 };
 static XE *callbackXE;
 static bool adlnNativeRCSProfileRequested;
+static bool display13SleepRequested;
 using kern_return_t = int;
 struct kmod_info_t {};
 static constexpr int KERN_FAILURE=5, KERN_SUCCESS=0;
@@ -124,6 +125,11 @@ int main() {
  xe=boot({"-wex-adln-kernel-ctx"});
  assert(xe.adlnNativeRequested && xe.display13FramebufferRequested && !adlnNativeRCSProfileRequested);
  xe=boot({});assert(adlnNativeRCSProfileRequested);
+ // System sleep stays off unless asked for, and the argument means nothing without Display 13.
+ assert(!display13SleepRequested);
+ xe=boot({"-wex-system-sleep"});assert(display13SleepRequested && xe.display13FramebufferRequested);
+ xe=boot({"-wex-system-sleep"},0x46A68086U);assert(display13SleepRequested && xe.display13FramebufferRequested);
+ xe=boot({"-wex-system-sleep"},0x9A498086U);assert(!display13SleepRequested && !xe.display13FramebufferRequested);
  for(const char *obsolete:{"-igfxn97","-igfxadln","-wex-adln","-wex-tgl","-wex-display13","-wex-adln-native","-wex-adln-rcs-profile"}) {
   xe=boot({obsolete},0x12348086);
   assert(!xe.adlnRequested && !xe.tglRequested && !xe.adlnNativeRequested && !adlnNativeRCSProfileRequested);

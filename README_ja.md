@@ -83,6 +83,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - 内蔵画面の輝度調整には`SSDT-PNLF`を追加します。
 - GPUは自動選択するため、通常は`device-id`上書きは不要です。
 - Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/Pではタイル形式を自動選択します。`-yTileDisable`は使わないでください。`AAPL,GfxYTile`は不要です。
+- 実験的機能: `-wex-system-sleep` を指定すると、システムスリープでリセットされるディスプレイの状態を復元し、スリープ時に接続中のUSB-C DP Altポートを解放します。NVIDIA GPUも動作しているRaptor Lake-Hノート1台でのみ確認しており、同じノートでもIntelのみの構成ではスリープ後に停止します。MIPI DSIでは無視されます。
 
 ## 動作確認済みの機能と既知の問題
 

@@ -243,6 +243,7 @@ static bool xelpDisplay13Device(IOPCIDevice *pci) {
 // Detailed read-only display evidence is opt-in; control and first-fault
 // receipts remain active in the ordinary AlderLakeN profile.
 static bool display13TraceEnabled;
+static bool display13SleepRequested;
 static bool display13Offline;
 static XELPMemory::Layout xelpMemory;
 static uint16_t xelpMemoryGGC;
@@ -3851,6 +3852,7 @@ void XE::selectProfile(const XELP::Profile &profile) {
     display13FramebufferRequested=profile.displayAdmitted() && profile.display==XELP::Display::XeLPD &&
         (XELP::displayAdapter(profile.family)==XELP::DisplayAdapter::ADLN || adlpDisplaySelected) && nativeOS;
     display13TraceEnabled=display13FramebufferRequested && checkKernelArgument("-wex-display13-trace");
+    display13SleepRequested=display13FramebufferRequested && checkKernelArgument("-wex-system-sleep");
     display13Offline=display13FramebufferRequested && checkKernelArgument("-wex-display13-offline");
     if(display13FramebufferRequested)currentFramebuffer=&kextIntelTGLFb;
     if(adlpDisplaySelected && !adlpRenderRequested) {
@@ -7037,6 +7039,11 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
     return result.status;
 }
 
+// -wex-system-sleep: what a real system sleep resets is put back at wake. Off by default, and never with DSI,
+// whose system sleep is not supported.
+bool XE::display13SystemSleep() {return display13SleepRequested && !callbackXE->adlnOutputWiring.dsi;}
+// Set when the sleep override, not the donor, turned display interrupts off; cleared once they are on again.
+static bool display13SleepIRQOff {};
 uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing) {
     auto self=callbackXE;
     // The GOP-preserving surface adapter must replace this refusal before
@@ -7048,9 +7055,14 @@ uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing
             Display13FBMemory::singlePath<OSObject *>(service) : nullptr;
         if(dsiLifecycleTarget(service,path))return kIOReturnNotReady;
     }
-    return Display13TC::finishMode(
+    const auto result=Display13TC::finishMode(
         [&](){return FunctionCast(wrapDisplay13TCSetMode,self->orgDisplay13TCSetMode)(controller,fb,timing);},
         [&](){reinterpret_cast<void (*)(void *,void *,uint32_t)>(self->display13TCNotify)(controller,fb,1);});
+    // The wake restore cannot turn display interrupts back on in the multi-output wiring, as no pipe is active yet.
+    // The first completed modeset after the wake has lit one.
+    if(display13SleepIRQOff && wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE))==kIOReturnSuccess)
+        display13SleepIRQOff=false;
+    return result;
 }
 
 bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
@@ -10129,6 +10141,11 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	// override(true) is only reached by the donor's simulator backend; our
 	// physical object has simulator=0. Do not force unrelated DDI/AUX domains.
 	if(!enable)wrapAlderLakeNEngineDisable(power);
+	// The donor reaches the sleep override with the display interrupt master still on, so quiescent() refuses, the
+	// bridge faults and the panel stays dark at wake. With no handler running, turn display interrupts off here, as
+	// hwDisableInterrupts does and as i915 does before the power domains suspend; the wake turns them back on.
+	if(!enable && display13SystemSleep() && display13FBIRQ.state.begun && display13FBIRQ.state.enabled && !display13FBIRQ.handlers &&
+	   wrapDisplay13FBDisableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE))==kIOReturnSuccess)display13SleepIRQOff=true;
 	uint64_t record[32] {};Display13Power::Result result;IOLockLock(c.lock);
 	if(callbackXE->display13FBLifecycleHooksReady && !enable && c.bridge.begun && !c.bridge.state.faulted &&
 		!c.engineEnabled && c.clockStopped && !c.dbuf.owned && !Display13WM::busyPipes(c.pipe)) {
@@ -10163,6 +10180,12 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 	display13FBPowerRecord(record,9,waking,result);IOLockUnlock(c.lock);
 	adlnPublishPowerRecord("N97FBPowerRestore",record);
 	if(result.status==Display13Power::Status::Complete)wrapAlderLakeNEngineEnable(power);
+	// Give back the display interrupts the sleep override turned off, once power and engine are back, unless the
+	// donor already did. If no pipe is active yet this stays pending for the first modeset (wrapDisplay13TCSetMode).
+	if(display13SleepIRQOff && result.status==Display13Power::Status::Complete) {
+		if(!display13FBIRQ.state.enabled)wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE));
+		if(display13FBIRQ.state.enabled)display13SleepIRQOff=false;
+	}
 }
 
 void XE::wrapAlderLakeNPrimaryDBUF(OSObject *plane,uint32_t start,uint32_t end,bool wait) {

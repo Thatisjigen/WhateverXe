@@ -15,7 +15,7 @@ const char *version="Darwin Kernel Version 20.6.0: Thu Jul  6 22:12:47 PDT 2023;
 bool noaccel=false;
 bool checkKernelArgument(const char *s){return noaccel && !strcmp(s,"-wex-noaccel");}
 int kextIntelTGL,kextIntelTGLFb;
-bool adlnNativeRCSProfileRequested=false,display13TraceEnabled=false,display13Offline=false;
+bool adlnNativeRCSProfileRequested=false,display13TraceEnabled=false,display13Offline=false,display13SleepRequested=false;
 struct XE {
  XELP::Profile xeProfile;
  bool tglGT2Detected=false,tglGT2Ready=false;

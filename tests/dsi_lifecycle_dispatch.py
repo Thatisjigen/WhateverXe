@@ -32,6 +32,11 @@ bool adlnWriterMappingBound(){return false;}
 void adlnPublishMemory(const char*,unsigned,void*,size_t,bool=false){}
 IOService *panel=nullptr;bool dsiModeTarget(IOService *fb){return fb && fb==panel;}
 constexpr uint32_t kIOReturnNotReady=0xe00002d8;
+constexpr uint32_t kIOReturnSuccess=0;
+// The sleep retry inside wrapDisplay13TCSetMode: its flag is never set by this replay, so the stubs only have to
+// exist; reaching them would mean the DSI dispatch ran the retry.
+bool display13SleepIRQOff=false;
+struct {IOService *controller=nullptr;}display13FBIRQ;
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
 uint32_t nativeMode(void*,void*,const void*){++modeCalls;return modeResult;}
 void nativeStop(IOService*,IOService*,OSObject*,uint8_t){++stopCalls;}
@@ -42,6 +47,7 @@ struct XE {
  uintptr_t orgAlderLakeNDisableDisplay=reinterpret_cast<uintptr_t>(nativeStop);
  bool quiesceDSIPath(IOService*,IOService*,OSObject*){++hostStops;return hostStopOK;}
  static uint32_t wrapDisplay13TCSetMode(void*,void*,const void*);
+ static uint32_t wrapDisplay13FBEnableIRQ(IOService*){assert(false);return 0;}
  static void wrapAlderLakeNDisableDisplay(IOService*,IOService*,OSObject*,uint8_t);
 }xe,*callbackXE=&xe;
 FUNCTIONS
