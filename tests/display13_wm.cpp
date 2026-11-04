@@ -94,7 +94,7 @@ int main() {
     assert(arbitrationControl(0x82001000)==0x92001000);
     assert(arbitrationControl(0x94001000)==0x94001000);
     assert(arbitrationControl(0x04001000)==0x04001000);
-    assert(arbitrationControl(0x86001000)==0x86001000); // unsupported FP16
+    assert(arbitrationControl(0x86001000)==0xB6001000); // FP16: three slots, as in i915
     assert(arbitrationControl(0x84009000)==0x84009000); // compressed
     for(uint32_t slots=0;slots<8;slots++) {
         const uint32_t ctl=0x84001000|(slots<<28),out=arbitrationControl(ctl);
@@ -163,10 +163,15 @@ int main() {
     // Captured native RGB8888/Y-tiled control, not the GOP linear control.
     assert(supportedRGBControl(0x94001008) && supportedRGBControl(0x94000008));
     // Actual dual hot-add switches pipe A to 32bpp RGB2101010, while B
-    // stays RGB8888. Neither permits YUV, FP16, CCS or rotation.
+    // stays RGB8888. Neither permits YUV, CCS or rotation.
     assert(supportedRGBControl(0x92001000) && supportedRGBControl(0x82000000));
     assert(!supportedRGBControl(0x92009000) && !supportedRGBControl(0x92001010));
-    assert(!supportedRGBControl(0x92001001) && !supportedRGBControl(0x96001000));
+    assert(!supportedRGBControl(0x92001001));
+    // EDR's 64-bit plane: eight bytes per pixel, three arbitration slots, larger watermarks.
+    assert(supportedRGBControl(0x96001000) && bytesPerPixel(0x96001000)==8 && bytesPerPixel(0x92001000)==4 && bytesPerPixel(0x94001008)==4);
+    assert(arbitrationControl(0x86000000)==0xB6000000 && arbitrationControl(0x82000000)==0x92000000);
+    assert(linearLevel(1920,2200,148500000,3,642,8).blocks>linearLevel(1920,2200,148500000,3,642).blocks);
+    assert(yTiledLevel(1920,2200,148500000,3,642,8).blocks>yTiledLevel(1920,2200,148500000,3,642).blocks);
     assert(!supportedRGBControl(0x91001000) && !supportedRGBControl(0x90801000));
     assert(!supportedRGBControl(0x94001408) && !supportedRGBControl(0x94009008));
     assert(!supportedRGBControl(0x94001018) && !supportedRGBControl(0x94001009));

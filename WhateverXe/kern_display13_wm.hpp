@@ -106,17 +106,17 @@ struct Plan {
 };
 // A downscaled plane's source width can exceed htotal (pipe scaler); the caller's
 // pixel rate already carries the downscale factor, as in i915.
-// Linear 32bpp RGB8888 or RGB2101010. The +1 block in blocks-per-line and method1, one-line
+// Linear RGB8888, RGB2101010 or RGB16161616F. The +1 block in blocks-per-line and method1, one-line
 // minimum, 10% DDB margin and strict allocation inequality are all required.
-inline Level linearLevel(uint32_t width,uint32_t htotal,uint64_t pixelHz,uint32_t latencyUs,uint32_t allocation) {
+inline Level linearLevel(uint32_t width,uint32_t htotal,uint64_t pixelHz,uint32_t latencyUs,uint32_t allocation,uint32_t cpp=4) {
     Level l;
     if(!latencyUs || !width || width>16384 || !htotal || width>3*htotal || htotal>16384 ||
        !pixelHz || pixelHz>2000000000ULL || latencyUs>65793 || !allocation || allocation>4096)return l;
-    const auto bpl=ceilDiv(uint64_t(width)*4,512)+1;
+    const auto bpl=ceilDiv(uint64_t(width)*cpp,512)+1;
     const auto lineTime=ceilDiv(uint64_t(htotal)*1000000,pixelHz);
-    const auto method1=fixedDiv(uint64_t(latencyUs)*pixelHz*4,512000000)+65536;
+    const auto method1=fixedDiv(uint64_t(latencyUs)*pixelHz*cpp,512000000)+65536;
     const auto method2=ceilDiv(uint64_t(latencyUs)*pixelHz,uint64_t(htotal)*1000000)*bpl*65536;
-    const bool shortLine=uint64_t(htotal)*4<512 && uint64_t(width)*4<512;
+    const bool shortLine=uint64_t(htotal)*cpp<512 && uint64_t(width)*cpp<512;
     const auto selected=shortLine || latencyUs>=lineTime ? method2 : method1;
     auto blocks=ceilDiv(selected,65536)+1;
     if(blocks<bpl)blocks=bpl;
@@ -135,18 +135,20 @@ inline bool writerMapping(uint64_t writerBase,uint64_t nativeBase,uint64_t nativ
     return writerBase && writerBase==nativeBase && nativePhysical && nativePhysical==ownerPhysical &&
         nativeLength==0x1000000 && ownerLength==nativeLength;
 }
+inline uint32_t bytesPerPixel(uint32_t ctl) {return ((ctl>>23)&31)==12 ? 8 : 4;}
 inline bool supportedRGBControl(uint32_t ctl) {
     const auto tile=(ctl>>10)&7,format=(ctl>>23)&31;
-    // ICL+ RGB2101010 (4) and RGB8888 (8) both use four bytes per pixel.
-    // Native dual-display reconfiguration may select the 30-bit format.
-    return ctl!=UINT32_MAX && (format==4 || format==8) && (tile==0 || tile==4) &&
+    // ICL+ RGB2101010 (4) and RGB8888 (8) both use four bytes per pixel, RGB16161616F (12) eight.
+    // Native dual-display reconfiguration may select the 30-bit format, EDR the 64-bit one.
+    return ctl!=UINT32_MAX && (format==4 || format==8 || format==12) && (tile==0 || tile==4) &&
         !(ctl&((1U<<15)|(1U<<4)|3U)); // No CCS/media compression or rotation.
 }
-// Wa_22012358565: ADL-P Display13 needs one programmable slot for a
-// four-byte RGB primary. Preserve format, tiling and all unrelated fields.
+// Wa_22012358565: ADL-P Display13 needs one programmable slot for a four-byte RGB
+// primary, three for an eight-byte one (i915, adlp_plane_ctl_arb_slots). Preserve
+// format, tiling and all unrelated fields.
 inline uint32_t arbitrationControl(uint32_t control) {
     return (control&Enabled) && supportedRGBControl(control) ?
-        (control&~(7U<<28))|(1U<<28) : control;
+        (control&~(7U<<28))|((bytesPerPixel(control)==8 ? 3U : 1U)<<28) : control;
 }
 inline uint32_t cursorWidth(uint32_t control) {
     if(control==UINT32_MAX)return 0;
@@ -164,11 +166,11 @@ inline bool cursorMatches(uint32_t control,uint32_t width,bool allowDisabled=fal
     if(control==UINT32_MAX || !cursorWidthSupported(width))return false;
     return (!(control&0x27) && allowDisabled) || cursorWidth(control)==width;
 }
-inline Level yTiledLevel(uint32_t width,uint32_t htotal,uint64_t pixelHz,uint32_t latencyUs,uint32_t allocation) {
+inline Level yTiledLevel(uint32_t width,uint32_t htotal,uint64_t pixelHz,uint32_t latencyUs,uint32_t allocation,uint32_t cpp=4) {
     Level l;
     if(!latencyUs || !width || width>16384 || !htotal || width>3*htotal || htotal>16384 ||
        !pixelHz || pixelHz>2000000000ULL || latencyUs>65793 || !allocation || allocation>4096)return l;
-    const auto tileBlocks=ceilDiv(uint64_t(width)*4*4,512)+1;
+    const auto tileBlocks=ceilDiv(uint64_t(width)*cpp*4,512)+1;
     const auto bpl=tileBlocks*65536/4;
     auto selected=ceilDiv(uint64_t(latencyUs)*pixelHz,uint64_t(htotal)*1000000)*bpl;
     if(selected<4*bpl)selected=4*bpl;
@@ -192,15 +194,15 @@ inline Level transition(Level wm0,uint32_t allocation,bool ipc,uint32_t yTileMin
     if(blocks>4095 || minimum>allocation)return l;
     l.blocks=blocks;l.minimum=minimum;l.enable=true;return l;
 }
-inline Plan plan(uint32_t width,uint32_t htotal,uint64_t pixelHz,uint32_t allocation,const Latency &latency,bool ipc,bool yTiled=false,uint32_t height=0) {
+inline Plan plan(uint32_t width,uint32_t htotal,uint64_t pixelHz,uint32_t allocation,const Latency &latency,bool ipc,bool yTiled=false,uint32_t height=0,uint32_t cpp=4) {
     Plan p;p.height=height;p.width=width;p.htotal=htotal;p.pixelHz=pixelHz;p.allocation=allocation;p.yTiled=yTiled;
     if(latency.status!=Status::Complete)return p;
     auto level=yTiled ? yTiledLevel : linearLevel;
-    for(unsigned i=0;i<6;++i)p.normal[i]=level(width,htotal,pixelHz,latency.us[i],allocation);
+    for(unsigned i=0;i<6;++i)p.normal[i]=level(width,htotal,pixelHz,latency.us[i],allocation,cpp);
     if(!p.normal[0].enable) {p.status=Status::WM0;return p;}
-    const auto tileMinimum=yTiled ? static_cast<uint32_t>(ceilDiv(uint64_t(width)*16,512)+1) : 0;
+    const auto tileMinimum=yTiled ? static_cast<uint32_t>(ceilDiv(uint64_t(width)*cpp*4,512)+1) : 0;
     p.transition=transition(p.normal[0],allocation,ipc,tileMinimum);
-    p.sagv=level(width,htotal,pixelHz,latency.sagvUs+latency.us[0],allocation);
+    p.sagv=level(width,htotal,pixelHz,latency.sagvUs+latency.us[0],allocation,cpp);
     p.sagvTransition=transition(p.sagv,allocation,ipc,tileMinimum);
     // A complete calculation may legitimately disable higher/transition/SAGV
     // levels that exceed this allocation. SAGV admission must inspect enable.
