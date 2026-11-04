@@ -65,6 +65,8 @@ with tempfile.TemporaryDirectory(prefix='wex-shutdown-') as tmp:
  subprocess.run([str(p/'test')],check=True)
 override=re.search(r'void XE::wrapAlderLakeNPowerOverride\(.*?\n\}',s,re.S)[0]
 assert override.index('display13ShutdownPowerCaller')<override.index('finishDisplay13TCShutdown')<override.index('wrapAlderLakeNEngineDisable')
+# A DP Alt port is released at sleep after the engine stop and before the display IRQs go off.
+assert override.index('wrapAlderLakeNEngineDisable')<override.index('releaseDisplay13TCForSleep')<override.index('wrapDisplay13FBDisableIRQ')
 if len(sys.argv)>1:
  b=Path(sys.argv[1]).read_bytes()
  install=re.search(r'bool XE::processDisplay13Shutdown\(.*?\n\}',s,re.S)[0]

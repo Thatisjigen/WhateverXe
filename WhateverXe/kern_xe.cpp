@@ -10192,6 +10192,39 @@ void XE::wrapAlderLakeNEngineDisable(void *power) {
 	if(acquiredGate)reinterpret_cast<void (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopOpen)(acquiredGate);
 }
 
+// A DP Alt port still connected at sleep keeps its TC AUX domain referenced. After a real sleep the Type-C subsystem has
+// been reset, Display13TC::Aux::prepare fails and the wake restore stops with UnqualifiedTCAUX, which leaves the whole
+// display dark. Release such a port here, as a hot unplug does; its sink comes back through HPD at wake. With the pipes
+// off the link can still hold its DDI reference and PLL: stop it first.
+void XE::releaseDisplay13TCForSleep() {
+ auto self=callbackXE;auto &c=display13FBPower;
+ if(!c.lock || !self->display13FBTCHooksReady)return;
+ for(unsigned tc=0;tc<4;++tc) {
+  const auto ddi=tc+3;
+  IOLockLock(c.lock);
+  auto port=c.tcObject[tc];
+  if(!port || !(self->adlnOutputWiring.typeC&(1U<<ddi)) || c.tcBusy[tc] || c.tcMode[tc].phase==Display13TC::Mode::Phase::Idle) {
+   IOLockUnlock(c.lock);continue;
+  }
+  port->retain();
+  Display13FBTCIO io{port,tc};Display13TC::Port p;
+  if(Display13TC::Port::resolve(ddi,p) && !c.bridge.nativeAUXRefs(ddi) && io.quiescent(ddi)) {
+   const auto pll=io.read(p.pll);
+   if(pll!=UINT32_MAX && ((pll&0xcc000000U) || c.bridge.nativeDDIRefs(ddi))) {
+    for(unsigned pipe=0;pipe<3;++pipe) {
+     auto &deferred=display13DeferredClocks[pipe];if(deferred.port==port)deferred={};
+     const auto clock=io.read(0x46140+4*pipe);
+     if(clock!=UINT32_MAX && (clock>>28)==ddi+3)io.write(0x46140+4*pipe,clock&0x0fffffffU);
+    }
+    if(Display13TC::Clock::stopLink(io,p)){c.tcSignalReady[tc]=false;c.tcDPLink[tc]={};}
+   }
+  }
+  IOLockUnlock(c.lock);
+  wrapDisplay13TCMode(port,0);
+  port->release();
+ }
+}
+
 void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	auto &c=display13FBPower;if(!c.lock || power!=c.power || !c.controller)return;
 	// The last hwShutdown can suspend the power banks before returning.
@@ -10203,6 +10236,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	// override(true) is only reached by the donor's simulator backend; our
 	// physical object has simulator=0. Do not force unrelated DDI/AUX domains.
 	if(!enable)wrapAlderLakeNEngineDisable(power);
+	if(!enable && display13SystemSleep())releaseDisplay13TCForSleep();
 	// The donor reaches the sleep override with the display interrupt master still on, so quiescent() refuses, the
 	// bridge faults and the panel stays dark at wake. With no handler running, turn display interrupts off here, as
 	// hwDisableInterrupts does and as i915 does before the power domains suspend; the wake turns them back on.
