@@ -9930,7 +9930,7 @@ void XE::wrapAlderLakeNLatencyInit(IOService *controller) {
 
 void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 	auto &c=display13FBPower;if(!c.lock)return;
-	uint64_t record[32] {},inputs[24] {};IOLockLock(c.lock);
+	uint64_t record[32] {},inputs[26] {};IOLockLock(c.lock);
 	Display13WM::Plan p;
 	auto fb=plane && plane->getMetaClass()->getClassSize()>=0x1C8 ? Display13FBMemory::field<IOService *>(plane,0x68) : nullptr;
 	auto controller=static_cast<IOService *>(c.controller);
@@ -9989,7 +9989,9 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 			// Audited native pixel/scaling calculation is CPU-only. Preserve its
 			// path frequency and downscale behavior rather than assuming FHD Hz.
 			auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
-			const auto pixel=adjust(c.controller,fb,path,cursor,nullptr);
+			const auto adjusted=adjust(c.controller,fb,path,cursor,nullptr);
+			const auto pixel=Display13WM::planePixelHz(adjusted,c.clock.nativeHz());
+			inputs[24]=adjusted;inputs[25]=c.clock.nativeHz();
 			p=Display13WM::plan(width,htotal,pixel,range.end-range.start,c.latency,(ipc&8) || Display13FBMemory::field<uint8_t>(c.controller,0x1B4C),yTiled,cursor ? width : ((Display13FBMemory::field<uint32_t>(plane,0x11C)>>16)&0x1FFF)+1,cursor ? 4 : Display13WM::bytesPerPixel(ctl));
 			if(p.status==Display13WM::Status::Complete) {
 				auto object=reinterpret_cast<uint8_t *>(plane);
@@ -10032,6 +10034,10 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 		if(!root->getProperty(property))root->setProperty(property,inputs,sizeof(inputs));
 		if(p.status!=Display13WM::Status::Complete) {
 			snprintf(property,sizeof(property),"N97FBPipe%u%sWMFailureInputs",pipe,cursor ? "Cursor" : "Primary");
+			if(!root->getProperty(property))root->setProperty(property,inputs,sizeof(inputs));
+		}
+		if(inputs[25] && inputs[24]>inputs[25]) {
+			snprintf(property,sizeof(property),"N97FBPipe%u%sWMClampedInputs",pipe,cursor ? "Cursor" : "Primary");
 			if(!root->getProperty(property))root->setProperty(property,inputs,sizeof(inputs));
 		}
 	}
