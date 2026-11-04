@@ -9075,8 +9075,21 @@ void XE::wrapAlderLakeNClockInit(IOService *controller) {
 	*reinterpret_cast<uint64_t *>(c+0xEA0)=r.nativeMaxHz();
 }
 uint64_t XE::wrapAlderLakeNClockProbe(IOService *controller) {return adlnClockReadout(controller).nativeHz();}
+// The dual path needs the controller gate, and another thread holds it at the panel's cold modeset: the change is refused,
+// clockFaulted latches, every SST hook answers NotReady and the panel stays off. Until a second framebuffer exists the
+// single-output path below, pipe A's FB mutex and no gate, is the matching one.
+bool XE::display13PanelOnlyClock() {
+	auto &c=display13FBPower;if(!c.lock)return false;
+	IOLockLock(c.lock);
+	const bool only=!XELP::raptorLakeUDevice(callbackXE->xeProfile.identity) &&
+		Display13FBTopology::panelOnlyClock(callbackXE->adlnOutputWiring,c.bridge.bootPort,c.pipe[0].memoryFramebuffer,c.pipe[1].memoryFramebuffer,c.pipe[2].memoryFramebuffer);
+	IOLockUnlock(c.lock);return only;
+}
 void XE::wrapAlderLakeNClockSet(IOService *controller,uint64_t nativeHz) {
-	if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring)) {adlnSetDualClock(controller,nativeHz);return;}
+	if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring)) {
+		if(!display13PanelOnlyClock()) {adlnSetDualClock(controller,nativeHz);return;}
+		SYSLOG("igfx","Display13 clock: %llu on the single-output path, only the panel has a framebuffer",nativeHz);
+	}
 	auto &c=display13FBPower;if(!c.lock)return;
 	Display13Clock::Change result;result.requestedHz=nativeHz;
 	auto fb=c.pipe[0].memoryFramebuffer;

@@ -35,6 +35,7 @@ struct Context {
  Display13Power::NativeBridge bridge;void *lock=reinterpret_cast<void *>(1),*controller=nullptr,*access=nullptr;
  Display13Power::MainLinkAUX mainLink[2];alignas(void *) uint8_t powerBytes[0x80]{};void *power=powerBytes;
  Map *map=nullptr;bool panelFaulted=false,clockFaulted=false,memoryFaulted=false,clockStopped=false;
+ struct {void *memoryFramebuffer=nullptr;} pipe[3];
 }display13FBPower;
 struct Display13FBPowerIO {
  Map *map;bool tcAuxSupported(){return true;}bool prepareTCAux(unsigned tc){return tc<4;}bool tcAuxHealthy(unsigned tc){return tc<4;}
@@ -68,7 +69,7 @@ struct XE {
  uintptr_t orgDisplay13EnablePort=0,orgDisplay13DisablePort=0;
  static bool display13MainLinkAUX(void*,bool,bool=false);
  static uint32_t wrapDisplay13EnablePort(void*);static uint32_t wrapDisplay13DisablePort(void*);
- static uint8_t *display13SSTPort(void*);static uint8_t *display13PanelBootPort(void*);static bool display13HDMIPort(void*);
+ static uint8_t *display13SSTPort(void*);static uint8_t *display13PanelBootPort(void*);static bool display13PanelOnlyClock();static bool display13HDMIPort(void*);
  static uint32_t wrapDisplay13TCSignal(void*,uint32_t,uint32_t,void*){assert(false);return 1;}
  static uint32_t wrapDisplay13SignalLevels(void*,uint32_t,uint32_t,void*);
  static uint32_t wrapDisplay13TrainingPattern(void*,uint32_t);
@@ -225,7 +226,21 @@ int main(int argc,char **argv){
   put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));++panelBootCases;
   assert(objectRefs.empty());
  }
- printf("PASS Display13 eDP boot handoff: %u mode 0 admission cases, only the VBT panel on Combo A/B\n",panelBootCases);
+ for(unsigned ddi=0;ddi<2;++ddi) {
+  // The clock path: a VBT panel next to another output, booted on the panel, its pipe alone. Raptor Lake-U stays out.
+  Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20,true);auto &c=display13FBPower;
+  assert(!XE::display13PanelOnlyClock());++panelBootCases;
+  c.bridge.bootPort=ddi;c.pipe[0].memoryFramebuffer=f.fb;
+  for(uint32_t id:{0xA7A08086U,0xA7A88086U,0x46A68086U}){state.xeProfile.identity=id;assert(XE::display13PanelOnlyClock());++panelBootCases;}
+  for(uint32_t id:{0xA7218086U,0xA7A18086U,0xA7A98086U,0xA7AC8086U,0xA7AD8086U}){state.xeProfile.identity=id;assert(!XE::display13PanelOnlyClock());++panelBootCases;}
+  state.xeProfile.identity=0xA7A08086U;
+  c.pipe[1].memoryFramebuffer=f.fb;assert(!XE::display13PanelOnlyClock());c.pipe[1].memoryFramebuffer=nullptr;++panelBootCases;
+  c.bridge.bootPort=1-ddi;assert(!XE::display13PanelOnlyClock());c.bridge.bootPort=ddi;++panelBootCases;
+  assert(XE::display13PanelOnlyClock()&&!locked);
+  Fixture g(0,0,ddi);Map other;setup(g,other,ddi,0,4,20);display13FBPower.bridge.bootPort=ddi;display13FBPower.pipe[0].memoryFramebuffer=g.fb;
+  assert(!XE::display13PanelOnlyClock());++panelBootCases;
+ }
+ printf("PASS Display13 eDP boot handoff: %u mode 0 admission and clock path cases, only the VBT panel on Combo A/B\n",panelBootCases);
  unsigned count=0,replays=0;
  for(unsigned ddi=0;ddi<2;++ddi)for(unsigned pipe=0;pipe<3;++pipe)for(unsigned lanes:{1U,2U,4U})
  for(unsigned rate:{6U,10U,20U,30U})for(unsigned swing=0;swing<4;++swing)for(unsigned emphasis=0;emphasis<4-swing;++emphasis){

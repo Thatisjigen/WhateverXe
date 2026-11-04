@@ -33,6 +33,11 @@ inline bool multiOutputWiring(const Display13OutputWiring &w) {
 inline bool singleOutputWiring(const Display13OutputWiring &w) {
     return selectedWiring(w) && !multiOutputWiring(w);
 }
+// An eDP panel next to other VBT outputs counts as multi-output, but while its
+// boot pipe A is the only one with a framebuffer a clock change has no peer to order.
+inline bool panelOnlyClock(const Display13OutputWiring &w,uint32_t bootPort,bool pipeA,bool pipeB,bool pipeC) {
+    return multiOutputWiring(w) && bootPort<Ports && (w.panel&(1U<<bootPort)) && pipeA && !pipeB && !pipeC;
+}
 inline uint32_t singleDDI(const Display13OutputWiring &w) {
     if(!singleOutputWiring(w))return UINT32_MAX;
     for(unsigned d=0;d<Ports;++d)if(w.selected()&(1U<<d))return d;

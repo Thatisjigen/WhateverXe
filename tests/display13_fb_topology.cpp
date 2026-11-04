@@ -172,6 +172,26 @@ int main() {
      Platform in,out;memset(out.data(),0x5a,Bytes);auto saved=out;in.config(2)[2]=0;
      assert(!apply(out.data(),Bytes,in.data(),w) && !memcmp(out.data(),saved.data(),Bytes));}
     assert(singleOutputWiring(wiring));
+    {
+        // The single-output clock path is for a VBT eDP panel whose pipe is alone. Every other board stays on the dual path.
+        Display13OutputWiring panelTC;panelTC.valid=true;panelTC.panel=1;panelTC.dp=8;panelTC.typeC=8;
+        Display13OutputWiring panelHDMI;panelHDMI.valid=true;panelHDMI.panel=1;panelHDMI.hdmi=2;panelHDMI.ddc[1]=2;
+        Display13OutputWiring twoHDMI;twoHDMI.valid=true;twoHDMI.hdmi=3;twoHDMI.ddc[0]=1;twoHDMI.ddc[1]=2;
+        Display13OutputWiring hdmiTC;hdmiTC.valid=true;hdmiTC.hdmi=1;hdmiTC.ddc[0]=1;hdmiTC.dp=8;hdmiTC.typeC=8;
+        Display13OutputWiring dsiTC;dsiTC.valid=true;dsiTC.dsi=1;dsiTC.dp=8;dsiTC.typeC=8;
+        Display13OutputWiring panelOnly;panelOnly.valid=true;panelOnly.panel=1;
+        const Display13OutputWiring others[] {twoHDMI,hdmiTC,dsiTC,panelOnly};
+        assert(panelTC.described() && panelHDMI.described());
+        for(const auto &w:others)assert(w.described());
+        for(unsigned frames=0;frames<8;++frames) {
+            const bool a=frames&1,b=frames&2,c=frames&4;
+            assert(panelOnlyClock(panelTC,0,a,b,c)==(frames==1));
+            assert(panelOnlyClock(panelHDMI,0,a,b,c)==(frames==1));
+            assert(!panelOnlyClock(panelTC,3,a,b,c) && !panelOnlyClock(panelHDMI,1,a,b,c) && !panelOnlyClock(panelTC,UINT32_MAX,a,b,c));
+            for(const auto &w:others)for(uint32_t boot=0;boot<4;++boot)assert(!panelOnlyClock(w,boot,a,b,c));
+        }
+        assert(multiOutputWiring(twoHDMI) && multiOutputWiring(hdmiTC) && multiOutputWiring(dsiTC) && singleOutputWiring(panelOnly));
+    }
     auto invalid=wiring;invalid.ddc[1]=4;assert(bootDDI(invalid,0x90030100)==UINT32_MAX);
     puts("PASS AlderLakeN connector policy: stable identities/counts/pool, A/DDC1, B/DDC2 and A+B; measured single-GOP bootstrap, excluded connectors, malformed wiring and foreign config rejection. CPU only.");
 }
