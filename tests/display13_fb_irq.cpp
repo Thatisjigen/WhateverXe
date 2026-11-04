@@ -471,5 +471,34 @@ int main() {
      assert(!quiescent(a,state,128,0));}
     {IO b;State state;b.r[0x70008]=0;assert(quiescent(b,state,32,0));
      for(auto reg:b.reads)assert(reg!=0x64000);}
+    {
+        // A system sleep zeroes the hotplug banks. armDetection puts back the detection alone; restoreHotplug
+        // also the owned interrupt bits and the HPD-only state, pipes masked; both leave a foreign or dead state alone.
+        constexpr uint32_t ports=0x09,typeC=0x08;
+        const auto sleep=[](IO &io) {
+            io.r[DDIControl]=io.r[TCControl]=io.r[NorthControl]=0;io.r[0xC400C]=0;io.r[0xC4004]=~0U;
+            io.r[HPDBank+4]=0;io.r[HPDBank-4]=~0U;io.r[GfxMaster]=io.r[Master]=0;
+            for(unsigned p=0;p<3;++p) {io.r[PipeIIR(p)+4]=0;io.r[PipeIIR(p)-4]=~0U;}
+        };
+        IO io;State s;
+        assert(enable(io,s,0,0,1,ports,typeC)==Status::Complete && s.enabled && s.active==1);
+        io.r[0x70008]=0;assert(disable(io,s)==Status::Complete && !s.enabled);
+        sleep(io);
+        assert(armDetection(io,s)==Status::Complete && !s.enabled && !(io.r[Master]&Enable) && !io.r[0xC400C]);
+        assert((io.r[DDIControl]&ddiMask(s,8))==ddiMask(s,8) && (io.r[NorthControl]&northControl(s,8))==northControl(s,8));
+        sleep(io);
+        assert(restoreHotplug(io,s,0)==Status::Complete && s.enabled && !s.active && (io.r[Master]&Enable) && (io.r[GfxMaster]&Enable));
+        assert((io.r[0xC400C]&pchOwned(s))==pchOwned(s) && !(io.r[0xC4004]&pchOwned(s)) && (io.r[HPDBank+4]&northOwned(s))==northOwned(s));
+        for(unsigned p=0;p<3;++p)assert(!(io.r[PipeIIR(p)+4]&PipeOwned));
+        assert(restoreHotplug(io,s,0)==Status::Unavailable);
+        io.writes.clear();assert(hotplugOnly(io,s,true)==Status::Complete && io.writes.empty());
+        IO dead;State ds;assert(enable(dead,ds,0,0,1,ports,typeC)==Status::Complete);
+        dead.r[0x70008]=0;assert(disable(dead,ds)==Status::Complete);sleep(dead);
+        dead.writes.clear();dead.wells=0;
+        assert(armDetection(dead,ds)==Status::Power && restoreHotplug(dead,ds,0)==Status::Power && dead.writes.empty());
+        dead.wells=0xFC0F;dead.r[0xC400C]=0x4;dead.r[0xC4004]=0;
+        assert(restoreHotplug(dead,ds,0)==Status::ForeignIRQ && dead.writes.empty() && !ds.enabled);
+        State never;assert(armDetection(dead,never)==Status::Unavailable && restoreHotplug(dead,never,0)==Status::Unavailable);
+    }
     puts("AlderLakeN Display13 IRQ fixtures passed: powered banks, native events, W1C isolation and fault masking");
 }

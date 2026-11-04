@@ -7044,6 +7044,8 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
 bool XE::display13SystemSleep() {return display13SleepRequested && !callbackXE->adlnOutputWiring.dsi;}
 // Set when the sleep override, not the donor, turned display interrupts off; cleared once they are on again.
 static bool display13SleepIRQOff {};
+// Set by the sleep power override, cleared by the first power restore after it.
+static bool display13WakePending {};
 uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing) {
     auto self=callbackXE;
     // The GOP-preserving surface adapter must replace this refusal before
@@ -7059,7 +7061,8 @@ uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing
         [&](){return FunctionCast(wrapDisplay13TCSetMode,self->orgDisplay13TCSetMode)(controller,fb,timing);},
         [&](){reinterpret_cast<void (*)(void *,void *,uint32_t)>(self->display13TCNotify)(controller,fb,1);});
     // The wake restore cannot turn display interrupts back on in the multi-output wiring, as no pipe is active yet.
-    // The first completed modeset after the wake has lit one.
+    // The first completed modeset after the wake has lit one. If the restore already put back the HPD-only state,
+    // the same call admits the lit pipes (extendActivePipes), in case no ConfigureVBL did.
     if(display13SleepIRQOff && wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE))==kIOReturnSuccess)
         display13SleepIRQOff=false;
     return result;
@@ -10194,6 +10197,7 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	if(result.status!=Display13Power::Status::Complete)adlnFault(c.bridge.state.faulted,__LINE__);
 	display13FBPowerRecord(record,8,enable,result);IOLockUnlock(c.lock);
 	adlnPublishPowerRecord("N97FBPowerOverride",record);
+	if(!enable && display13SystemSleep())display13WakePending=true;
 }
 void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 	auto &c=display13FBPower;if(!c.lock || power!=c.power || !c.controller)return;
@@ -10213,6 +10217,22 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 	if(display13SleepIRQOff && result.status==Display13Power::Status::Complete) {
 		if(!display13FBIRQ.state.enabled)wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE));
 		if(display13FBIRQ.state.enabled)display13SleepIRQOff=false;
+	}
+	// Interrupts still off means the hotplug detection reset by the sleep is off too, and the donor's panel power-on in
+	// the first modeset waits for an HPD it cannot see. Put back the HPD-only state the display had before the sleep,
+	// which the next sleep's engine stop verifies; if that is refused, arm the detection alone.
+	if(display13WakePending) {
+		display13WakePending=false;
+		if(result.status==Display13Power::Status::Complete && !display13FBIRQ.state.enabled && display13FBIRQ.lock && display13FBIRQ.base &&
+		   adlnIRQOwner(display13FBIRQ.controller)) {
+			auto &irq=display13FBIRQ;Display13FBIRQIO irqIO {irq.base};
+			const auto saved=IOSimpleLockLockDisableInterrupt(irq.lock);
+			const auto hotplug=irq.quiescing || irq.handlers ? Display13FBIRQ::Status::Unavailable :
+				Display13FBIRQ::restoreHotplug(irqIO,irq.state,adlnSharedGT(irq.controller));
+			if(hotplug!=Display13FBIRQ::Status::Complete && !irq.state.enabled)Display13FBIRQ::armDetection(irqIO,irq.state);
+			adlnIRQCache(irq.controller,irqIO);
+			IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
+		}
 	}
 }
 

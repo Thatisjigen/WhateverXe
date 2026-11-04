@@ -421,6 +421,69 @@ template<class IO> Status hotplugOnly(IO &io,State &s,bool preservePipeStatus=fa
     if(!(io.read(Master)&Enable))return fail(io,s,Status::Readback);
     s.enabled=true;return Status::Complete;
 }
+// A system sleep resets the PCH and north hotplug banks. The donor waits for the eDP HPD live state inside the first
+// modeset after the wake, before enable() can run with no active pipe, and treats a low HPD as no panel. Turn the
+// detection of the owned ports back on, alone: IER, IMR, master and the sticky status stay untouched, the next enable()
+// clears that status. i915 likewise re-runs intel_hpd_init before restoring the display on resume.
+template<class IO> Status armDetection(IO &io,const State &s) {
+    if(!s.begun || s.faulted)return Status::Unavailable;
+    const auto wells=io.read(Driver);
+    if(wells==UINT32_MAX || (wells&3)!=3)return Status::Power;
+    const auto ddi=io.read(DDIControl);if(ddi==UINT32_MAX)return Status::Readback;
+    if((ddi&ddiMask(s,8))!=ddiMask(s,8))io.write(DDIControl,(ddi&~0x3333U)|ddiMask(s,8));
+    if(s.ports&0x78) {
+        const auto tc=io.read(TCControl);if(tc==UINT32_MAX)return Status::Readback;
+        if((tc&tcMask(s,8))!=tcMask(s,8))io.write(TCControl,(tc&~0x333333U)|tcMask(s,8));
+        if((io.read(TCControl)&tcMask(s,8))!=tcMask(s,8))return Status::Readback;
+    }
+    // A USB-C DP Alt port is detected by the north TC_HOTPLUG_CTL, which enable() programs through northControl().
+    if(s.typeC) {
+        const auto north=io.read(NorthControl);if(north==UINT32_MAX)return Status::Readback;
+        if((north&northControl(s,8))!=northControl(s,8))io.write(NorthControl,(north&~0x333333U)|northControl(s,8));
+        if((io.read(NorthControl)&northControl(s,8))!=northControl(s,8))return Status::Readback;
+    }
+    return (io.read(DDIControl)&ddiMask(s,8))==ddiMask(s,8) ? Status::Complete : Status::Readback;
+}
+// With the display off the multi-output wiring keeps the interrupts in the HPD-only state, and the engine stop of the
+// next sleep verifies that state. After a system sleep the banks are zero and enable() waits for an active pipe, so a
+// dark wake without a modeset leaves them empty, the next stop reports Conflict and every later modeset is refused.
+// Put back what enable() programs for hotplug and enter the same HPD-only state, pipes masked. ConfigureVBL then admits
+// the pipes with extendActivePipes, as after a display-only sleep.
+template<class IO> Status restoreHotplug(IO &io,State &s,uint32_t sharedGT) {
+    if(!s.begun || s.faulted || s.enabled || (sharedGT && sharedGT!=NativeGT))return Status::Unavailable;
+    if(!available(io) || (s.typeC && !io.readable(NorthControl)) || ((s.ports&0x78) && !io.readable(TCControl)))return Status::Unavailable;
+    const auto master=io.read(Master),wells=io.read(Driver);
+    if(master==UINT32_MAX || wells==UINT32_MAX)return Status::Readback;
+    if(master&Enable)return Status::Unavailable;
+    if((wells&3)!=3)return Status::Power;
+    if(io.read(GfxMaster)&((3U)|(3U<<29))&~sharedGT)return Status::ForeignIRQ;
+    const auto pchIER=io.read(0xC400C),pchIMR=io.read(0xC4004);
+    if(pchIER==UINT32_MAX)return Status::Readback;
+    if((pchIER&~pchIMR)&~(pchOwned(s)|s.excludedPCH))return Status::ForeignIRQ;
+    const auto ddi=io.read(DDIControl);if(ddi==UINT32_MAX)return Status::Readback;
+    io.write(DDIControl,(ddi&~0x3333U)|ddiMask(s,8)|(ddi&ddiMask(s,3)));
+    if(s.ports&0x78) {
+        const auto tc=io.read(TCControl);if(tc==UINT32_MAX)return Status::Readback;
+        io.write(TCControl,(tc&~0x333333U)|tcMask(s,8)|(tc&tcMask(s,3)));
+    }
+    if(s.typeC) {
+        const auto ctl=io.read(NorthControl);
+        if(ctl==UINT32_MAX)return Status::Readback;
+        io.write(NorthControl,(ctl&~0x333333U)|northControl(s,8)|(ctl&northControl(s,3)));
+        io.write(HPDBank-4,io.read(HPDBank-4)&~northOwned(s));
+        io.write(HPDBank+4,io.read(HPDBank+4)|northOwned(s));
+        const auto staleNorth=io.read(HPDBank)&northOwned(s);if(staleNorth)io.write(HPDBank,staleNorth);
+        if((io.read(NorthControl)&northControl(s,8))!=northControl(s,8) ||
+           (io.read(HPDBank+4)&northOwned(s))!=northOwned(s) || (io.read(HPDBank-4)&northOwned(s)))
+            return Status::Readback;
+    }
+    io.write(0xC4004,io.read(0xC4004)&~pchOwned(s));
+    io.write(0xC400C,io.read(0xC400C)|pchOwned(s));
+    const auto stale=io.read(0xC4008)&pchOwned(s);if(stale)io.write(0xC4008,stale);
+    io.write(GfxMaster,Enable);
+    if(!(io.read(GfxMaster)&Enable))return Status::Readback;
+    return hotplugOnly(io,s,true);
+}
 // The runtime supplies one mask to WM checks, this hardware proof and its
 // access block. Never silently derive a different DDI mapping inside the proof.
 template<class IO> bool quiescentPipes(IO &io,const State &s,uint32_t domains,unsigned handlers,uint32_t pipes) {
