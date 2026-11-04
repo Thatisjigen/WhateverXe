@@ -88,6 +88,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - Experimental: `-wex-reset-recover` saves the render engine's mode, status-page, chicken and user-mode whitelist registers and its cache-control (MOCS and L3) tables just before a render-domain GPU hang reset and writes them back after the reset, before work is replayed, on GPUs where the reset clears them, and completes stamps whose work the reset lost: two seconds after the reset, and later whenever a waiter times out on one that has stopped moving. It also enables the reset trace.
 - Experimental: `-wex-hidpi-dbuf` gives the cursor 96 DBUF blocks instead of 40 and an RGB primary its planned allocation from the first write, for HiDPI modes behind the pipe scaler at high refresh rates.
 - Experimental: `-wex-scanout-coherent` treats every surface the donor flips to a display plane as displayable, so its later rendering uses the donor's display-safe (not LLC-cached) MOCS. The display engine does not snoop the LLC.
+- `IOVARendererID` is hidden by default on the display family where advertising it crashes the VA driver during image conversion (`VTPixelTransferSession`, Photo Booth, mediaanalysisd); other machines on the same kext keep it. Experimental: `-wex-va-renderer` keeps it advertised there too, for GPUs that want the VA renderer and do not hit the crash, at the cost that HEVC may then fall back to software in Apple's decoder service.
 
 ## Tested features and known issues
 
