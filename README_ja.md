@@ -84,6 +84,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - GPUは自動選択するため、通常は`device-id`上書きは不要です。
 - Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/Pではタイル形式を自動選択します。`-yTileDisable`は使わないでください。`AAPL,GfxYTile`は不要です。
 - 実験的機能: `-wex-hidpi-dbuf` を指定すると、カーソルのDBUFを40ブロックから96ブロックに増やし、RGBプライマリには最初の書き込みから計画どおりの割り当てを与えます。高リフレッシュレートでパイプスケーラを使うHiDPIモード向けです。
+- 実験的機能: `-wex-scanout-coherent` を指定すると、ドナーがディスプレイプレーンにフリップしたサーフェスをすべて表示可能として扱い、以降の描画にドナーのディスプレイ安全な（LLCにキャッシュしない）MOCSを使います。ディスプレイエンジンはLLCをスヌープしません。
 
 ## 動作確認済みの機能と既知の問題
 

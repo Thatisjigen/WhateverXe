@@ -84,6 +84,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - GPU selection is automatic; a `device-id` override is normally unnecessary.
 - Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P select tiling automatically. Do not use `-yTileDisable`; `AAPL,GfxYTile` is unnecessary.
 - Experimental: `-wex-hidpi-dbuf` gives the cursor 96 DBUF blocks instead of 40 and an RGB primary its planned allocation from the first write, for HiDPI modes behind the pipe scaler at high refresh rates.
+- Experimental: `-wex-scanout-coherent` treats every surface the donor flips to a display plane as displayable, so its later rendering uses the donor's display-safe (not LLC-cached) MOCS. The display engine does not snoop the LLC.
 
 ## Tested features and known issues
 
