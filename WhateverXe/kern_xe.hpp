@@ -433,6 +433,8 @@ private:
     static uint32_t wrapHDRValidateTiming(IOService *fb,void *description,unsigned long long size);
     mach_vm_address_t orgHDRSetupTiming {};
     static void wrapHDRSetupTiming(IOService *fb,const void *in,void *out);
+    mach_vm_address_t orgHDRRegsNeedUpdate {};
+    static bool wrapHDRRegsNeedUpdate(void *controller,IOService *fb,void *path,void *crtc,const void *timing,void *scaler);
     static char *wrapHDRLeaf7Names(uint64_t features,char *buffer,uint32_t length);
     static void holdDisplay13TCWake(IOService *fb);
     mach_vm_address_t orgAlderLakeNGamma10 {},adlnGammaTableUpdate {},orgAlderLakeNPreGamma {};
