@@ -6270,7 +6270,7 @@ static void display13PlaneWatch(thread_call_param_t,thread_call_param_t) {
 		const uint32_t control=reg(0x70180);
 		display13PlaneRecord[3]=reg(0x70034);
 		if(control!=UINT32_MAX && control && !(control&0x80000000U)) {
-			reg(0x70180)=control|0x80000000U;
+			reg(0x70180)=Display13WM::arbitrationControl(control|0x80000000U);
 			reg(0x7019C)=reg(0x7019C);
 			++display13PlaneRecord[2];
 		}
