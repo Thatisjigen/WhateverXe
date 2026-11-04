@@ -83,6 +83,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - 内蔵画面の輝度調整には`SSDT-PNLF`を追加します。
 - GPUは自動選択するため、通常は`device-id`上書きは不要です。
 - Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/Pではタイル形式を自動選択します。`-yTileDisable`は使わないでください。`AAPL,GfxYTile`は不要です。
+- 実験的機能: `-wex-tc-stop-link` を指定すると、通常のクロック停止が拒否された場合に、ディスプレイを失ったUSB-Cポートのリンクを解放処理のリトライで停止します。実機ではまだ動作を確認していません。
 
 ## 動作確認済みの機能と既知の問題
 

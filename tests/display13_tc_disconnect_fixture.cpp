@@ -27,6 +27,7 @@ struct Context {
  Display13Power::NativeBridge bridge;Mode tcMode[4];OSObject *tcObject[4]{};MMIO *map=nullptr;
  alignas(8) uint8_t controllerBytes[0xe08]{},powerBytes[0x80]{};
  unsigned tcBusy[4]{};IOWorkLoop *workLoop=&::workLoop;
+ struct Link{unsigned rate;} tcDPLink[4]{};
  void *controller=controllerBytes,*power=powerBytes,*lock=(void*)1;bool tcSignalReady[4]{},clockFaulted=false;
 } display13FBPower;
 struct Display13FBPowerIO {
@@ -73,6 +74,9 @@ unsigned XE::wrapDisplay13TCMode(OSObject*p,unsigned wanted){
 // PRODUCTION_DRAIN
 static constexpr uint32_t display13TCReleaseEmptyTicks=3,display13TCReleaseLimit=600;
 static uint32_t display13TCReleaseEmpty[4],display13TCReleaseTries[4];
+static bool display13TCStopLink;
+struct Display13DeferredClock {void *port {};uint32_t value {};bool pending {};};
+static Display13DeferredClock display13DeferredClocks[3];
 // PRODUCTION_RELEASE
 template<class T>void put(void*p,unsigned at,T value){memcpy(static_cast<uint8_t*>(p)+at,&value,sizeof(value));}
 int main(){
@@ -155,7 +159,19 @@ int main(){
   assert(step(false)&&mode.phase==Mode::Phase::Active&&io.nativeMode()==3); // Work loop gate busy: nothing happens.
   c.tcBusy[p.tc]=1;assert(step(true)&&io.nativeMode()==3);c.tcBusy[p.tc]=0;
   map.regs[0x64310+256*p.tc]=0;
-  // STOP_LINK_CASES
+  if(!asked) {
+   // The native clock stop never came. Without the argument the tick leaves the link alone; with it, a transcoder on
+   // the DDI blocks the stop, then the tick does it and the next one releases.
+   assert(c.bridge.getDDI(power,d).status==Display13Power::Status::Complete);
+   map.regs[p.pll]=0xcc000000;map.regs[p.clock]=0x80001234;map.regs[Clock::Gate]&=~Clock::gateBit(p.tc);c.tcSignalReady[p.tc]=true;
+   map.regs[0x46140]=(d+3)<<28|5;display13DeferredClocks[0]={&port,9,true};
+   display13TCStopLink=false;assert(step(true)&&map.regs[p.pll]==0xcc000000&&c.tcSignalReady[p.tc]);display13TCStopLink=true;
+   const auto wells=map.regs[0x45404];map.regs[0x45404]|=1U<<10;map.regs[0x60400]=0x80000000U|((d+1)<<27);
+   assert(step(true)&&map.regs[p.pll]==0xcc000000&&map.regs[0x46140]==((d+3)<<28|5));
+   map.regs[0x60400]=0;map.regs[0x45404]=wells;
+   assert(step(true)&&!(map.regs[p.pll]&0xcc000000U)&&!c.bridge.nativeDDIRefs(d)&&!c.tcSignalReady[p.tc]);
+   assert(map.regs[0x46140]==5&&!display13DeferredClocks[0].pending);
+  }
   assert(!step(true)&&mode.phase==Mode::Phase::Idle&&!io.nativeMode()&&!(map.regs[p.buffer]&64)&&!c.tcObject[p.tc]);
   assert(!step(true)&&!display13TCReleaseEmpty[p.tc]&&!display13TCReleaseTries[p.tc]);
  }

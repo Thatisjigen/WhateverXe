@@ -83,6 +83,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - Add `SSDT-PNLF` for internal-display brightness control.
 - GPU selection is automatic; a `device-id` override is normally unnecessary.
 - Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P select tiling automatically. Do not use `-yTileDisable`; `AAPL,GfxYTile` is unnecessary.
+- Experimental: `-wex-tc-stop-link` lets the USB-C release retry stop the link of a port that lost its display when the normal clock stop was refused. It has not been exercised on real hardware.
 
 ## Tested features and known issues
 

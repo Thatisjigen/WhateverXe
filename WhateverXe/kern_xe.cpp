@@ -7604,9 +7604,11 @@ static constexpr uint32_t display13TCReleaseWatch=120,display13TCReleaseEmptyTic
 static thread_call_t display13TCReleaseCall;
 static bool display13TCReleaseArmed;
 static uint32_t display13TCReleaseLeft,display13TCReleaseEmpty[4],display13TCReleaseTries[4];
+static bool display13TCStopLink;
 
 void XE::display13TCReleaseSetup() {
  if(!display13TCReleaseCall)display13TCReleaseCall=thread_call_allocate(display13TCReleaseTick,nullptr);
+ display13TCStopLink=checkKernelArgument("-wex-tc-stop-link");
 }
 
 void XE::display13TCReleaseArm() {
@@ -7630,10 +7632,27 @@ bool XE::display13TCReleaseStep(unsigned tc,bool gated) {
  if(!mode.disconnectPending && empty<display13TCReleaseEmptyTicks) {tries=0;return empty!=0;}
  if(tries>=display13TCReleaseLimit)return false;
  ++tries;
- if(gated && !c.tcBusy[tc]) {
+ uint32_t result=0;const bool tried=gated && !c.tcBusy[tc];
+ if(tried) {
   port->retain();IOLockUnlock(c.lock);
-  wrapDisplay13TCMode(port,0);port->release();
+  result=wrapDisplay13TCMode(port,0);port->release();
   IOLockLock(c.lock);
+ }
+ // -wex-tc-stop-link: the native clock stop was refused or never came (a latch makes display13SSTPort null, and
+ // display13StopTranscoder then refuses it), so the PLL and the DDI reference stay up and the retried mode 0 cannot complete.
+ // With no sink, no transcoder on the DDI and the buffer off, nothing is left to order against. stopLink keeps its own checks
+ // and never puts an absent DDI reference, so a repeat is harmless; the next tick does the mode 0.
+ if(display13TCStopLink && result && tried && empty>=display13TCReleaseEmptyTicks && c.tcObject[tc]==port &&
+    !c.tcBusy[tc] && !c.bridge.nativeAUXRefs(ddi) && io.quiescent(ddi)) {
+  const auto pll=io.read(p.pll);
+  if(pll!=UINT32_MAX && ((pll&0xcc000000U) || c.bridge.nativeDDIRefs(ddi))) {
+   for(unsigned pipe=0;pipe<3;++pipe) {
+    auto &deferred=display13DeferredClocks[pipe];if(deferred.port==port)deferred={};
+    const auto clock=io.read(0x46140+4*pipe);
+    if(clock!=UINT32_MAX && (clock>>28)==ddi+3)io.write(0x46140+4*pipe,clock&0x0fffffffU);
+   }
+   if(Display13TC::Clock::stopLink(io,p)){c.tcSignalReady[tc]=false;c.tcDPLink[tc]={};}
+  }
  }
  const bool released=mode.phase==Display13TC::Mode::Phase::Idle;
  if(released)empty=tries=0;
