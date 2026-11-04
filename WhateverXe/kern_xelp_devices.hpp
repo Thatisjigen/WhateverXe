@@ -92,6 +92,11 @@ inline bool mobileDisplay13Device(uint32_t pci) {
     const auto e=deviceEntry(pci);
     return e && e->backend==GT::ADLPMobile;
 }
+// Recognized, but their dedicated display-clock handling is not implemented: docs/device-selection.md.
+inline bool raptorLakeUDevice(uint32_t pci) {
+    if((pci&0xFFFF)!=0x8086)return false;
+    const auto id=pci>>16;return id==0xA721 || id==0xA7A1 || id==0xA7A9 || id==0xA7AC || id==0xA7AD;
+}
 inline bool desktopGTDevice(uint32_t pci) {
     const auto e=deviceEntry(pci);
     return e && (e->family==Family::AlderLakeS || e->family==Family::RaptorLakeS);

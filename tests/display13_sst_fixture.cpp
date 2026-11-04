@@ -68,7 +68,7 @@ struct XE {
  uintptr_t orgDisplay13EnablePort=0,orgDisplay13DisablePort=0;
  static bool display13MainLinkAUX(void*,bool,bool=false);
  static uint32_t wrapDisplay13EnablePort(void*);static uint32_t wrapDisplay13DisablePort(void*);
- static uint8_t *display13SSTPort(void*);static bool display13HDMIPort(void*);
+ static uint8_t *display13SSTPort(void*);static uint8_t *display13PanelBootPort(void*);static bool display13HDMIPort(void*);
  static uint32_t wrapDisplay13TCSignal(void*,uint32_t,uint32_t,void*){assert(false);return 1;}
  static uint32_t wrapDisplay13SignalLevels(void*,uint32_t,uint32_t,void*);
  static uint32_t wrapDisplay13TrainingPattern(void*,uint32_t);
@@ -186,6 +186,46 @@ int main(int argc,char **argv){
   assert(!XE::wrapDisplay13EnablePort(f.port));assert(!XE::wrapDisplay13DisablePort(f.port));assert(objectRefs.empty());
   display13FBPower.panelFaulted=true;assert(!XE::display13SSTPort(f.port));
  }
+ // Firmware handoff: a Combo eDP port still in native mode 0 passes only as the VBT panel. Mode 1, Type-C modes, an
+ // external DP or HDMI route on the same DDI, and every other term of the exact check stay as they were.
+ unsigned panelBootCases=0;
+ for(unsigned ddi=0;ddi<2;++ddi) {
+  Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20,true);
+  assert(XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));
+  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&XE::display13PanelBootPort(f.port)==f.port);++panelBootCases;
+  for(unsigned mode:{2U,3U,4U}){put(f.port,0x550,mode);assert(!XE::display13PanelBootPort(f.port));++panelBootCases;}
+  put(f.port,0x550,0U);assert(XE::display13PanelBootPort(f.port));
+  auto &c=display13FBPower;
+  for(bool *fault:{&c.clockFaulted,&c.memoryFaulted,&c.panelFaulted,&c.clockStopped}) {
+   *fault=true;assert(!XE::display13PanelBootPort(f.port));*fault=false;++panelBootCases;
+  }
+  f.port[0x117]=1;assert(!XE::display13PanelBootPort(f.port));f.port[0x117]=0;++panelBootCases;
+  put(f.port,0x120,1-ddi);assert(!XE::display13PanelBootPort(f.port));put(f.port,0x120,ddi);++panelBootCases;
+  put(f.port,0x578,static_cast<void *>(f.fb));assert(!XE::display13PanelBootPort(f.port));put(f.port,0x578,static_cast<void *>(f.access));++panelBootCases;
+  bound=false;assert(!XE::display13PanelBootPort(f.port));bound=true;++panelBootCases;
+  state.display13FBSSTHooksReady=false;assert(!XE::display13PanelBootPort(f.port));state.display13FBSSTHooksReady=true;++panelBootCases;
+  state.xeProfile.display=XELP::Display::XeD;assert(!XE::display13PanelBootPort(f.port));state.xeProfile.display=XELP::Display::XeLPD;++panelBootCases;
+  for(uint32_t id:{0xA7218086U,0xA7A18086U,0xA7A98086U,0xA7AC8086U,0xA7AD8086U}){state.xeProfile.identity=id;assert(!XE::display13PanelBootPort(f.port));++panelBootCases;}
+  for(uint32_t id:{0xA7208086U,0xA7A08086U,0xA7A88086U,0xA7AA8086U,0xA7AB8086U,0x46A68086U,0x46D08086U}){state.xeProfile.identity=id;assert(XE::display13PanelBootPort(f.port));++panelBootCases;}
+  state.xeProfile.identity=0;
+  // No other SST caller is loosened: with mode 0 they still refuse, once the native mode is set they run as before.
+  assert(XE::display13PanelBootPort(f.port));
+  assert(XE::wrapDisplay13EnablePort(f.port)==kIOReturnNotReady&&!linkCalls);
+  put(f.port,0x550,1U);assert(!XE::display13PanelBootPort(f.port)&&XE::display13SSTPort(f.port));
+  assert(!XE::wrapDisplay13EnablePort(f.port));assert(!XE::wrapDisplay13DisablePort(f.port));assert(objectRefs.empty());
+ }
+ for(unsigned ddi=0;ddi<2;++ddi) {
+  Fixture f(0,0,ddi);Map map;setup(f,map,ddi,0,4,20);
+  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));++panelBootCases;
+  assert(objectRefs.empty());
+ }
+ {
+  // A Type-C DP route is not a Combo handoff.
+  Fixture f(0,0,3);Map map;setup(f,map,3,0,4,20);
+  put(f.port,0x550,0U);assert(!XE::display13SSTPort(f.port)&&!XE::display13PanelBootPort(f.port));++panelBootCases;
+  assert(objectRefs.empty());
+ }
+ printf("PASS Display13 eDP boot handoff: %u mode 0 admission cases, only the VBT panel on Combo A/B\n",panelBootCases);
  unsigned count=0,replays=0;
  for(unsigned ddi=0;ddi<2;++ddi)for(unsigned pipe=0;pipe<3;++pipe)for(unsigned lanes:{1U,2U,4U})
  for(unsigned rate:{6U,10U,20U,30U})for(unsigned swing=0;swing<4;++swing)for(unsigned emphasis=0;emphasis<4-swing;++emphasis){
