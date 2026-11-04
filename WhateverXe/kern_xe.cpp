@@ -9987,13 +9987,41 @@ void XE::wrapAlderLakeNEngineEnable(void *power) {
 	if(callbackXE->display13FBEngineEnableHookReady && c.bridge.begun && !c.bridge.state.faulted &&
 		!c.bridge.state.suspended && acquired.status==Display13Power::Status::Complete && !c.clockFaulted && clock.status==Display13Clock::Status::Complete &&
 		Display13Power::objectAssociations(power,0x80,c.controller,0x1C20)) {
-		Display13FBDBUFIO io {c.map};
+		Display13FBDBUFIO io {c.map};uint32_t sleepInitial=0;
+		// After a system sleep the DBUF slices, the plane DDB entries and MBUS_CTL come back reset while the retained
+		// state still holds them, and resumeProof fails hardwareMatches. As i915 reprograms MBUS and the DDB on resume:
+		// write back the saved MBUS and the selected pipes' zeroed DDB entries, and forget the slice requests the hardware
+		// lost so power() requests them again. Direct writes, restricted to these registers and to this case.
+		if(display13SystemSleep() && c.dbuf.begun && !c.dbuf.faulted && !c.dbuf.updating && !c.dbuf.joined && c.dbuf.requested) {
+			bool lost=true;
+			for(unsigned i=0;i<4;++i) {
+				const auto v=io.read(Display13DBUF::regs[i]);
+				if(v==UINT32_MAX || (v&(Display13DBUF::Request|Display13DBUF::On)))lost=false;
+			}
+			if(lost) {
+				auto &q=c.dbuf;
+				auto raw=[&](uint32_t reg,uint32_t value) {*reinterpret_cast<volatile uint32_t *>(c.map->getVirtualAddress()+reg)=value;};
+				if(io.read(0x4438C)!=q.mbus)raw(0x4438C,q.mbus);
+				const auto wells=io.read(0x45404);
+				for(unsigned p=0;p<3;++p)if((q.selected&(1U<<p)) && Display13FBIRQ::powered(wells,p)) {
+					const auto pr=Display13DBUF::hardwareRaw(q,p,q.pipe[p].primary),cr=Display13DBUF::hardwareRaw(q,p,q.pipe[p].cursor);
+					if(pr==UINT32_MAX || cr==UINT32_MAX || io.read(0x7027C+0x1000*p) || io.read(0x7017C+0x1000*p))continue;
+					raw(0x7027C+0x1000*p,pr);raw(0x7017C+0x1000*p,cr);
+				}
+				q.requested=q.powered=q.owned=0;sleepInitial=q.initialRequests;
+				for(unsigned i=0;i<4;++i)q.raw[i]=io.read(Display13DBUF::regs[i]);
+			}
+		}
 		status=Display13DBUF::begin(io,c.dbuf,__builtin_popcount(callbackXE->adlnOutputWiring.selected())>=3 ? 7U : 0U,c.transcoders);
 		if(status==Display13DBUF::Status::Complete) {
 			if(acquired.status==Display13Power::Status::Complete)status=Display13DBUF::resumeEngine(io,c.dbuf);
 			else status=Display13DBUF::Status::Power;
 		}
 		if(status==Display13DBUF::Status::Complete)status=Display13DBUF::tracker(io,c.dbuf);
+		// power() requests the firmware's slices (initialRequests) again and marks them owned, and stop() keeps them
+		// requested as the predecessor's, so the next sleep would find them owned and its override would refuse.
+		// Give them back the boot state: requested, not ours.
+		if(status==Display13DBUF::Status::Complete && sleepInitial)c.dbuf.owned&=~sleepInitial;
 	}
 	c.engineEnabled=status==Display13DBUF::Status::Complete;
     // This method already holds a sleepable owner lock. Qualify immutable BAR
