@@ -83,6 +83,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - Add `SSDT-PNLF` for internal-display brightness control.
 - GPU selection is automatic; a `device-id` override is normally unnecessary.
 - Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P select tiling automatically. Do not use `-yTileDisable`; `AAPL,GfxYTile` is unnecessary.
+- Experimental: `-wex-hidpi-dbuf` gives the cursor 96 DBUF blocks instead of 40 and an RGB primary its planned allocation from the first write, for HiDPI modes behind the pipe scaler at high refresh rates.
 
 ## Tested features and known issues
 
