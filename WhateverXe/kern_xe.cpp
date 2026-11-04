@@ -96,6 +96,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <libkern/c++/OSSerialize.h>
 #include <libkern/c++/OSData.h>
+#include <kern/thread_call.h>
 
 extern "C" const char version[];
 extern "C" void tglHangPreStopWake(void *,bool,unsigned,unsigned,void *);
@@ -6152,6 +6153,7 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 	if(!c.scopes.permits(reinterpret_cast<uintptr_t>(current_thread())))return;
 	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
 	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
+	if(e.aux)display13TCReleaseArm(); // A DP Alt event: the port may have just lost its sink.
 	if(c.state.faulted) {
 		*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xD84)=0;
 		*(reinterpret_cast<uint8_t *>(controller)+0xFD4)=0;
@@ -6738,7 +6740,7 @@ uint32_t XE::wrapDisplay13TCMode(OSObject *port,uint32_t wanted) {
     IOLockLock(c.lock);const auto ddi=display13TCTarget(port,wanted==0);
     const auto selected=ddi<7 && (self->adlnOutputWiring.typeC&(1U<<ddi))?3U:4U;
     if(ddi>=7 || (wanted!=0 && wanted!=selected) || c.tcBusy[ddi-3] ||
-       (c.tcObject[ddi-3] && c.tcObject[ddi-3]!=port)) {IOLockUnlock(c.lock);return kIOReturnNotReady;}
+       (c.tcObject[ddi-3] && c.tcObject[ddi-3]!=port)) {IOLockUnlock(c.lock);if(!wanted)display13TCReleaseArm();return kIOReturnNotReady;}
     const auto tc=ddi-3;auto &mode=c.tcMode[tc];
     if(!c.tcObject[tc]){c.tcObject[tc]=port;port->retain();}
     struct IO : Display13FBTCIO {
@@ -6806,6 +6808,7 @@ uint32_t XE::wrapDisplay13TCMode(OSObject *port,uint32_t wanted) {
         uint32_t detail[] {1,ddi,result.phy.before,result.phy.after,result.phy.writes,result.phy.elapsedUs};
         root->setProperty("WEXDisplay13TCModeFailureState",detail,sizeof(detail));
     }
+    if(!wanted && !done)display13TCReleaseArm();
     return done ? kIOReturnSuccess : kIOReturnNotReady;
 }
 
@@ -7143,6 +7146,7 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
         }
     }
+    if(adlnOutputWiring.typeC)display13TCReleaseSetup();
     display13FBDPHooksReady=true;display13FBPower.tcSupported=true;return processDisplay13Training(patcher,index,address,size);
 }
 
@@ -7585,6 +7589,79 @@ uint8_t *XE::display13SSTPort(void *port) {
     Display13FBMemory::field<uint32_t>(p,0x120)!=config[0] || Display13FBMemory::field<uint32_t>(p,0x550)!=(config[0]>=3?((s->adlnOutputWiring.typeC&(1U<<config[0]))?3U:4U):1U) ||
     Display13FBMemory::field<void *>(p,0x578)!=c.access)return nullptr;
  return p;
+}
+
+// A DP Alt port that lost its sink has to give the PHY back, and the only route to that is one setPortMode(0) from the donor
+// and, when that is refused, one drain as the framebuffer's last path goes. A port that never lit has no path, and a latched
+// fault stops the path free and the clock stop, so nothing comes back to disconnectPending and the PHY ownership and the
+// leases stay held with no sink. Linux does this job from a delayed work 1 s after the last link reference goes
+// (disconnect_phy_work, intel_tc.c). Retry from a 1 s thread call, armed by every DP Alt event and every refused mode 0.
+static constexpr uint32_t display13TCReleaseWatch=120,display13TCReleaseEmptyTicks=3,display13TCReleaseLimit=600;
+static thread_call_t display13TCReleaseCall;
+static bool display13TCReleaseArmed;
+static uint32_t display13TCReleaseLeft,display13TCReleaseEmpty[4],display13TCReleaseTries[4];
+
+void XE::display13TCReleaseSetup() {
+ if(!display13TCReleaseCall)display13TCReleaseCall=thread_call_allocate(display13TCReleaseTick,nullptr);
+}
+
+void XE::display13TCReleaseArm() {
+ if(!display13TCReleaseCall)return;
+ __atomic_store_n(&display13TCReleaseLeft,display13TCReleaseWatch,__ATOMIC_RELEASE);
+ if(__atomic_exchange_n(&display13TCReleaseArmed,true,__ATOMIC_ACQ_REL))return;
+ uint64_t deadline;clock_interval_to_deadline(1,kSecondScale,&deadline);
+ thread_call_enter_delayed(display13TCReleaseCall,deadline);
+}
+
+// Enters and leaves with the owner lock, which it drops around the native mode 0. Returns whether the port still needs a tick.
+bool XE::display13TCReleaseStep(unsigned tc,bool gated) {
+ auto self=callbackXE;auto &c=display13FBPower;auto &mode=c.tcMode[tc];const auto ddi=tc+3;
+ auto port=c.tcObject[tc];auto &empty=display13TCReleaseEmpty[tc];auto &tries=display13TCReleaseTries[tc];
+ Display13TC::Port p;
+ if(!port || !(self->adlnOutputWiring.typeC&(1U<<ddi)) || mode.phase==Display13TC::Mode::Phase::Idle ||
+    !Display13TC::Port::resolve(ddi,p)) {empty=tries=0;return false;}
+ Display13FBTCIO io{port,tc};
+ empty=p.altHPD(io.read(0xc4000),io.read(0x44470))?0:empty+1;
+ // The donor asked for mode 0, or the sink has been gone for a few seconds and it never did (a port that never lit).
+ if(!mode.disconnectPending && empty<display13TCReleaseEmptyTicks) {tries=0;return empty!=0;}
+ if(tries>=display13TCReleaseLimit)return false;
+ ++tries;
+ if(gated && !c.tcBusy[tc]) {
+  port->retain();IOLockUnlock(c.lock);
+  wrapDisplay13TCMode(port,0);port->release();
+  IOLockLock(c.lock);
+ }
+ const bool released=mode.phase==Display13TC::Mode::Phase::Idle;
+ if(released)empty=tries=0;
+ return !released;
+}
+
+void XE::display13TCReleaseTick(void *,void *) {
+ auto self=callbackXE;auto &c=display13FBPower;bool again=false;
+ if(self && c.lock && self->display13FBTCHooksReady) {
+  IOLockLock(c.lock);
+  auto gate=c.workLoop;
+  if(c.controller && c.map && c.tcSupported && c.bridge.begun && !c.bridge.state.suspended) {
+   // Same nonblocking gate as finishDisplay13TCShutdown: mode 0 must not race hotplug on the work loop.
+   const bool gated=gate && Display13FBMemory::field<IOWorkLoop *>(c.controller,0xE00)==gate &&
+    self->adlnWorkLoopTryClose && self->adlnWorkLoopOpen &&
+    reinterpret_cast<bool (*)(IOWorkLoop *)>(self->adlnWorkLoopTryClose)(gate);
+   for(unsigned tc=0;tc<4;++tc)if(display13TCReleaseStep(tc,gated))again=true;
+   IOLockUnlock(c.lock);
+   if(gated)reinterpret_cast<void (*)(IOWorkLoop *)>(self->adlnWorkLoopOpen)(gate);
+  } else IOLockUnlock(c.lock);
+ }
+ const auto left=__atomic_load_n(&display13TCReleaseLeft,__ATOMIC_ACQUIRE);
+ if(left) {
+  uint32_t expected=left;__atomic_compare_exchange_n(&display13TCReleaseLeft,&expected,left-1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+ } else if(!again) {
+  __atomic_store_n(&display13TCReleaseArmed,false,__ATOMIC_RELEASE);
+  // An event between the load above and this store found the flag set and did not enter the call.
+  if(!__atomic_load_n(&display13TCReleaseLeft,__ATOMIC_ACQUIRE) ||
+     __atomic_exchange_n(&display13TCReleaseArmed,true,__ATOMIC_ACQ_REL))return;
+ }
+ uint64_t deadline;clock_interval_to_deadline(1,kSecondScale,&deadline);
+ thread_call_enter_delayed(display13TCReleaseCall,deadline);
 }
 
 bool XE::display13HDMIPort(void *port) {
