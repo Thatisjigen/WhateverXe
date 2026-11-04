@@ -7046,6 +7046,37 @@ bool XE::display13SystemSleep() {return display13SleepRequested && !callbackXE->
 static bool display13SleepIRQOff {};
 // Set by the sleep power override, cleared by the first power restore after it.
 static bool display13WakePending {};
+// i915 re-runs the display core init on resume. Neither the donor nor WhateverXe writes these registers, so after boot
+// they hold the firmware's values, and a system sleep zeroes CHICKEN_MISC_2 (0x42084), the XE_LPD error mask and the
+// pipe chicken bits. Bit 30 of CHICKEN_MISC_2 is CHICKEN_MISC_DISABLE_DPT (Linux: adl, dg2): cleared, tiled planes fetch
+// through a display page table the donor never builds, so pipes run, flips land, no underrun, and every output is black.
+// The boot values are taken once the engine is up, pipe banks only while powered, and written back at the wake restore,
+// before any modeset, where the sleep changed them.
+static constexpr uint32_t display13CoreRegs[20] {0x45038,0x45048,0x4504C,0x45130,0x45134,0x45140,0x45144,0x46430,0x46434,
+    0x4421C,0x42080,0x42084,0x45000,0x45004,0x46530,0x51004,0x7003C,0x70038,0x7103C,0x71038};
+static constexpr uint32_t display13CoreRestorable=0x30BFF; // 0-9 ABOX, BW buddy, DCPR, error mask; 11 CHICKEN_MISC_2; 16-17 pipe A DBOX and chicken
+static uint32_t display13CoreBoot[20] {},display13CoreBootValid {};static bool display13CoreSaved {};
+static uint32_t display13CoreValid(uint32_t wells) {
+    uint32_t valid=0;
+    for(unsigned i=0;i<20;++i) {
+        const auto reg=display13CoreRegs[i];const unsigned pipe=reg>=0x70000 ? (reg-0x70000)>>12 : 3;
+        if(pipe>=3 || Display13FBIRQ::powered(wells,pipe))valid|=1U<<i;
+    }
+    return wells==UINT32_MAX ? 0 : valid;
+}
+// The registers (pipe banks only while powered, else UINT32_MAX); returns the power wells, UINT32_MAX when unmapped.
+static uint32_t display13CoreRead(IOMemoryMap *map,uint32_t (&v)[20]) {
+    for(auto &x:v)x=0;
+    if(!map || !map->getVirtualAddress() || map->getLength()!=0x1000000)return UINT32_MAX;
+    const auto base=map->getVirtualAddress();
+    auto rd=[&](uint32_t reg) {return *reinterpret_cast<volatile uint32_t *>(base+reg);};
+    const auto wells=rd(0x45404);
+    for(unsigned i=0;i<20;++i) {
+        const auto reg=display13CoreRegs[i];const unsigned pipe=reg>=0x70000 ? (reg-0x70000)>>12 : 3;
+        v[i]=pipe<3 && !Display13FBIRQ::powered(wells,pipe) ? UINT32_MAX : rd(reg);
+    }
+    return wells;
+}
 uint32_t XE::wrapDisplay13TCSetMode(void *controller,void *fb,const void *timing) {
     auto self=callbackXE;
     // The GOP-preserving surface adapter must replace this refusal before
@@ -10212,6 +10243,16 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 	display13FBPowerRecord(record,9,waking,result);IOLockUnlock(c.lock);
 	adlnPublishPowerRecord("N97FBPowerRestore",record);
 	if(result.status==Display13Power::Status::Complete)wrapAlderLakeNEngineEnable(power);
+	// Only after a real sleep: no plane runs yet, as in i915's core init.
+	if(display13WakePending && result.status==Display13Power::Status::Complete && c.engineEnabled && display13CoreSaved) {
+		uint32_t v[20];IOLockLock(c.lock);const auto wells=display13CoreRead(c.map,v);
+		if(const auto restorable=display13CoreRestorable&display13CoreBootValid&display13CoreValid(wells)) {
+			const auto base=c.map->getVirtualAddress();
+			for(unsigned i=0;i<20;++i)if((restorable&(1U<<i)) && v[i]!=display13CoreBoot[i])
+				*reinterpret_cast<volatile uint32_t *>(base+display13CoreRegs[i])=display13CoreBoot[i];
+		}
+		IOLockUnlock(c.lock);
+	}
 	// Give back the display interrupts the sleep override turned off, once power and engine are back, unless the
 	// donor already did. If no pipe is active yet this stays pending for the first modeset (wrapDisplay13TCSetMode).
 	if(display13SleepIRQOff && result.status==Display13Power::Status::Complete) {
@@ -10615,6 +10656,14 @@ void XE::wrapAlderLakeNPowerInit(void *power,void *controller) {
 	// The replaced native init starts the display engine before returning.
 	// Keep that ordering without executing its Display12 DBUF/clock writes.
 	if(result.status==Display13Power::Status::Complete)wrapAlderLakeNEngineEnable(power);
+	// The firmware's display core values, before any sleep.
+	if(display13SystemSleep() && result.status==Display13Power::Status::Complete && c.engineEnabled && !display13CoreSaved) {
+		uint32_t v[20];IOLockLock(c.lock);const auto wells=display13CoreRead(c.map,v);IOLockUnlock(c.lock);
+		if(wells!=UINT32_MAX && (wells&3)==3) {
+			for(unsigned i=0;i<20;++i)display13CoreBoot[i]=v[i];
+			display13CoreBootValid=display13CoreValid(wells);display13CoreSaved=true;
+		}
+	}
 }
 
 bool XE::adlnPowerReference(void *power,uint32_t operation,uint32_t domain) {
