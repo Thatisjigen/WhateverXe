@@ -151,6 +151,7 @@
   "-wex-reset-trace": [],
   "-wex-scanout-coherent": [],
   "-wex-hidpi-dbuf": [],
+  "-wex-va-renderer": [],
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
   "-wex-dsi-hdmi-test": [],

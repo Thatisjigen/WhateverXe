@@ -15670,12 +15670,14 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 		that->removeProperty("IOGVAScaler");
 		SYSLOG("igfx", "Display13 va: IOGVAScaler not advertised (pixel transfer stays off the VA driver)");
 	}
-	// Acer ANV15-52, Graphics 0.4.0: without the scaler key AppleGVA still opens the VA driver for pixel transfers,
-	// and the driver crashes (VTPixelTransferSessionTransferImage: Photo Booth's first camera frame, mediaanalysisd). Hiding
-	// the keys one at a time from a test process, IOVARendererID alone stops the crash and H.264 and HEVC stay in hardware.
-	if (callbackXE->adlpDisplaySelected) {
+	// AppleGVA opens the VA driver for pixel transfers, and the driver crashes there on a NULL pointer
+	// (AVFPixelProcess_PrepareToTransferImages): VTPixelTransferSession, the camera, mediaanalysisd in a loop.
+	// On the display family that hits it, hide this key by default so the crash does not happen, at a price:
+	// Apple's decoder service then finds no renderer and may decode HEVC in software. Other machines on the
+	// same kext keep the key; -wex-va-renderer also keeps it where it is hidden by default.
+	if (callbackXE->adlpDisplaySelected && !checkKernelArgument("-wex-va-renderer")) {
 		that->removeProperty("IOVARendererID");
-		SYSLOG("igfx", "Display13 va: IOVARendererID not advertised (pixel transfer stays off the VA driver)");
+		SYSLOG("igfx", "IOVARendererID not advertised (default on this display; -wex-va-renderer keeps it)");
 	}
 
 	if (!tglBlitScratchSize || (*tglBlitScratchSize!=0xD240 && *tglBlitScratchSize!=0xE000)) {
