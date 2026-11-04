@@ -6789,6 +6789,10 @@ uint32_t XE::wrapDisplay13TCMode(OSObject *port,uint32_t wanted) {
     const auto preparation=framebufferLinkRequirements(port,selected).preparation(inherited);
     IO io{port,tc,reinterpret_cast<uint32_t (*)(OSObject *,uint32_t)>(self->display13TCBaseMode),preparation};
     const auto owner=reinterpret_cast<uintptr_t>(c.controller),object=reinterpret_cast<uintptr_t>(port);
+    // A replug can beat the retry tick. Finish the old disconnect first when the port is quiescent, so the connect starts from
+    // Idle with the new orientation; otherwise fall through to Mode::connect, which re-accepts a live port with the same lanes.
+    if(wanted && mode.disconnectPending && mode.phase==Display13TC::Mode::Phase::Active &&
+       mode.disconnect(io,owner,object,ddi).status==Display13TC::Status::Complete) {c.tcSignalReady[tc]=false;c.tcDPLink[tc]={};}
     const auto result=wanted?mode.connect(io,owner,object,ddi,wanted):mode.disconnect(io,owner,object,ddi);
     const bool done=result.status==Display13TC::Status::Complete;
     if(!wanted && done){c.tcSignalReady[tc]=false;c.tcDPLink[tc]={};OSSafeReleaseNULL(c.tcObject[tc]);}
