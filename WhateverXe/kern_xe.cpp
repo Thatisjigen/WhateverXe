@@ -7244,6 +7244,9 @@ void XE::wrapDisplay13DPPortWrite(void *port,uint32_t reg,uint32_t value) {
     FunctionCast(wrapDisplay13DPPortWrite,s->orgDisplay13DPPortWrite)(port,reg,value);
 }
 
+// A monitor does not leave HDR when the packet stops: the LG kept its HDR mode through an SDR complete modeset, and showed SDR as PQ.
+// Once HDR has gone out on a pipe, its SDR modesets send the packet with EOTF 0, the donor's own unused case in fillDRMDIP, and leave it on.
+static bool hdrPacketSent[3];
 uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,const void *timing) {
     auto self=callbackXE;auto &c=display13FBPower;
     auto fb=static_cast<IOService *>(rawFB);auto path=static_cast<OSObject *>(rawPath);
@@ -7293,6 +7296,10 @@ uint32_t XE::wrapDisplay13TCLightUp(void *controller,void *rawFB,void *rawPath,c
         void packets(){
             if(dp)reinterpret_cast<void (*)(void *,void *,void *,const void *)>(self->display13DPSDPs)(controller,fb,path,timing);
             else reinterpret_cast<void (*)(void *,void *,void *)>(self->display13TCPackets)(controller,fb,path);
+            if(dp && self->hdrEnableDRM && pipeIndex<3) {
+                if(*reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(timing)+0x8E)==2)hdrPacketSent[pipeIndex]=true;
+                else if(hdrPacketSent[pipeIndex])reinterpret_cast<uint32_t (*)(void *,void *,void *,uint16_t)>(self->hdrEnableDRM)(controller,fb,path,0);
+            }
         }
     } io{self,controller,fb,path,port,timing};
     IOLockLock(c.lock);io.ddi=display13TCTarget(port);io.pipeIndex=Display13FBMemory::field<uint32_t>(path,0x3640);IOLockUnlock(c.lock);
@@ -7401,9 +7408,10 @@ uint64_t XE::wrapDisplay13DPCDInfo(void *raw) {
     return result;
 }
 
-// WEXHDRDIP, read live: {1, then for each pipe: powered, VIDEO_DIP_CTL, first GMP word, TRANS_DDI_FUNC_CTL}. Bit 4 of VIDEO_DIP_CTL is the HDR packet.
+// WEXHDRDIP, read live: {2, then for each pipe: powered, VIDEO_DIP_CTL, the packet's words 0 and 1, TRANS_DDI_FUNC_CTL, TRANS_MSA_MISC, PLANE_CTL, PLANE_COLOR_CTL,
+// GAMMA_MODE, PIPE_CSC_MODE, PIPE_MISC}. Bit 4 of VIDEO_DIP_CTL is the HDR packet, bits 16-23 of its word 1 the EOTF.
 static bool hdrDIPSerialize(void *,void *,OSSerialize *serializer) {
-    uint32_t r[13] {1};
+    uint32_t r[34] {2};
     auto &c=display13FBPower;
     if(c.lock && c.map) {
         IOLockLock(c.lock);
@@ -7413,7 +7421,9 @@ static bool hdrDIPSerialize(void *,void *,OSSerialize *serializer) {
             const auto wells=reg(0x45404);
             for(unsigned pipe=0;pipe<3 && wells!=UINT32_MAX;++pipe)if(Display13FBIRQ::powered(wells,pipe)) {
                 const auto bank=0x1000*pipe;
-                r[1+4*pipe]=1;r[2+4*pipe]=reg(0x60200+bank);r[3+4*pipe]=reg(0x602E0+bank);r[4+4*pipe]=reg(0x60400+bank);
+                const uint32_t regs[] {0x60200+bank,0x602E0+bank,0x602E4+bank,0x60400+bank,0x60410+bank,0x70180+bank,0x701CC+bank,0x4A480+0x800*pipe,0x49028+0x100*pipe,0x70030+bank};
+                r[1+11*pipe]=1;
+                for(unsigned i=0;i<arrsize(regs);++i)r[2+11*pipe+i]=reg(regs[i]);
             }
         }
         IOLockUnlock(c.lock);
@@ -7519,7 +7529,7 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             black=display13PlaneWatchCall && patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
         }
         IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(depth?8U:0U)|(depth==2?16U:0U)|(black?32U:0U),32);
-        // HDR. Off without the boot-args, each its own step. WEXHDRReady: 1 the donor's validation, 4 its modeset and 8 the packet (-wex-hdr-modes), 2 the sysctl's text (-wex-hdr-sgx).
+        // HDR. Off without the boot-args, each its own step. WEXHDRReady: 1 the donor's validation, 4 its modeset, 8 the packet and 16 its way back to SDR (-wex-hdr-modes), 2 the sysctl's text (-wex-hdr-sgx).
         uint32_t hdrReady=0;
         if(checkKernelArgument("-wex-hdr-modes")) {
             const char *validate="__ZN21AppleIntelFramebuffer22validateDetailedTimingEPvy";
@@ -7543,6 +7553,9 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
                 if(patcher.routeMultipleShort(index,&route,1,address,size))hdrReady|=8;
                 patcher.clearError();
             }
+            const char *drm="__ZN31AppleIntelFramebufferController17enableDRMDIPforDPEP21AppleIntelFramebufferP21AppleIntelDisplayPatht";
+            const auto e=patcher.solveSymbol<mach_vm_address_t>(index,drm,address,size);patcher.clearError();
+            if(e==address+0x57BDA && !memcmp(reinterpret_cast<void *>(e),frame,sizeof(frame))) {hdrEnableDRM=e;hdrReady|=16;}
             if(auto live=OSSerializer::forTarget(nullptr,hdrDIPSerialize)) {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDRDIP",live);live->release();}
         }
         if(checkKernelArgument("-wex-hdr-sgx")) {
@@ -8926,25 +8939,22 @@ void XE::wrapHDRSetupTiming(IOService *fb,const void *in,void *out) {
 // A timing that differs only in dynamicRange takes the partial path: hwRegsNeedUpdate compares encoding and colorimetry but not the range, and only LightUpDP
 // sends the HDR packet. macOS then encodes PQ for a monitor left in SDR, and the picture goes grey (a complete modeset at
 // 120 Hz showed HDR). So a modeset whose range disagrees with the packet in the hardware is a complete one, both ways: disableDisplay takes the packet off and
-// LightUpDP puts it on. The register is the one enableDRMDIPforDP uses. WEXHDRComplete = {modesets made complete, last wanted, last VIDEO_DIP_CTL}.
+// LightUpDP puts it on. A packet that says EOTF 0 is SDR. WEXHDRComplete = {modesets made complete, last wanted, last VIDEO_DIP_CTL}.
 static uint32_t hdrCompleteRecord[3];
 bool XE::wrapHDRRegsNeedUpdate(void *controller,IOService *fb,void *path,void *crtc,const void *timing,void *scaler) {
     const auto need=FunctionCast(wrapHDRRegsNeedUpdate,callbackXE->orgHDRRegsNeedUpdate)(controller,fb,path,crtc,timing,scaler);
     auto &c=display13FBPower;
     if(need || !timing || !path || !c.lock || !c.map)return need;
     const auto pipe=Display13FBMemory::field<uint32_t>(path,0x3640);
-    auto transcoder=pipe;
-    const auto port=Display13FBMemory::field<uint8_t *>(path,0x3648);
-    const auto config=port ? Display13FBMemory::field<uint8_t *>(port,0x548) : nullptr;
-    if(config && !Display13FBMemory::field<uint32_t>(config,8))transcoder=0xF; // eDP
     if(pipe>=3)return need;
     IOLockLock(c.lock);
     Display13FBDBUFIO io {c.map};
     const auto wells=io.read(0x45404);
-    const auto dip=wells!=UINT32_MAX && Display13FBIRQ::powered(wells,pipe) ? io.read(0x60200+0x1000*transcoder) : UINT32_MAX;
+    const auto powered=wells!=UINT32_MAX && Display13FBIRQ::powered(wells,pipe);
+    const auto dip=powered ? io.read(0x60200+0x1000*pipe) : UINT32_MAX,word=powered ? io.read(0x602E4+0x1000*pipe) : 0;
     IOLockUnlock(c.lock);
     const bool wanted=*reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(timing)+0x8E)==2;
-    if(dip==UINT32_MAX || wanted==((dip&0x10)!=0))return need;
+    if(dip==UINT32_MAX || wanted==((dip&0x10) && (word&0xFF0000)))return need;
     ++hdrCompleteRecord[0];hdrCompleteRecord[1]=wanted;hdrCompleteRecord[2]=dip;
     IORegistryEntry::getRegistryRoot()->setProperty("WEXHDRComplete",hdrCompleteRecord,sizeof(hdrCompleteRecord));
     return true;
