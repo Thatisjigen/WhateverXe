@@ -144,6 +144,7 @@
   "-wex-noaccel": [],
   "-wex-display-trace": [],
   "-wex-adlp-readout": [],
+  "-wex-no-va-renderer": [],
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
   "-wex-dsi-hdmi-test": [],

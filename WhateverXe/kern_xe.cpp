@@ -14044,6 +14044,14 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	if (!that->getProperty("IOGVAHEVCDecode") &&
 	    OSDynamicCast(OSDictionary, that->getProperty("IOGVAHEVCDecodeCapabilities")))
 		that->setProperty("IOGVAHEVCDecode", "2");
+	// AppleGVA opens the VA driver for pixel transfers, and the driver crashes there on a NULL pointer
+	// (AVFPixelProcess_PrepareToTransferImages): VTPixelTransferSession, the camera, mediaanalysisd in a loop.
+	// Hiding this key alone stops it, at a price: Apple's decoder service then finds no renderer and may
+	// decode in software. So only on request.
+	if (checkKernelArgument("-wex-no-va-renderer")) {
+		that->removeProperty("IOVARendererID");
+		SYSLOG("igfx", "IOVARendererID not advertised (-wex-no-va-renderer)");
+	}
 
 	if (!tglBlitScratchSize || (*tglBlitScratchSize!=0xD240 && *tglBlitScratchSize!=0xE000)) {
 		SYSLOG("igfx", "TGL blit scratch parameter mismatch");
