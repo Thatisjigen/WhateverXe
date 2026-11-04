@@ -7499,7 +7499,7 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             black=display13PlaneWatchCall && patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
         }
         IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(depth?8U:0U)|(depth==2?16U:0U)|(black?32U:0U),32);
-        // HDR. Off without the boot-args, each its own step. WEXHDRReady: 1 the donor's validation (-wex-hdr-modes), 2 the sysctl's text (-wex-hdr-sgx).
+        // HDR. Off without the boot-args, each its own step. WEXHDRReady: 1 the donor's validation and 4 its modeset (-wex-hdr-modes), 2 the sysctl's text (-wex-hdr-sgx).
         uint32_t hdrReady=0;
         if(checkKernelArgument("-wex-hdr-modes")) {
             const char *validate="__ZN21AppleIntelFramebuffer22validateDetailedTimingEPvy";
@@ -7507,6 +7507,13 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             if(v==address+0x2FFCA && !memcmp(reinterpret_cast<void *>(v),frame,sizeof(frame))) {
                 KernelPatcher::RouteRequest route(validate,wrapHDRValidateTiming,orgHDRValidateTiming);
                 if(patcher.routeMultipleShort(index,&route,1,address,size))hdrReady|=1;
+                patcher.clearError();
+            }
+            const char *setup="__ZN21AppleIntelFramebuffer18setupDisplayTimingEPK29IODetailedTimingInformationV2PS0_";
+            const auto s=patcher.solveSymbol<mach_vm_address_t>(index,setup,address,size);patcher.clearError();
+            if(s==address+0x6814C && !memcmp(reinterpret_cast<void *>(s),frame,sizeof(frame))) {
+                KernelPatcher::RouteRequest route(setup,wrapHDRSetupTiming,orgHDRSetupTiming);
+                if(patcher.routeMultipleShort(index,&route,1,address,size))hdrReady|=4;
                 patcher.clearError();
             }
         }
@@ -8864,6 +8871,30 @@ uint32_t XE::wrapHDRValidateTiming(IOService *fb,void *description,unsigned long
     IORegistryEntry::getRegistryRoot()->setProperty("WEXHDRValidate",hdrValidateRecord,sizeof(hdrValidateRecord));
     return result;
 }
+// A modeset asks AGDP again, through the handler it registered with the controller. Its validateMode refuses HDR10 there too, the link index stays -1,
+// and setupDisplayTiming returns without filling its output: hwSetMode then programs the pipe from uninitialised stack, the frame counter stops and every
+// transaction on that pipe hangs. So AGDP sees SDR in its copy of the timing; the donor keeps HDR10 in its own.
+// WEXHDRModeset = {HDR10 modesets seen, last link index, last result}.
+using HDRAGDCHandler=uint64_t (*)(void *,void *,uint64_t,uint64_t,uint64_t,uint64_t);
+static HDRAGDCHandler hdrAGDCOrg;
+static uint32_t hdrModesetRecord[3];
+static uint64_t hdrAGDCHandler(void *target,void *args,uint64_t a2,uint64_t event,uint64_t a4,uint64_t a5) {
+    auto range=args && static_cast<uint32_t>(event)==0xC ? reinterpret_cast<uint16_t *>(static_cast<uint8_t *>(args)+0x92) : nullptr;
+    if(!range || *range!=2)return hdrAGDCOrg(target,args,a2,event,a4,a5);
+    *range=1;
+    const auto result=hdrAGDCOrg(target,args,a2,event,a4,a5);
+    *range=2;
+    ++hdrModesetRecord[0];hdrModesetRecord[1]=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(args)+0xAC);hdrModesetRecord[2]=static_cast<uint8_t>(result);
+    IORegistryEntry::getRegistryRoot()->setProperty("WEXHDRModeset",hdrModesetRecord,sizeof(hdrModesetRecord));
+    return result;
+}
+void XE::wrapHDRSetupTiming(IOService *fb,const void *in,void *out) {
+    if(in && *reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(in)+0x8E)==2) {
+        auto &handler=*reinterpret_cast<HDRAGDCHandler *>(Display13FBMemory::field<uint8_t *>(fb,0x1D0)+0x1BF8);
+        if(handler && handler!=hdrAGDCHandler) {hdrAGDCOrg=handler;handler=hdrAGDCHandler;}
+    }
+    FunctionCast(wrapHDRSetupTiming,callbackXE->orgHDRSetupTiming)(fb,in,out);
+}
 uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,bool force) {
     auto config=Display13FBMemory::field<uint32_t *>(port,0x548);
     const bool selected=Display13FBTopology::selected(callbackXE->adlnPlatform,config,callbackXE->adlnOutputWiring);
@@ -10035,7 +10066,7 @@ void XE::adlnWMSetup(OSObject *plane,OSObject *path,bool cursor) {
 			// path frequency and downscale behavior rather than assuming FHD Hz.
 			auto adjust=reinterpret_cast<uint64_t (*)(void *,void *,void *,bool,void *)>(callbackXE->adlnAdjustPixelClock);
 			const auto pixel=adjust(c.controller,fb,path,cursor,nullptr);
-			p=Display13WM::plan(width,htotal,pixel,range.end-range.start,c.latency,(ipc&8) || Display13FBMemory::field<uint8_t>(c.controller,0x1B4C),yTiled,cursor ? width : ((Display13FBMemory::field<uint32_t>(plane,0x11C)>>16)&0x1FFF)+1);
+			p=Display13WM::plan(width,htotal,pixel,range.end-range.start,c.latency,(ipc&8) || Display13FBMemory::field<uint8_t>(c.controller,0x1B4C),yTiled,cursor ? width : ((Display13FBMemory::field<uint32_t>(plane,0x11C)>>16)&0x1FFF)+1,cursor ? 4 : Display13WM::bytesPerPixel(ctl));
 			if(p.status==Display13WM::Status::Complete) {
 				auto object=reinterpret_cast<uint8_t *>(plane);
 				if(cursor) {
