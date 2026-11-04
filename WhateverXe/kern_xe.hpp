@@ -404,6 +404,8 @@ private:
     static uint32_t wrapDisplay13FBModeInfo(IOService *fb,int mode,void *info);
     mach_vm_address_t orgHDRValidateTiming {},orgHDRLeaf7Names {};
     static uint32_t wrapHDRValidateTiming(IOService *fb,void *description,unsigned long long size);
+    mach_vm_address_t orgHDRSetupTiming {};
+    static void wrapHDRSetupTiming(IOService *fb,const void *in,void *out);
     static char *wrapHDRLeaf7Names(uint64_t features,char *buffer,uint32_t length);
     static uint32_t wrapDisplay13FBPowerState(IOService *fb,uint32_t state);
     mach_vm_address_t orgAlderLakeNGamma10 {},adlnGammaTableUpdate {},orgAlderLakeNPreGamma {};
