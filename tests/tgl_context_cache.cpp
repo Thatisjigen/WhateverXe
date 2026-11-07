@@ -19,4 +19,11 @@ int main() {
  for(unsigned i=3;i<16;++i)assert(!words[i]);
  for(unsigned i=0;i<8192;++i)if(i<4096||i>=4160)assert(page[i]==0xA5);
  for(uint32_t old=0;old<65536;++old)assert(((old&~(words[2]>>16))|(words[2]&0xffff))==(old|0x40));
+ // Closed (TGL trial) mode refuses construction; soft (ADL-N opt-in) mode keeps
+ // the native constructor result. Each path counts separately.
+ auto c=TGLContextCache::counts();assert(!TGLContextCache::soft() && !c[0] && !c[1] && !c[2]);
+ assert(!TGLContextCache::decline(true) && !TGLContextCache::decline(false) && c[2]==2 && !c[1]);
+ TGLContextCache::soft()=true;
+ assert(TGLContextCache::decline(true) && !TGLContextCache::decline(false) && c[1]==2 && c[2]==2 && !c[0]);
+ TGLContextCache::soft()=false;assert(!TGLContextCache::decline(true) && c[2]==3 && c[1]==2);
 }

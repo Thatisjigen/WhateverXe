@@ -176,5 +176,6 @@
   "-wex-no-display-sleep-irq": [],
   "-wex-no-s0-csb-resync": [
     "-wex-tgl-s0-csb-resync"
-  ]
+  ],
+  "-wex-adln-ctx-invalidate": []
 }
