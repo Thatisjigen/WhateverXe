@@ -524,6 +524,13 @@ bool tglCPSSerialize(void *,void *,OSSerialize *serializer) {
  auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
+// Schema 1: soft mode, installed, soft declines, closed refusals.
+static bool tglContextCacheSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[5] {1,TGLContextCache::soft()};
+ for(unsigned i=0;i<3;++i)out[i+2]=__atomic_load_n(&TGLContextCache::counts()[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 // Constructor return is before scheduler submission. This covers fresh RCS
 // images and safe-image clones; beginReset later restores the qualified image.
 // Do not change POCS/CCS, native completion, or an already submitted context.
@@ -533,11 +540,12 @@ static bool tglContextCacheInit(void *context,void *task,const void *params,uint
  auto c=static_cast<uint8_t *>(context);if(c[0x6C]!=0)return true;
  auto owner=*reinterpret_cast<uint8_t **>(c+0x50);
  auto buffer=*reinterpret_cast<uint8_t **>(c+0x98);
- if(!owner || !buffer || !*reinterpret_cast<void **>(owner+0x13F8))return false;
+ if(!owner || !buffer || !*reinterpret_cast<void **>(owner+0x13F8))return TGLContextCache::decline(ok);
  auto cpu=reinterpret_cast<void *(*)(void *)>(tglCPSCPUAddress)(buffer);
  const auto size=*reinterpret_cast<uint64_t *>(buffer+0x20);
  const auto gpu=__atomic_load_n(&tglCPSCounts[2],__ATOMIC_RELAXED);
- if(!TGLContextCache::install(cpu,size,gpu))return false;
+ if(!TGLContextCache::install(cpu,size,gpu))return TGLContextCache::decline(ok);
+ __atomic_fetch_add(&TGLContextCache::counts()[0],1U,__ATOMIC_RELAXED);
  asm volatile("clflush (%0)"::"r"(static_cast<uint8_t *>(cpu)+0x1054):"memory");
  asm volatile("mfence":::"memory");return true;
 }
@@ -13861,7 +13869,15 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			const bool tahoeTrialScope=!adlnDetected && checkKernelArgument("-disablegfxfirmware") &&
 				(XELP::kernelOS(version)==XELP::OS::Tahoe);
 			const bool completionCacheRequested=tahoeTrialScope && !(tglTahoeDisabledTrials&1);
-			const bool contextCacheRequested=tahoeTrialScope && !(tglTahoeDisabledTrials&2);
+			// Linux applies Wa_18022495364 to TGL, ADL and RPL (Xe_LP 12.00-12.10).
+			// The ADL-N backend also drives ADL-P/RPL-P; opt in on the same Tahoe
+			// host-scheduler target with -wex-adln-ctx-invalidate. That scope only
+			// enables the indirect trial and declines an unqualified image per
+			// context instead of failing construction.
+			const bool adlnContextCacheRequested=adlnDetected && checkKernelArgument("-disablegfxfirmware") &&
+				(XELP::kernelOS(version)==XELP::OS::Tahoe) && checkKernelArgument("-wex-adln-ctx-invalidate");
+			const bool contextCacheRequested=(tahoeTrialScope && !(tglTahoeDisabledTrials&2)) || adlnContextCacheRequested;
+			TGLContextCache::soft()=adlnContextCacheRequested;
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLTahoeDisabledTrials",tglTahoeDisabledTrials,32);
 			// Preserve native submission; use its one-shot force-restore flag only
 			// for a witnessed equal-tail resubmission of the active first item.
@@ -13952,6 +13968,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			tglContextCacheEnabled=contextCacheRequested && contextCacheOK;
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLContextCacheIndirectReady",tglContextCacheEnabled);
+			if(tglContextCacheEnabled)if(auto live=OSSerializer::forTarget(nullptr,tglContextCacheSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLContextCacheLive",live);live->release();
+			}
 			// The native RCS constructor initializes RPCS with ENABLE alone.
 			// Request the one TGL slice explicitly, as intel_sseu_make_rpcs does.
 			// Preserve the instruction and native ownership/lifetime of the image.

@@ -20,5 +20,15 @@ inline bool install(void *image,size_t size,uint64_t gpu) {
     (w[3] && w[3]!=pointer) || (w[5] && w[5]!=RestoreOffset))return false;
  memcpy(p+0x1054,&pointer,4);memcpy(p+0x105C,&RestoreOffset,4);return true;
 }
+// Counts: installed, soft declines, closed refusals. Function-local statics
+// keep this header usable from C++14 fixtures without inline variables.
+inline uint32_t *counts() {static uint32_t c[3] {};return c;}
+// Soft mode: an unqualified image keeps its native INDIRECT_CTX (none) and the
+// context is created normally; closed mode (TGL trial) fails construction.
+inline bool &soft() {static bool s=false;return s;}
+inline bool decline(bool constructed) {
+ if(soft()) {__atomic_fetch_add(&counts()[1],1U,__ATOMIC_RELAXED);return constructed;}
+ __atomic_fetch_add(&counts()[2],1U,__ATOMIC_RELAXED);return false;
+}
 }
 #endif

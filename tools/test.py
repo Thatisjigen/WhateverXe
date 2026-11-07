@@ -39,6 +39,7 @@ display13_boot_handoff display13_clock_runtime display13_training_frontend frame
 dsi_restart dsi_panel dsi_command_adapter dsi_irq_live dsi_surface_adapter dsi_aperture_adapter
 display13_shutdown display13_wake_notifications released_physical_admission released_topology
 accelerator_resources display13_power_dispatch tgl_recovery test_runner_contract gpu_reset_trace_object uhd770_page va_pages
+tgl_adln_context_cache
 """.split()
 FAMILIES = {'BigSur':'bigsur', 'Monterey':'monterey', 'Ventura':'ventura',
             'Sonoma':'sonoma', 'Sequoia':'sequoia', 'Tahoe':'tahoe'}
