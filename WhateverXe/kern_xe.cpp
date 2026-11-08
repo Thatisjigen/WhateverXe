@@ -5216,6 +5216,9 @@ static bool adlnBeginClockGuard(Display13FBClockGuard &g) {
 	if(irq.quiescing || g.master==UINT32_MAX) {IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);failure(2);return false;}
 	g.held=true;g.enabled=irq.state.enabled;irq.quiescing=true;irq.blockedPipes=7;
 	io.write(Display13FBIRQ::Master,0);irq.state.enabled=false;
+	// Refresh the native cached DE master (c+D84) too: ProcessInterrupt restores the master
+	// from it, which would re-arm DE inside this scope and spin on a deferred display bit.
+	{Display13FBIRQIO irqIO {irq.base};adlnIRQCache(irq.controller,irqIO);}
 	IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
 	bool quiet=false;
 	for(unsigned ms=0;ms<=20;++ms) {
@@ -6416,7 +6419,19 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 	IOSimpleLockLock(c.scopeLock);
 	const bool permitted=c.scopes.permits(reinterpret_cast<uintptr_t>(current_thread()));
 	IOSimpleLockUnlock(c.scopeLock);
-	if(!permitted)return;
+	const auto dropCache=[controller] {
+		*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xD84)=0;
+		*(reinterpret_cast<uint8_t *>(controller)+0xFD4)=0;
+	};
+	if(!permitted) {
+		// The native ProcessInterrupt re-arms the DE master from c+D84 after this call and
+		// loops while the GT master still shows a display bit: with nothing serviced it never
+		// returns (CPU 0 livelock in interrupt context, spinlock-timeout panics after display
+		// wake, Precision 5570). A disabled bank stays off in hardware and in the cache; its
+		// pending statuses remain for the permitted handler once the scope ends.
+		if(!c.state.enabled) {dropCache();if(io.readable(Display13FBIRQ::Master))io.write(Display13FBIRQ::Master,0);}
+		return;
+	}
 	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
 	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
 	if(e.aux)display13TCReleaseArm(); // A DP Alt event: the port may have just lost its sink.
@@ -6424,10 +6439,7 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 		const auto pulse=display13ReplayPulse(io);
 		if(pulse) {*aux|=pulse;display13TCReleaseArm();} // The watch's tick publishes WEXDisplay13TCReplay, in a thread.
 	}
-	if(c.state.faulted) {
-		*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(controller)+0xD84)=0;
-		*(reinterpret_cast<uint8_t *>(controller)+0xFD4)=0;
-	}
+	if(c.state.faulted || !c.state.enabled)dropCache();
 }
 
 bool XE::processDisplay13FramebufferGTT(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
@@ -9580,6 +9592,7 @@ bool XE::adlnFreeStoppedPipe(IOService *fb) {
                 // stays disabled through native free; native SW queue/FD4 and
                 // GT callbacks remain intact for another pipe's old events.
                 io.write(Display13FBIRQ::Master,0);irq.state.enabled=false;irq.quiescing=true;irq.blockedPipes|=1U<<pipe;held=true;
+                adlnIRQCache(controller,io); // native cached master must not re-arm DE in the scope
                 const auto parked=Display13FBIRQ::parkStoppedPipe(io,irq.state,pipe,irq.handlers,irq.softwareHandlers,queued);
                 record[9]=static_cast<uint32_t>(parked);ready=parked==Display13FBIRQ::Status::Complete;
             }
@@ -11825,7 +11838,8 @@ bool XE::adlnPowerReference(void *power,uint32_t operation,uint32_t domain) {
 					Display13FBIRQ::beginPowerRelease(irqIO,irq.state,releaseScope,released,affected,
 						irq.scopes.display,competingSoftware,queued,aux,hpd) : Display13FBIRQ::Status::Unavailable;
 				irqRelease[9]=static_cast<uint32_t>(status);releaseAllowed=status==Display13FBIRQ::Status::Complete;
-				if(releaseScope.held) {irq.quiescing=true;irq.blockedPipes=affected;}
+				if(releaseScope.held) {irq.quiescing=true;irq.blockedPipes=affected;
+					adlnIRQCache(static_cast<IOService *>(c.controller),irqIO);} // master parked: drop native cache
 			} else {
 				releaseAllowed=!irq.quiescing && Display13FBIRQ::quiescentPipes(irqIO,irq.state,released,irq.handlers,affected);
 				if(releaseAllowed) {irq.quiescing=true;irq.blockedPipes=affected;}

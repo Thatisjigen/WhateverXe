@@ -602,7 +602,10 @@ template<class IO> Status vblank(IO &io,State &s,unsigned pipe,bool enabled) {
 // registry serialization, PCI config access, or unpowered pipe reads here.
 template<class IO> Events collect(IO &io,State &s) {
     Events e;
-    if(!s.begun || !s.enabled || s.faulted)return e;
+    if(!s.begun)return e;
+    // A disabled or faulted bank must not leave the DE master armed: the native handler would
+    // re-read the display bit forever. Keep pending statuses for the next permitted handler.
+    if(!s.enabled || s.faulted) {if(io.readable(Master))io.write(Master,0);return e;}
     const auto master=io.read(Master),wells=io.read(Driver);s.lastMaster=master;
     if(master==UINT32_MAX) {e.status=fail(io,s,Status::Readback);return e;}
     io.write(Master,0);++s.interrupts;
