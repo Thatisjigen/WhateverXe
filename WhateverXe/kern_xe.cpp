@@ -6174,7 +6174,32 @@ bool XE::processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach
 	if(routed && !display13FBIRQ.scopeLock)display13FBIRQ.scopeLock=IOSimpleLockAlloc();
 	KernelPatcher::RouteRequest swRoute {swSymbol,wrapDisplay13FBSWIRQ,orgDisplay13FBSWIRQ};
 	const bool swRouted=routed && patcher.routeMultipleShort(index,&swRoute,1,address,size);
-	patcher.clearError();return swRouted;
+	patcher.clearError();
+	// AppleIntelFramebufferController::IdleTimerFired re-enables a DE master it finds disabled
+	// (DISPLAY_INT_CTL |= Enable) and fakes a VBL. WEX owns that master: it parks it off across
+	// display sleep/wake, power and clock scopes, faults and storms, with c+FD4 = 0 so the native
+	// ProcessInterrupt skips processDE. Re-armed behind WEX, the display bit is never serviced and
+	// the GT master re-fires forever: CPU 0 livelock, then lock-timeout or NVMe-timeout panics a few
+	// seconds after display wake (Precision 5570). Skip that recovery branch (js -> jmp). Exact
+	// donor bytes only; a mismatch leaves it alone and is visible as WEXIdleTimerGuard = false.
+	if(swRouted) {
+		const char *idleSymbol="__ZN31AppleIntelFramebufferController14IdleTimerFiredEv";
+		const auto idle=patcher.solveSymbol<mach_vm_address_t>(index,idleSymbol,address,size);patcher.clearError();
+		const uint8_t idleBefore[] {0x85,0xDB,0x78,0x5C},idleAfter[] {0x85,0xDB,0xEB,0x5C};
+		// test ebx,ebx (85 DB) at +0x56CF0, js +0x5C (78 5C) at +0x56CF2: the pattern starts at the test
+		constexpr uint32_t idleBranch=0x56CF0;
+		bool idleOk=idle==address+0x56C2A && size>idleBranch+sizeof(idleBefore) &&
+			!memcmp(reinterpret_cast<void *>(address+idleBranch),idleBefore,sizeof(idleBefore));
+		if(idleOk) {
+			KernelPatcher::LookupPatch idlePatch {currentFramebuffer,idleBefore,idleAfter,sizeof(idleBefore),1};
+			patcher.applyLookupPatch(&idlePatch,reinterpret_cast<uint8_t *>(address+idleBranch),sizeof(idleBefore)+1);
+			idleOk=patcher.getError()==KernelPatcher::Error::NoError &&
+				!memcmp(reinterpret_cast<void *>(address+idleBranch),idleAfter,sizeof(idleAfter));
+			patcher.clearError();
+		}
+		IORegistryEntry::getRegistryRoot()->setProperty("WEXIdleTimerGuard",idleOk);
+	}
+	return swRouted;
 }
 
 IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
