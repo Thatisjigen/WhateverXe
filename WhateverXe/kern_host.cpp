@@ -11,6 +11,11 @@
 #include <Headers/kern_api.hpp>
 #include <Headers/kern_iokit.hpp>
 #include <IOKit/pci/IOPCIDevice.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/IOPM.h>
+#include <IOKit/pwr_mgt/RootDomain.h>
+#include <kern/clock.h>
+#include "kern_rplp_iog.hpp"
 static size_t hostInstructionSize(const uint8_t *bytes,size_t length) {
  uint8_t code[32] {};memcpy(code,bytes,length<sizeof(code)?length:sizeof(code));
  Disassembler::hde_t ins {};
@@ -34,6 +39,71 @@ static const char *backlightPath[] { "/System/Library/Extensions/AppleBacklight.
 static KernelPatcher::KextInfo backlight { "com.apple.driver.AppleBacklight",backlightPath,arrsize(backlightPath),{true},{},KernelPatcher::KextInfo::Unloaded };
 static const char *surfacePath[] { "/System/Library/Extensions/IOSurface.kext/Contents/MacOS/IOSurface" };
 static KernelPatcher::KextInfo surface { "com.apple.iokit.IOSurface",surfacePath,arrsize(surfacePath),{true},{},KernelPatcher::KextInfo::Unloaded };
+// From Samran Ahmad's WhateverXe-RaptorLakeP (his -wex-rplp-wsstart, rounds 55 and 56, BSD-3-Clause;
+// kern_rplp_iog.hpp), here on by default. A dGPU without a driver gets an IONDRVFramebuffer placeholder whose
+// controller the window server never opens, so the controller keeps its window-server wait byte set and its cached
+// computed-state word stale, and the family's systemWork sends the sleep notification to the server, and then the early
+// WillSleep to the accelerators, only while no controller has that byte: the Intel accelerator never learns of the
+// sleep, and its wake has nothing to restart. At the system's will-sleep notice, and again at the two wake notices, the
+// walk zeroes both words of a controller whose every framebuffer is such a placeholder: the state the server would have
+// left had it opened them. The family's own sleep handler is a priority interest too and precedes this one; its
+// systemWork re-evaluates the aggregate until it can reply, so a clearing in the same pass is seen. With every GPU
+// driven there is no such controller and the walk only reads. The offsets belong to one layout of IOFBController, so
+// the walk runs only while the family's first controller is that class at the size they were read at (wsStartLayout);
+// otherwise nothing is read. -wex-no-rplp-wsstart turns all of it off. RPLPWSStart: 0 schema, 1 the outcome (1 walked,
+// 2 layout not recognised), 2 the last will-sleep uptime ns, 3..14 the walk's record (kern_rplp_iog.hpp), 15 wake-side
+// runs | runs that had to clear again << 32. No kernel address is published.
+struct XeKernelMem {
+ uint64_t read64(uint64_t a) const {uint64_t v;memcpy(&v,reinterpret_cast<const void *>(a),sizeof(v));return v;}
+ uint32_t read32(uint64_t a) const {uint32_t v;memcpy(&v,reinterpret_cast<const void *>(a),sizeof(v));return v;}
+ uint8_t read8(uint64_t a) const {return *reinterpret_cast<const uint8_t *>(a);}
+ void write8(uint64_t a,uint8_t v) const {*reinterpret_cast<volatile uint8_t *>(a)=v;}
+ void write32(uint64_t a,uint32_t v) const {*reinterpret_cast<volatile uint32_t *>(a)=v;}
+};
+bool XeHost::wsStartPlaceholder(uint64_t fb) {
+ const OSMetaClass *mc=reinterpret_cast<const OSObject *>(fb)->getMetaClass();
+ const char *name=mc ? mc->getClassName() : nullptr;
+ return name && strcmp(name,"IONDRVFramebuffer")==0;
+}
+bool XeHost::wsStartLayout(uint64_t controller) {
+ // 0x1C8: IOFBController's instance size in the family build whose fields kern_rplp_iog.hpp names (600).
+ if(!RPLPIOG::pointer(controller))return false;
+ const OSMetaClass *mc=reinterpret_cast<const OSObject *>(controller)->getMetaClass();
+ const char *name=mc ? mc->getClassName() : nullptr;
+ return name && strcmp(name,"IOFBController")==0 && mc->getClassSize()==0x1C8;
+}
+void XeHost::wsStartRun(bool tick) {
+ if(!gIOFBAllControllers)return;
+ XeKernelMem m;RPLPIOG::Globals g;g.controllers=reinterpret_cast<uint64_t>(gIOFBAllControllers);uint64_t w[12] {};
+ // An empty list has nothing to check and nothing to walk.
+ const uint64_t head=m.read64(g.controllers);
+ const bool known=!head || wsStartLayout(head);
+ if(known)RPLPIOG::wsStart(m,g,wsStartPlaceholder,true,w);
+ auto &r=wsStartRecord;
+ if(tick)r[15]=((r[15]&0xFFFFFFFFULL)+1)|(((r[15]>>32)+(w[9] ? 1 : 0))<<32);
+ else {
+  uint64_t t;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&t);
+  r[1]=known ? 1 : 2;r[2]=t;r[15]=0;
+  for(unsigned i=0;i<12;++i)r[3+i]=w[i];
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("RPLPWSStart",r,sizeof(r));
+}
+IOReturn XeHost::wsStartSleepWake(void *target,void *,UInt32 type,IOService *,void *argument,vm_size_t) {
+ auto host=static_cast<XeHost *>(target);
+ switch(type) {
+  case kIOMessageSystemWillSleep: host->wsStartRun(false);break;
+  case kIOMessageSystemWillPowerOn: case kIOMessageSystemHasPoweredOn: host->wsStartRun(true);break;
+  default: break;
+ }
+ if(type==kIOMessageSystemWillSleep || type==kIOMessageCanSystemSleep)
+  acknowledgeSleepWakeNotification(static_cast<IOPowerStateChangeNotification *>(argument)->powerRef);
+ return kIOReturnSuccess;
+}
+void XeHost::wsStartArm() {
+ // The family's kext is loaded, so the root domain exists; without the list head there is nothing to walk.
+ const bool ok=gIOFBAllControllers && registerPrioritySleepWakeInterest(wsStartSleepWake,this,nullptr)!=nullptr;
+ IORegistryEntry::getRegistryRoot()->setProperty("RPLPWSStartArmed",ok);
+}
 void XeHost::init() {
  callbackHost=this;
  // Copy the firmware tables while the boot firmware still owns them. This
@@ -42,6 +112,9 @@ void XeHost::init() {
  PE_parse_boot_argn("gfxrst",&resetFramebuffer,sizeof(resetFramebuffer));
  if(resetFramebuffer>=FB_TOTAL)resetFramebuffer=FB_DETECT;
  lilu.onKextLoadForce(nullptr,0,[](void *u,KernelPatcher &p,size_t i,mach_vm_address_t a,size_t s){static_cast<XeHost *>(u)->processKext(p,i,a,s);},this);
+ // The placeholder fix reads the graphics family's controller list. The family's kext is hooked in any case;
+ // -wex-no-rplp-wsstart turns the fix off.
+ wsStartEnabled=!checkKernelArgument("-wex-no-rplp-wsstart");
  lilu.onKextLoadForce(&graphics);
  lilu.onKextLoadForce(&accelFamily);
  lilu.onKextLoadForce(&backlight);
@@ -102,7 +175,7 @@ void XeHost::processKernel(KernelPatcher &patcher) {
    if(v){consoleVinfo=*v;gotConsoleVinfo=true;}else patcher.clearError();
   }
  }
- if(!active || resetFramebuffer==FB_DETECT){resetFramebuffer=FB_NONE;if(!systemWakeRecovery)graphics.switchOff();}
+ if(!active || resetFramebuffer==FB_DETECT){resetFramebuffer=FB_NONE;if(!systemWakeRecovery && !(active && wsStartEnabled))graphics.switchOff();}
  DeviceInfo::deleter(info);
 }
 void XeHost::processLoadedDependency(KernelPatcher &patcher,KernelPatcher::KextInfo &info) {
@@ -232,6 +305,14 @@ void XeHost::processKext(KernelPatcher &patcher,size_t index,mach_vm_address_t a
    IORegistryEntry::getRegistryRoot()->setProperty("WEXHostPagingContractReady",paging);
    IORegistryEntry::getRegistryRoot()->setProperty("WEXDSIWakeRecoveryReady",ready);
   }
+  // This block is also reached for a family that was loaded before the donor (processLoadedDependency): arm once.
+  if(wsStartEnabled && !gIOFBAllControllers) {
+   // The family's controller list head, a file-local static of IOGraphicsFamily, resolved as Samran's plugin does.
+   gIOFBAllControllers=patcher.solveSymbol<uint64_t *>(index,"__ZL19gIOFBAllControllers",address,size);
+   if(!gIOFBAllControllers)patcher.clearError();
+   wsStartArm();
+  }
+  // WhateverGreen's console back-copy only with a reset mode, as before.
   if(resetFramebuffer==FB_NONE)return;
   gIOFBVerboseBootPtr=patcher.solveSymbol<uint8_t *>(index,"__ZL16gIOFBVerboseBoot",address,size);
   if(gIOFBVerboseBootPtr){KernelPatcher::RouteRequest route("__ZN13IOFramebuffer6initFBEv",wrapFramebufferInit,orgFramebufferInit);patcher.routeMultiple(index,&route,1,address,size);}

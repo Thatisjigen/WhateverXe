@@ -147,6 +147,7 @@
   "-wex-adlp-readout": [],
   "-wex-reset-recover": [],
   "-wex-hdr-modes": [],
+  "-wex-no-rplp-wsstart": [],
   "-wex-hdr-sgx": [],
   "-wex-reset-trace": [],
   "-wex-scanout-coherent": [],
