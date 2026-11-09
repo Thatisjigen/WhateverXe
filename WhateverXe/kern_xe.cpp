@@ -7529,9 +7529,9 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             black=display13PlaneWatchCall && patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
         }
         IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(depth?8U:0U)|(depth==2?16U:0U)|(black?32U:0U),32);
-        // HDR. Off without the boot-args, each its own step. WEXHDRReady: 1 the donor's validation, 4 its modeset, 8 the packet and 16 its way back to SDR (-wex-hdr-modes), 2 the sysctl's text (-wex-hdr-sgx).
+        // HDR. On unless -wex-no-hdr-modes and -wex-no-hdr-sgx turn its two parts off, each its own step. WEXHDRReady: 1 the donor's validation, 4 its modeset, 8 the packet and 16 its way back to SDR (-wex-hdr-modes), 2 the sysctl's text (-wex-hdr-sgx).
         uint32_t hdrReady=0;
-        if(checkKernelArgument("-wex-hdr-modes")) {
+        if(!checkKernelArgument("-wex-no-hdr-modes")) {
             const char *validate="__ZN21AppleIntelFramebuffer22validateDetailedTimingEPvy";
             const auto v=patcher.solveSymbol<mach_vm_address_t>(index,validate,address,size);patcher.clearError();
             if(v==address+0x2FFCA && !memcmp(reinterpret_cast<void *>(v),frame,sizeof(frame))) {
@@ -7558,7 +7558,7 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             if(e==address+0x57BDA && !memcmp(reinterpret_cast<void *>(e),frame,sizeof(frame))) {hdrEnableDRM=e;hdrReady|=16;}
             if(auto live=OSSerializer::forTarget(nullptr,hdrDIPSerialize)) {IORegistryEntry::getRegistryRoot()->setProperty("WEXHDRDIP",live);live->release();}
         }
-        if(checkKernelArgument("-wex-hdr-sgx")) {
+        if(!checkKernelArgument("-wex-no-hdr-sgx")) {
             KernelPatcher::RouteRequest names("_cpuid_get_leaf7_feature_names",wrapHDRLeaf7Names,orgHDRLeaf7Names);
             if(patcher.routeMultiple(KernelPatcher::KernelID,&names,1))hdrReady|=2;
             patcher.clearError();
@@ -10751,10 +10751,10 @@ bool XE::enableDisplay13EngineLocked(void *power) {
 		!c.bridge.state.suspended && acquired.status==Display13Power::Status::Complete && clockReady && !c.clockFaulted && clock.status==Display13Clock::Status::Complete &&
 		Display13Power::objectAssociations(power,0x80,c.controller,0x1C20)) {
 		Display13FBDBUFIO io {c.map};
-		// -wex-hidpi-dbuf: a cursor behind the pipe scaler is charged the downscale. At 180 Hz
+		// 96 DBUF blocks for the cursor (-wex-no-hidpi-dbuf keeps the native 40): a cursor behind the pipe scaler is charged the downscale. At 180 Hz
 		// its SAGV watermark needs up to 78 blocks (3200x1800, 256 wide); with the native 40
 		// the plan has none, and program() would fault the watermark owner for good.
-		if(checkKernelArgument("-wex-hidpi-dbuf"))c.dbuf.cursorBlocks=96;
+		if(!checkKernelArgument("-wex-no-hidpi-dbuf"))c.dbuf.cursorBlocks=96;
 		status=Display13DBUF::begin(io,c.dbuf,__builtin_popcount(callbackXE->adlnOutputWiring.selected())>=3 ? 7U : 0U,c.transcoders);
 		if(status==Display13DBUF::Status::Complete) {
 			if(acquired.status==Display13Power::Status::Complete)status=Display13DBUF::resumeEngine(io,c.dbuf);
@@ -11333,7 +11333,7 @@ void XE::wrapAlderLakeNPlanarDBUFWrite(void *access,uint64_t reg,uint32_t value)
 	uint64_t record[14] {2,reg,value};auto status=Display13DBUF::Status::Unavailable;
 	auto path=Display13FBMemory::singlePath<OSObject *>(fb);
 	auto plane=path && path->getMetaClass()->getClassSize()>=0x3730 ? Display13FBMemory::field<OSObject *>(path,0x32C8) : nullptr;
-	// -wex-hidpi-dbuf: this donor helper also writes the initial RGB allocation, split a
+	// With the 96-block cursor: this donor helper also writes the initial RGB allocation, split a
 	// third/two thirds as for planar YUV and past a fixed 40-block cursor prefix. At native
 	// size the layout setup replaces it later, but in a pipe-scaled mode it runs last and
 	// the primary underruns on motion (retropineaple, 9d28483, single-pipe layout only).
@@ -12219,7 +12219,7 @@ static bool gpuResetTraceSerialize(void *,void *,OSSerialize *serializer) {
  for(uint32_t i=n-used;i<n;++i)out->appendBytes(&gpuResetTraceRing[i%arrsize(gpuResetTraceRing)],sizeof(GPUResetTraceEntry));
  const bool result=out->serialize(serializer);out->release();return result;
 }
-// -wex-reset-recover (retropineaple's -wex-reset-restore: with "-restore" in the boot-args crash reports went to /mnt5 and
+// Reset recovery, on by default, -wex-no-reset-recover turns it off (retropineaple's -wex-reset-restore: with "-restore" in the boot-args crash reports went to /mnt5 and
 // ReportCrash aborted, on every boot that carried it and none other, so the name changes here):
 // on this GPU the hung work sits on the donor's second
 // ring (0x1A000 block), whose reset uses the render GDRST domain (mask 2) but
@@ -12524,7 +12524,7 @@ static bool gpuResetTraceInstall(KernelPatcher &patcher,size_t index,mach_vm_add
   patcher.clearError();
  }
  __atomic_store_n(&gpuResetTraceOn,ready,__ATOMIC_RELEASE);
- if(ready && checkKernelArgument("-wex-reset-recover")) {
+ if(ready && !checkKernelArgument("-wex-no-reset-recover")) {
   static const uint8_t wake[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50};
   auto at=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator13SafeForceWakeEbj",address,size);
   patcher.clearError();
@@ -12562,7 +12562,7 @@ static bool gpuResetTraceInstall(KernelPatcher &patcher,size_t index,mach_vm_add
  return ready;
 }
 
-// -wex-scanout-coherent: surfaceStateFillMemoryObjectControlState gives a
+// Scanout coherence, on by default, -wex-no-scanout-coherent turns it off: surfaceStateFillMemoryObjectControlState gives a
 // displayable IOSurface a MOCS that does not keep its writes in the LLC; the
 // display engine reads memory without snooping the LLC. WindowServer's
 // backing for a downscaled HiDPI mode (larger than the panel) is not marked
@@ -12655,9 +12655,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  const bool surfaceABIReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,false);
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
- if(checkKernelArgument("-wex-reset-trace") || checkKernelArgument("-wex-reset-recover"))
+ if(checkKernelArgument("-wex-reset-trace") || !checkKernelArgument("-wex-no-reset-recover"))
   gpuResetTraceInstall(patcher,index,address,size);
- if(checkKernelArgument("-wex-scanout-coherent"))scanoutCoherentInstall(patcher,index,address,size);
+ if(!checkKernelArgument("-wex-no-scanout-coherent"))scanoutCoherentInstall(patcher,index,address,size);
    // Serialize only the two direct stores in detectEDRAM. The original
    // forcewake and 1000ms sleep remain outside the shared gate.
    {

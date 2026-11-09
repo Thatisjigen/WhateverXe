@@ -38,7 +38,7 @@ private:
  void captureFirmware();
  void processKext(KernelPatcher &,size_t,mach_vm_address_t,size_t);
  enum { FB_DETECT, FB_RESET, FB_COPY, FB_ZEROFILL, FB_NONE, FB_TOTAL };
- uint32_t resetFramebuffer {FB_DETECT};
+ uint32_t resetFramebuffer {FB_NONE};   // the graphics family's console back-copy is off; gfxrst= picks a WhateverGreen mode
 	struct vc_info {
 		unsigned int   v_height;        /* pixels */
 		unsigned int   v_width;         /* pixels */
