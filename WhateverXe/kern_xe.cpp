@@ -10545,15 +10545,17 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 	}
     if(ready)restoreDisplay13Ports(controller);
 	// Sleep, sleepirq: give back the display interrupts the sleep left off, once power and engine are back, unless the
-	// donor already re-enabled them. After a power loss the enable reinstalls them (restoreAfterPowerLoss).
-	// WEXDisplay13SleepIRQ = {calls, restore ok, was off, enable result}.
-	if(display13SleepIRQOff) {
+	// donor already re-enabled them. After a power loss the enable reinstalls them (restoreAfterPowerLoss), and the loss
+	// counts even when the override left them on: a suspend that could not park them does not keep the sleep from
+	// resetting the banks. WEXDisplay13SleepIRQ = {calls, restore ok, was off | banks lost << 1, enable result}.
+	const bool irqLost=ready && display13FBIRQ.powerLost;
+	if(display13SleepIRQOff || irqLost) {
 		static uint32_t sleepIRQ[4] {};++sleepIRQ[0];sleepIRQ[1]=ready;
-		sleepIRQ[2]=!display13FBIRQ.state.enabled;sleepIRQ[3]=UINT32_MAX;
+		sleepIRQ[2]=(display13FBIRQ.state.enabled ? 0U : 1U)|(irqLost ? 2U : 0U);sleepIRQ[3]=UINT32_MAX;
 		if(ready) {
-			if(!display13FBIRQ.state.enabled)sleepIRQ[3]=static_cast<uint32_t>(wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE)));
+			if(!display13FBIRQ.state.enabled || irqLost)sleepIRQ[3]=static_cast<uint32_t>(wrapDisplay13FBEnableIRQ(__atomic_load_n(&display13FBIRQ.controller,__ATOMIC_ACQUIRE)));
 			// sleepirq2: stays pending until enabled; the first modeset after the wake retries (wrapDisplay13TCSetMode).
-			if(display13FBIRQ.state.enabled)display13SleepIRQOff=false;
+			display13SleepIRQOff=!display13FBIRQ.state.enabled || display13FBIRQ.powerLost;
 		}
 		IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13SleepIRQ",sleepIRQ,sizeof(sleepIRQ));
 	}
@@ -10565,14 +10567,15 @@ void XE::wrapAlderLakeNPowerRestore(void *power,bool waking) {
 	// WEXDisplay13HotplugRestore = restoreHotplug | armDetection << 8.
 	if(display13WakePending) {
 		display13WakePending=false;
-		if(ready && !display13FBIRQ.state.enabled && display13FBIRQ.lock && display13FBIRQ.base &&
+		// After a power loss the hotplug banks are reset even if the state still says enabled.
+		if(ready && (!display13FBIRQ.state.enabled || display13FBIRQ.powerLost) && display13FBIRQ.lock && display13FBIRQ.base &&
 		   adlnIRQOwner(display13FBIRQ.controller)) {
 			auto &irq=display13FBIRQ;Display13FBIRQIO irqIO {irq.base};
 			const auto saved=IOSimpleLockLockDisableInterrupt(irq.lock);
 			const auto hotplug=irq.quiescing || irq.handlers ? Display13FBIRQ::Status::Unavailable :
 				Display13FBIRQ::restoreHotplug(irqIO,irq.state,adlnSharedGT(irq.controller));
 			auto restored=static_cast<uint32_t>(hotplug);
-			if(hotplug!=Display13FBIRQ::Status::Complete && !irq.state.enabled)
+			if(hotplug!=Display13FBIRQ::Status::Complete && (!irq.state.enabled || irq.powerLost))
 				restored|=static_cast<uint32_t>(Display13FBIRQ::armDetection(irqIO,irq.state))<<8;
 			adlnIRQCache(irq.controller,irqIO);
 			IOSimpleLockUnlockEnableInterrupt(irq.lock,saved);
