@@ -141,6 +141,7 @@ struct XeHost {
  void processKext(KernelPatcher &,size_t,mach_vm_address_t,size_t);
  static void wrapPanelSetDisplay(){}static void wrapFramebufferInit(){}
  uintptr_t orgPanelSetDisplay=0,orgFramebufferInit=0;uint8_t *gIOFBVerboseBootPtr=nullptr;
+ bool wsStartEnabled=false;uint64_t *gIOFBAllControllers=nullptr;void wsStartArm(){events.push_back(11);}
 };
 '''.replace('// DEVICE_ADAPTER',adapter).replace('HOST_STATE',host_state)+provider_classifier.replace('XE::','XeHost::XE::')+surface_setter.replace('XE::','XeHost::XE::')+body+r'''
 XeHost *XeHost::callbackHost;
@@ -393,6 +394,10 @@ for(unsigned rev:{0U,12U,255U})for(bool override:{false,true}) {
  // dispatch must remain connected to the selected mobile Display13 backend.
  host.processKext(patcher,1,0,0);assert(events.back()==101);
  host.processKext(patcher,2,0,0);assert(events.back()==102);
+ // The sleep fix hooks the graphics family's kext whatever gfxrst says and arms unless its switch turned it off; with
+ // the fix off and gfxrst off, that kext is left alone.
+ host.wsStartEnabled=true;host.processKext(patcher,4,0,0);assert(events.back()==11);
+ host.wsStartEnabled=false;events.clear();host.processKext(patcher,4,0,0);assert(events.empty());
 }
 puts("PASS actual host admission: absent/unpublished/unsupported GPUs never enter Xe; published PCI reads precede selected-driver dispatch");}
 '''
