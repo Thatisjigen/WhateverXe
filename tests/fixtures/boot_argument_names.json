@@ -145,17 +145,27 @@
   "-wex-noaccel": [],
   "-wex-display-trace": [],
   "-wex-adlp-readout": [],
-  "-wex-reset-recover": [],
-  "-wex-hdr-modes": [],
   "-wex-no-rplp-wsstart": [],
-  "-wex-hdr-sgx": [],
   "-wex-reset-trace": [],
-  "-wex-scanout-coherent": [],
-  "-wex-hidpi-dbuf": [],
   "-wex-va-renderer": [],
   "-wex-adlp-load-only": [],
   "-wex-display13-offline": [],
   "-wex-dsi-hdmi-test": [],
   "-wex-dsi-power-test": [],
-  "-wex-panel-base-visible": []
+  "-wex-panel-base-visible": [],
+  "-wex-no-reset-recover": [
+    "-wex-reset-recover"
+  ],
+  "-wex-no-hdr-modes": [
+    "-wex-hdr-modes"
+  ],
+  "-wex-no-hdr-sgx": [
+    "-wex-hdr-sgx"
+  ],
+  "-wex-no-scanout-coherent": [
+    "-wex-scanout-coherent"
+  ],
+  "-wex-no-hidpi-dbuf": [
+    "-wex-hidpi-dbuf"
+  ]
 }
