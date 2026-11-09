@@ -12163,7 +12163,7 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 }
 
 // -wex-reset-trace: record the donor's GPU hang recovery. Each entry is
-// {mach time, event, result, object, arg, 16 registers}; events are enter/exit
+// {mach time, event, result, object number, arg, 16 registers}; events are enter/exit
 // pairs of the channel restart, engine reset, scheduler reset/resume and
 // command-streamer reset. The ring is memory-only and serialized on read, so
 // the recovery path never allocates.
@@ -12178,6 +12178,19 @@ static const uint32_t gpuResetTraceRegs[16] {0x941C,0x4A08,0x2030,0x2034,0x2038,
  0x2074,0x209C,0x20D0,0x229C,0x2234,0x23A0,0x2550,0x0D84};
 static mach_vm_address_t gpuResetOrgEngine,gpuResetOrgScheduler,gpuResetOrgResume;
 static bool gpuResetTraceOn;
+// Every user can read the ring, through the registry and the log, so an entry
+// names its object by the order in which the trace first met it (1, 2, ...) and
+// never by its kernel address. All ones: more objects than the table holds.
+static const void *gpuResetTraceObjects[128];
+static uint64_t gpuResetTraceObjectID(const void *object) {
+ if(!object)return 0;
+ for(uint32_t i=0;i<arrsize(gpuResetTraceObjects);++i) {
+  const void *seen=__atomic_load_n(&gpuResetTraceObjects[i],__ATOMIC_ACQUIRE);
+  if(!seen && __atomic_compare_exchange_n(&gpuResetTraceObjects[i],&seen,object,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))return i+1;
+  if(seen==object)return i+1;
+ }
+ return ~0ULL;
+}
 static void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_t result) {
  if(!__atomic_load_n(&gpuResetTraceOn,__ATOMIC_ACQUIRE))return;
  // IGAccelFIFOChannel +0x18 is the accelerator, whose MMIO base is at +0x1240.
@@ -12186,7 +12199,7 @@ static void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_
  const auto n=__sync_fetch_and_add(&gpuResetTraceCount,1);
  auto &e=gpuResetTraceRing[n%arrsize(gpuResetTraceRing)];
  e.time=mach_absolute_time();e.event=event;e.result=uint32_t(result);
- e.object=reinterpret_cast<uint64_t>(object);e.arg=arg;
+ e.object=gpuResetTraceObjectID(object);e.arg=arg;
  auto mmio=__atomic_load_n(&gpuResetMMIO,__ATOMIC_ACQUIRE);
  for(unsigned i=0;i<arrsize(gpuResetTraceRegs);++i)
   e.regs[i]=mmio?*reinterpret_cast<volatile uint32_t *>(mmio+gpuResetTraceRegs[i]):0;
