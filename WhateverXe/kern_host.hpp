@@ -58,6 +58,16 @@ private:
 
  vc_info consoleVinfo {};
  uint8_t *consoleBuffer {}, *gIOFBVerboseBootPtr {};
+ // The sleep fix for a driverless GPU's placeholder, on unless -wex-no-rplp-wsstart: the graphics family's controller
+ // list head, the walk's record and the sleep/wake interest.
+ bool wsStartEnabled {};
+ uint64_t *gIOFBAllControllers {};
+ uint64_t wsStartRecord[16] {2};
+ static bool wsStartPlaceholder(uint64_t);
+ static bool wsStartLayout(uint64_t);
+ static IOReturn wsStartSleepWake(void *,void *,UInt32,IOService *,void *,vm_size_t);
+ void wsStartRun(bool);
+ void wsStartArm();
  mach_vm_address_t orgFramebufferInit {};
  bool gotConsoleVinfo {};
  static void wrapFramebufferInit(IOFramebuffer *);
