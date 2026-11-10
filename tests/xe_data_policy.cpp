@@ -68,4 +68,24 @@ int main() {
     assert(!service("/tmp/com.apple.WebKit.GPU", Client::WebKitGPU));
     assert(!service(metal, Client::None));
     assert(clientForFile((base+"MacOS/adapter.dylib").c_str(), true) == Client::Compiler);
+    // The NVIDIA Metal runtime of a hybrid machine: its exact images, executable
+    // maps only, and only while the caller leaves it on.
+    const std::string nv = "/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/";
+    const std::string icd = "/Library/GPUBundles/nvmtl/";
+    for (const std::string &image : {nv+"NVMTLDriver", nv+"libnvmtl_translate.dylib", nv+"air-runtime/libLLVM.dylib",
+        nv+"air-runtime/libzstd.1.dylib", icd+"libvulkan_nouveau.dylib", icd+"libnvmtl_translate.dylib"}) {
+        assert(clientForFile(image.c_str(), true) == Client::WebKitGPU);
+        assert(clientForFile(("/System/Volumes/Data"+image).c_str(), true) == Client::WebKitGPU);
+        assert(clientForFile(image.c_str(), false) == Client::None);
+        assert(clientForFile(image.c_str(), true, false) == Client::None);
+    }
+    // Its codecs, its tools, renamed or relocated copies and the bare folders stay out.
+    for (const std::string &other : {nv+"libnvencvt.dylib", nv+"libnvdec_h264.dylib", nv+"NVMTLDriver.old", nv+"../Info.plist",
+        nv, icd, icd+"air-opt", icd+"libvulkan.1.4.362.dylib", icd+"libvulkan_nouveau.dylib.syms",
+        "/tmp"+icd+"libvulkan_nouveau.dylib", std::string("/Library/GPUBundles/NVIDIAShared.bundle/Contents/MacOS/NVIDIAShared")})
+        assert(clientForFile(other.c_str(), true) == Client::None);
+    // Our own images do not depend on that switch.
+    assert(clientForFile((va+"TGLVA").c_str(), true, false) == Client::WebKitGPU);
+    assert(clientForFile((mtl+"impostor.dylib").c_str(), true, false) == Client::WebKitGPU);
+    assert(clientForFile((base+"MacOS/adapter.dylib").c_str(), true, false) == Client::Compiler);
 }
