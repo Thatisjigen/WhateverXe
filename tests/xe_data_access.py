@@ -11,7 +11,7 @@ harness = r'''
 #include <cstring>
 namespace KernelVersion { enum { Catalina=19, BigSur, Monterey, Ventura, Sonoma, Sequoia, Tahoe }; }
 int version=20; int getKernelVersion() { return version; }
-bool ready=true, processPresent=true, platform=true, valid=true, pathError=false;
+bool ready=true, processPresent=true, platform=true, valid=true, pathError=false, nvidiaWebKit=true;
 const char *identity="com.apple.WebKit.GPU";
 const char *target="/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/TGLVA";
 const char *imagePath="/arbitrary/updated/Safari/WebKitGPU";
@@ -52,12 +52,27 @@ int main() {
     pathError=true; assert(!allowed((void*)1,true)); pathError=false;
     target="/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/unlisted";
     assert(!allowed((void*)1,true));
+    // The NVIDIA runtime of a hybrid machine: the same signed service, its listed images only, and switchable.
+    version=25; imagePath="/arbitrary/updated/Safari/WebKitGPU";
+    target="/Library/GPUBundles/nvmtl/libvulkan_nouveau.dylib";
+    assert(allowed((void*)1,true));
+    assert(!allowed((void*)1,false));
+    platform=false; assert(!allowed((void*)1,true)); platform=true;
+    valid=false; assert(!allowed((void*)1,true)); valid=true;
+    identity="com.apple.WebKit.WebContent"; assert(!allowed((void*)1,true)); identity="com.apple.WebKit.GPU";
+    nvidiaWebKit=false; assert(!allowed((void*)1,true));
+    target="/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/TGLVA";
+    assert(allowed((void*)1,true)); // our own images do not depend on the switch
+    nvidiaWebKit=true;
+    target="/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/libnvencvt.dylib";
+    assert(!allowed((void*)1,true));
+    assert(imageReads==0); // still no executable-path query for WebKit
     target="/Library/GPUBundles/XeCompilerAdapter.bundle/Contents/MacOS/adapter.dylib";
     imagePath="/System/Library/Frameworks/Metal.framework/Versions/A/XPCServices/MTLCompilerService.xpc/Contents/MacOS/MTLCompilerService";
     for(version=20;version<=25;++version) assert(allowed((void*)1,true)==(version>=23));
     imagePath="/tmp/MTLCompilerService"; assert(!allowed((void*)1,true));
     assert(imageReads==releases);
-    puts("PASS: production access decision, six OS gates, relocation, trust failures, compiler boundary");
+    puts("PASS: production access decision, six OS gates, relocation, trust failures, NVIDIA runtime, compiler boundary");
 }
 '''
 harness = harness.replace('#include <cstring>', '#include <cstring>\n#include <initializer_list>')
