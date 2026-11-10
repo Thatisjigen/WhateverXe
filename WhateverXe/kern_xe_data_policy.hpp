@@ -31,12 +31,28 @@ inline bool file(const char *path, bool executable) {
     if (!strcmp(path, "MacOS/adapter.dylib") || !strcmp(path, "MacOS/libigc-tgl.dylib")) return true;
     return !executable && (!strcmp(path, "MacOS/runtime.igc64.bc") || !strcmp(path, "Info.plist"));
 }
-inline Client clientForFile(const char *path, bool executable) {
+// The images NullMoth's Metal plugin maps on a machine that also has an NVIDIA
+// GPU: the plugin, its shader translator, the AIR runtime it carries and the
+// Vulkan driver. Exact paths, as for our own images; its codecs are not listed.
+inline bool nvidiaRuntime(const char *path) {
+    constexpr const char bundle[] = "/Library/GPUBundles/NVMTLDriver.bundle/Contents/MacOS/";
+    if (!strncmp(path, bundle, sizeof(bundle)-1)) {
+        path += sizeof(bundle)-1;
+        return !strcmp(path, "NVMTLDriver") || !strcmp(path, "libnvmtl_translate.dylib") ||
+            !strcmp(path, "air-runtime/libLLVM.dylib") || !strcmp(path, "air-runtime/libzstd.1.dylib");
+    }
+    return !strcmp(path, "/Library/GPUBundles/nvmtl/libvulkan_nouveau.dylib") ||
+        !strcmp(path, "/Library/GPUBundles/nvmtl/libnvmtl_translate.dylib");
+}
+inline Client clientForFile(const char *path, bool executable, bool nvidia = true) {
     if (file(path, executable)) return Client::Compiler;
     // WebKit already permits Data reads; allow executable maps of fixed GPU images.
     if (!path || !executable) return Client::None;
     constexpr const char data[] = "/System/Volumes/Data";
     if (!strncmp(path, data, sizeof(data)-1)) path += sizeof(data)-1;
+    // The two Sandbox callbacks take one route, and on a hybrid machine it is
+    // ours: a second plugin cannot grant this for the other GPU's runtime.
+    if (nvidia && nvidiaRuntime(path)) return Client::WebKitGPU;
     constexpr const char va[] = "/Library/GPUBundles/AppleIntelTGLGraphicsVADriver.bundle/Contents/MacOS/";
     if (!strncmp(path, va, sizeof(va)-1)) {
         path += sizeof(va)-1;
