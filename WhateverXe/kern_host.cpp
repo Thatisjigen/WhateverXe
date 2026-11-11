@@ -16,6 +16,10 @@
 #include <IOKit/pwr_mgt/RootDomain.h>
 #include <kern/clock.h>
 #include "kern_rplp_iog.hpp"
+#include <Headers/kern_mach.hpp>
+#include <sys/vnode.h>
+extern "C" const char version[];
+#include "kern_va_pages.hpp"
 static size_t hostInstructionSize(const uint8_t *bytes,size_t length) {
  uint8_t code[32] {};memcpy(code,bytes,length<sizeof(code)?length:sizeof(code));
  Disassembler::hde_t ins {};
@@ -138,6 +142,8 @@ void XeHost::processKernel(KernelPatcher &patcher) {
  // The host must dispatch framebuffer patches and accelerator rejection
  // hooks even when the selected profile deliberately has no Render backend.
  active=profile.displayAdmitted();
+ // Exact corrections of the Intel VA driver's pages, armed with its renderer advertised.
+ prepareVAPages(patcher,gpu,profile,checkKernelArgument("-wex-va-renderer"));
 
  const auto display=XELP::displayAdapter(profile.family);
  systemWakeRecovery=active && (display==XELP::DisplayAdapter::ADLP || display==XELP::DisplayAdapter::ADLN);

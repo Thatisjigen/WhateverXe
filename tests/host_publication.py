@@ -96,6 +96,8 @@ using IOService=IOPCIDevice;using IOReturn=int;using IOFramebuffer=IOPCIDevice;
 constexpr uint32_t kIOWindowServerActiveAttribute=1,kIOWSAA_StateMask=15,kIOWSAA_Accelerated=1,kIOWSAA_Unaccelerated=0;
 constexpr IOReturn kIOReturnSuccess=0,kIOReturnNotReady=-1;
 #define FunctionCast(fn,addr) reinterpret_cast<decltype(&fn)>(addr)
+static bool checkKernelArgument(const char *){return false;}
+static void prepareVAPages(KernelPatcher &,IOPCIDevice *gpu,const XELP::Profile &profile,bool renderer){assert(!renderer);if(profile.displayAdmitted())assert(gpu && published);}
 struct XeHost {
  static XeHost *callbackHost;
  HOST_STATE
