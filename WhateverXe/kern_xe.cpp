@@ -4806,6 +4806,10 @@ struct Display13FBIRQContext {
 	Display13FBIRQ::HandlerScopes scopes;
 	volatile uint32_t admittedPipes {}; // Release-published after actual path/backing proof.
 	Display13FBIRQ::Status status {Display13FBIRQ::Status::Unavailable};
+	// Guards the scope list and in-flight handler count on their own, so the
+	// post-handler retirement never retakes the native IRQ lock. Placed last to
+	// keep every existing field offset unchanged.
+	IOSimpleLock *scopeLock {};
 };
 static Display13FBIRQContext display13FBIRQ;
 // Only the original RegisterAccelerator binds C0 and copies its callbacks.
@@ -6096,6 +6100,10 @@ bool XE::processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach
 	};
 	const bool routed=patcher.routeMultiple(index,routes,arrsize(routes),address,size);
 	patcher.clearError();
+	// Allocate the private scope lock here, once, before the framebuffer can
+	// enable interrupts. The hard-IRQ handlers below use it instead of the
+	// native IRQ lock for their own entry bookkeeping.
+	if(routed && !display13FBIRQ.scopeLock)display13FBIRQ.scopeLock=IOSimpleLockAlloc();
 	KernelPatcher::RouteRequest swRoute {swSymbol,wrapDisplay13FBSWIRQ,orgDisplay13FBSWIRQ};
 	const bool swRouted=routed && patcher.routeMultipleShort(index,&swRoute,1,address,size);
 	patcher.clearError();return swRouted;
@@ -6196,17 +6204,26 @@ bool XE::wrapDisplay13FBProcessIRQ(IOService *controller) {
 	auto saved=IOSimpleLockLockDisableInterrupt(c.lock);
 	if(((c.blockedPipes&c.state.active) || !c.state.enabled) && !adlnSharedGT(controller)) {IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return false;}
 	const bool display=c.state.enabled && !c.quiescing && !c.blockedPipes;
-	if(!c.scopes.begin(scope,reinterpret_cast<uintptr_t>(current_thread()),display)) {IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return false;}
-	++c.handlers;IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
-	// Include native DSB completion, which runs after its own simple-lock
-	// unlock. Checking only the lock is insufficient before a power release.
+	// Push the entry under the private scope lock, nested while the native lock
+	// still gates the state read above. The scope lock is never held across the
+	// original handler, so the retirement below cannot spin on it.
+	IOSimpleLockLock(c.scopeLock);
+	const bool admitted=c.scopes.begin(scope,reinterpret_cast<uintptr_t>(current_thread()),display);
+	if(admitted)++c.handlers;
+	IOSimpleLockUnlock(c.scopeLock);
+	IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+	if(!admitted)return false;
+	// Run the complete original handler, including the native DSB retirement it
+	// performs after releasing its own simple lock, holding none of our locks.
 	const auto pending=FunctionCast(wrapDisplay13FBProcessIRQ,callbackXE->orgDisplay13FBIRQ[4])(controller);
-	saved=IOSimpleLockLockDisableInterrupt(c.lock);
-	// This stack node is inserted/removed under the same lock and cannot be
-	// withdrawn by another caller. Keep the real total counter through the
-	// complete original handler, including DSB retirement after its unlock.
+	// Retire the entry under the private scope lock only. A violent display
+	// reconfiguration can leave the original handler re-entering or still
+	// holding its own native IRQ lock on return, so retaking that lock here
+	// would spin forever on a lock this CPU already owns.
+	const auto scopeState=IOSimpleLockLockDisableInterrupt(c.scopeLock);
 	c.scopes.end(scope);--c.handlers;
-	IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return pending;
+	IOSimpleLockUnlockEnableInterrupt(c.scopeLock,scopeState);
+	return pending;
 }
 void XE::wrapDisplay13FBSWIRQ(IOService *controller,IOInterruptEventSource *source,int count) {
 	// SWInterruptHandler atomically consumes E08/E0C/E10 before invoking
@@ -6394,7 +6411,12 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 	// Native ProcessInterrupt already holds c+90. Permission belongs to its
 	// entry scope, even if a power/clock caller restored state.enabled since.
 	// Keep all hardware pending untouched for a subsequent permitted handler.
-	if(!c.scopes.permits(reinterpret_cast<uintptr_t>(current_thread())))return;
+	// The scope list is owned by its own lock; take it to read the permission
+	// without racing a concurrent entry/retirement on another CPU.
+	IOSimpleLockLock(c.scopeLock);
+	const bool permitted=c.scopes.permits(reinterpret_cast<uintptr_t>(current_thread()));
+	IOSimpleLockUnlock(c.scopeLock);
+	if(!permitted)return;
 	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
 	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
 	if(e.aux)display13TCReleaseArm(); // A DP Alt event: the port may have just lost its sink.
