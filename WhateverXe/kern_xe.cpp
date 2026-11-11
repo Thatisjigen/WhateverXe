@@ -9888,7 +9888,7 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
     Display13WM::Latch before[3],after[3];
     IOService *frames[3] {};IORecursiveLock *mutexes[3] {};bool locked[3] {};
     IOWorkLoop *loop=nullptr,*acquired=nullptr;uint32_t active=0;
-    uint64_t evidence[28] {1,nativeHz};
+    uint64_t evidence[28] {1,nativeHz};bool gateBusy=false; // [27]: gate retries, |0x100 if still busy
     IOLockLock(c.lock);
     const bool valid=callbackXE->display13FBClockSetHookReady && controller==c.controller && c.map && c.bridge.begun &&
         !c.bridge.state.faulted && !c.clockFaulted && !c.watermarkFaulted &&
@@ -9920,7 +9920,17 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
             evidence[7]=reinterpret_cast<bool (*)(const IOWorkLoop *)>(callbackXE->adlnWorkLoopInGate)(loop);
             if(!evidence[7]) {
                 ready=reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(loop);
+                // Another thread can hold the gate for a moment. Retry briefly without the
+                // owner lock; the controller, the active-pipe set and the clock are checked
+                // again after the relock below. Bounded, so it cannot wait on a gate whose
+                // owner wants the caller's framebuffer mutex.
+                for(unsigned retry=0;!ready && retry<20;++retry) {
+                    IOLockUnlock(c.lock);IOSleep(5);
+                    ready=reinterpret_cast<bool (*)(IOWorkLoop *)>(callbackXE->adlnWorkLoopTryClose)(loop);
+                    IOLockLock(c.lock);evidence[27]=retry+1;
+                }
                 if(ready) {acquired=loop;evidence[8]=1;}
+                else gateBusy=true;
             }
         }
         if(ready)for(unsigned p=0;p<3;++p)if(active&(1U<<p)) {
@@ -9990,6 +10000,11 @@ void XE::adlnSetDualClock(IOService *controller,uint64_t nativeHz) {
     if(result.status==Display13Clock::ChangeStatus::Complete) {
         c.clock=result.after;c.clockStopped=false;c.resumeClockHz=result.after.nativeHz();
         *reinterpret_cast<uint64_t *>(reinterpret_cast<uint8_t *>(controller)+0xE98)=result.after.nativeHz();
+    } else if(gateBusy && !result.writes) {
+        // Nothing was written: the clock is unchanged and still valid. Leave the
+        // lifecycle open so a later request can succeed, instead of refusing every
+        // watermark program for the rest of the boot.
+        evidence[27]|=0x100;
     } else adlnFault(c.clockFaulted,__LINE__);
     evidence[16]=static_cast<uint32_t>(result.status);evidence[17]=result.writes;
     for(unsigned p=0;p<3;++p) {
