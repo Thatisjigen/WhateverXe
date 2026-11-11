@@ -23,6 +23,7 @@ Open originalOpen;
 Map originalMap;
 bool enabled, ready;
 bool nvidiaWebKit = true; // -wex-no-nv-webkit: Safari's GPU service keeps to the Intel driver.
+bool nvidiaVideo = false; // -wex-nv-video: it also maps the NVIDIA runtime's video decoders.
 volatile SInt32 readGrants, mapGrants;
 
 bool knownOS() {
@@ -35,7 +36,7 @@ bool allowed(void *vnode, bool executable) {
     int length = sizeof(path);
     // vn_getpath does not enter the filesystem; never reopen a path in a MAC hook.
     if (getPath(vnode, path, &length)) return false;
-    const auto client = XeDataPolicy::clientForFile(path, executable, nvidiaWebKit);
+    const auto client = XeDataPolicy::clientForFile(path, executable, nvidiaWebKit, nvidiaVideo);
     if (client == XeDataPolicy::Client::None) return false;
     auto process = currentProcess();
     if (!process) return false;
@@ -75,6 +76,7 @@ int checkMap(void *cred, void *file, void *label, int prot, int flags, uint64_t 
 
 void XeDataAccess::init() {
     nvidiaWebKit = !checkKernelArgument("-wex-no-nv-webkit");
+    nvidiaVideo = checkKernelArgument("-wex-nv-video");
     if (knownOS()) lilu.onKextLoadForce(&sandbox);
 }
 KernelPatcher::KextInfo &XeDataAccess::dependency() { return sandbox; }
@@ -126,6 +128,7 @@ bool XeDataAccess::processKext(KernelPatcher &p, size_t index, mach_vm_address_t
     }
     IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeDataAccess", ready);
     IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeDataAccessNVIDIA", ready && nvidiaWebKit);
+    IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeDataAccessNVIDIAVideo", ready && nvidiaWebKit && nvidiaVideo);
     SYSLOG("wex", "GPU Data access ready=%d", ready);
     return true;
 }

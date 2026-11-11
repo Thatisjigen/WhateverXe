@@ -78,14 +78,26 @@ int main() {
         assert(clientForFile(("/System/Volumes/Data"+image).c_str(), true) == Client::WebKitGPU);
         assert(clientForFile(image.c_str(), false) == Client::None);
         assert(clientForFile(image.c_str(), true, false) == Client::None);
+        assert(clientForFile(image.c_str(), true, true, true) == Client::WebKitGPU); // independent of the decoders
     }
-    // Its codecs, its tools, renamed or relocated copies and the bare folders stay out.
-    for (const std::string &other : {nv+"libnvencvt.dylib", nv+"libnvdec_h264.dylib", nv+"NVMTLDriver.old", nv+"../Info.plist",
+    // The video decoders only on request, and only while the NVIDIA list is on.
+    const std::string decoders = nv+"libnvencvt.dylib";
+    assert(clientForFile(decoders.c_str(), true) == Client::None);
+    assert(clientForFile(decoders.c_str(), true, true, true) == Client::WebKitGPU);
+    assert(clientForFile(("/System/Volumes/Data"+decoders).c_str(), true, true, true) == Client::WebKitGPU);
+    assert(clientForFile(decoders.c_str(), false, true, true) == Client::None);
+    assert(clientForFile(decoders.c_str(), true, false, true) == Client::None);
+    // Its encoders and other decoder libraries, its tools, renamed or relocated copies and the bare folders stay out.
+    for (const std::string &other : {nv+"libnvenc_h264.dylib", nv+"libnvenc_hevc.dylib", nv+"libnvdec_h264.dylib", nv+"libnvdec_hevc.dylib",
+        nv+"libnvencvt.dylib.old", nv+"air-runtime/libnvencvt.dylib", icd+"libnvencvt.dylib", nv+"NVMTLDriver.old", nv+"../Info.plist",
         nv, icd, icd+"air-opt", icd+"libvulkan.1.4.362.dylib", icd+"libvulkan_nouveau.dylib.syms",
-        "/tmp"+icd+"libvulkan_nouveau.dylib", std::string("/Library/GPUBundles/NVIDIAShared.bundle/Contents/MacOS/NVIDIAShared")})
+        "/tmp"+icd+"libvulkan_nouveau.dylib", std::string("/Library/GPUBundles/NVIDIAShared.bundle/Contents/MacOS/NVIDIAShared")}) {
         assert(clientForFile(other.c_str(), true) == Client::None);
-    // Our own images do not depend on that switch.
+        assert(clientForFile(other.c_str(), true, true, true) == Client::None);
+    }
+    // Our own images do not depend on those switches.
     assert(clientForFile((va+"TGLVA").c_str(), true, false) == Client::WebKitGPU);
+    assert(clientForFile((va+"TGLVA").c_str(), true, true, true) == Client::WebKitGPU);
     assert(clientForFile((mtl+"impostor.dylib").c_str(), true, false) == Client::WebKitGPU);
     assert(clientForFile((base+"MacOS/adapter.dylib").c_str(), true, false) == Client::Compiler);
 }
