@@ -14,9 +14,12 @@ header=(root/'WhateverXe/kern_local_va_vfe.hpp').read_text()
 safeHeader=(root/'WhateverXe/kern_local_va_safe.hpp').read_text()
 identity=re.search(r'ReferenceSHA256\[\]\{([^}]+)\}',header);expected=bytes(int(n,0) for n in identity[1].split(','))
 first=re.search(r'\{0x786000,\{([^}]+)\}',safeHeader)
+pixelHeader=(root/'WhateverXe/kern_local_va_pixel.hpp').read_text()
+pfirst=re.search(r'\{0x2b000,\{([^}]+)\}',pixelHeader)
 if args.donor:
  data=args.donor.read_bytes();page=data[0x2c000:0x2d000];assert hashlib.sha256(page).digest()==expected
  safe=data[0x786000:0x787000];assert hashlib.sha256(safe).digest()==bytes(int(n,0) for n in first[1].split(','))
+ pixel=data[0x2b000:0x2c000];assert hashlib.sha256(pixel).digest()==bytes(int(n,0) for n in pfirst[1].split(','))
 else:
  page=bytearray((i*37+31)%256 for i in range(4096))
  for off,count,body in re.findall(r'\{0x([a-f0-9]+),(\d+),\{([^}]+)\},',header):
@@ -25,10 +28,16 @@ else:
  # A synthetic first capability page with the expected count at its first list.
  safe=bytearray((i*53+7)%256 for i in range(4096));safe[0xfc4:0xfc8]=(2).to_bytes(4,'little')
  safeHeader=safeHeader[:first.start(1)]+','.join(hex(v) for v in hashlib.sha256(safe).digest())+safeHeader[first.end(1):]
+ # A synthetic capability-builder page carrying every original byte of the pixel patches.
+ pixel=bytearray((i*29+11)%256 for i in range(4096))
+ for off,size,before,after in re.findall(r'\{0x([0-9a-f]+),(\d+),\{([^}]+)\},\{([^}]+)\}\}',pixelHeader[pfirst.end():]):
+  value=bytes(int(n,0) for n in before.split(','));assert len(value)==int(size);pixel[int(off,16):int(off,16)+len(value)]=value
+ pixelHeader=pixelHeader[:pfirst.start(1)]+','.join(hex(v) for v in hashlib.sha256(pixel).digest())+pixelHeader[pfirst.end(1):]
 code=r'''
 #include "kern_local_va_vfe.hpp"
 #include "kern_local_va_l3.hpp"
 #include "kern_local_va_safe.hpp"
+#include "kern_local_va_pixel.hpp"
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
 #include <cassert>
@@ -59,7 +68,7 @@ static std::vector<uint8_t> read(const char*p){std::ifstream f(p,std::ios::binar
 static void walker(void*,uint32_t*x,uint32_t*y,unsigned i){*x=16+i;*y=32+i;}
 template<class T>void put(uint8_t*p,unsigned o,T v){memcpy(p+o,&v,sizeof(v));}
 int main(int argc,char**argv){
- assert(argc==3 || argc==4);auto page=read(argv[1]),safe=read(argv[2]);assert(page.size()==4096 && safe.size()==4096);unsigned cases=0;
+ assert(argc==4 || argc==5);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]);assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096);unsigned cases=0;
  KernelPatcher patcher;IOPCIDevice gpu;
  // Scope: exact device and revision, no override, Tahoe, the route, and the renderer switch.
  for(unsigned bits=0;bits<32;++bits){
@@ -67,22 +76,22 @@ int main(int argc,char**argv){
   auto profile=XELP::identify(0xa7a08086,bits&8?0x04:0x05,bits&16?0x9a498086:0xa7a08086);
   prepareVAPages(patcher,&gpu,profile,renderer);
   const bool scope=(bits&8) && !(bits&16);
-  assert(vaGen12Enabled==(scope && renderer) && vaSafeEnabled==(scope && renderer));
+  assert(vaGen12Enabled==(scope && renderer) && vaSafeEnabled==(scope && renderer) && vaPixelEnabled==(scope && renderer));
   assert(vaPageHookReady==(scope && renderer && (bits&4) && routeOK));++cases;
  }
  kernel=Tahoe;routeOK=true;
- prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled);++cases;
- prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled);++cases;
+ prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled);++cases;
  for(const char *servicing:{"Darwin Kernel Version 25.6.0: other date; root:xnu-new/RELEASE_X86_64","Darwin Kernel Version 25.7.2: future date; root:xnu-next/RELEASE_X86_64"}) {
-  version=servicing;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled);++cases;
+  version=servicing;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);++cases;
  }
  version="Darwin Kernel Version 24.6.0: Mon Jul 14 11:28:17 PDT 2025; root:xnu-11417.140.69~1/RELEASE_X86_64";
- prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled);++cases;
- prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled);++cases;
- version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled);
+ prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled);++cases;
+ version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);
  // The VFE packet generator: validated executable code pages only, rechecked under the write lock.
  for(unsigned condition=0;condition<11;++condition){
-  auto data=page;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=0;
+  auto data=page;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=0;
   validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
   writeOK=condition!=4;race=condition==5;vaGen12Enabled=condition!=6;
   if(condition==7)data[200]^=1;
@@ -90,7 +99,7 @@ int main(int argc,char**argv){
   auto offset=LocalVAVFE::FileOffset+(condition==8?4096:0);
   vaValidatePage((void*)1,(void*)2,offset,data.data(),condition==9?nullptr:&valid,&t,condition==10?nullptr:&nx);
   assert(originalCalls==1 && !writing);if(condition!=9)assert(valid==validation);assert(t==taint);if(condition!=10)assert(nx==nxValue);
-  assert(vaVFEPages==(condition==0?1U:0U) && !vaL3Pages && !vaSafePages);
+  assert(vaVFEPages==(condition==0?1U:0U) && !vaL3Pages && !vaSafePages && !vaPixelPages);
   if(condition==0){auto expected=page;LocalVAVFE::apply(expected.data());assert(data==expected);assert(!LocalVAVFE::matches(data.data(),4096,offset,true,false));}
   else if(condition!=5 && condition!=7)assert(data==page);
   ++cases;
@@ -98,7 +107,7 @@ int main(int argc,char**argv){
  vaGen12Enabled=true;
  // The capability list lives in a data page: NX does not exclude it, and only its first list is cleared.
  for(unsigned condition=0;condition<10;++condition){
-  auto data=safe;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=0;
+  auto data=safe;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=0;
   validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?0:1;
   writeOK=condition!=4;race=condition==5;vaSafeEnabled=condition!=6;vaPageHookReady=condition!=9;
   if(condition==7)data[100]^=1;
@@ -107,16 +116,40 @@ int main(int argc,char**argv){
   vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
   assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
   const bool patched=condition==0 || condition==3;
-  assert(vaSafePages==(patched?1U:0U) && !vaVFEPages && !vaL3Pages);
+  assert(vaSafePages==(patched?1U:0U) && !vaVFEPages && !vaL3Pages && !vaPixelPages);
   if(patched){auto expected=safe;memset(expected.data()+0xfc4,0,4);assert(data==expected);}
   else if(condition!=5 && condition!=7)assert(data==safe);
   ++cases;
  }
  vaSafeEnabled=vaPageHookReady=true;
+ // The pixel-transfer capabilities: a code page, so validated, untainted and executable only.
+ for(unsigned condition=0;condition<10;++condition){
+  auto data=pixel;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=0;
+  validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
+  writeOK=condition!=4;race=condition==5;vaPixelEnabled=condition!=6;vaPageHookReady=condition!=9;
+  if(condition==7)data[64]^=1;
+  int valid=-1,t=-1,nx=-1;
+  const uint64_t offset=0x2b000+(condition==8?4096:0);
+  vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
+  assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
+  assert(vaPixelPages==(condition==0?1U:0U) && !vaVFEPages && !vaL3Pages && !vaSafePages);
+  if(!condition){auto expected=pixel;LocalVAPixel::apply(expected.data(),1);assert(data==expected);assert(LocalVAPixel::match(data.data(),4096,offset,true,false)==-1);}
+  else if(condition!=5 && condition!=7)assert(data==pixel);
+  ++cases;
+ }
+ vaPixelEnabled=vaPageHookReady=true;
  assert(!LocalVAVFE::matches(page.data(),4095,LocalVAVFE::FileOffset,true,false));
  printf("PASS: %u production callback cases: exact scope, both switches, validated pages, mutation race, permissions, NX and original outputs preserved\n",cases);
- if(argc==3)return 0;
- auto image=read(argv[3]);
+ if(argc==4)return 0;
+ auto image=read(argv[4]);
+ // The pixel-transfer pages of the real image: both match, and every patch lands where expected.
+ for(unsigned i=0;i<LocalVAPixel::PageCount;++i) {
+  const auto &p=LocalVAPixel::Pages[i];assert(p.offset+4096<=image.size());
+  std::vector<uint8_t> copy(image.begin()+p.offset,image.begin()+p.offset+4096);
+  assert(LocalVAPixel::match(copy.data(),4096,p.offset,true,false)==int(i));LocalVAPixel::apply(copy.data(),i);
+  for(unsigned j=0;j<p.count;++j)assert(!memcmp(copy.data()+p.patches[j].offset,p.patches[j].after,p.patches[j].size));
+  assert(LocalVAPixel::match(copy.data(),4096,p.offset,true,false)==-1);
+ }
  // lymzzyh's tables against the real image: every page and site still matches.
  for(unsigned i=0;i<LocalVASafe::PageCount;++i) {
   const auto &table=LocalVASafe::Pages[i];assert(table.offset+4096<=image.size());
@@ -171,8 +204,8 @@ int main(int argc,char**argv){
 }
 '''.replace('PRODUCTION',production)
 with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
- p=Path(tmp);(p/'kern_local_va_vfe.hpp').write_text(header);(p/'kern_local_va_safe.hpp').write_text(safeHeader)
- (p/'page.bin').write_bytes(page);(p/'safe.bin').write_bytes(safe);(p/'test.cpp').write_text(code)
+ p=Path(tmp);(p/'kern_local_va_vfe.hpp').write_text(header);(p/'kern_local_va_safe.hpp').write_text(safeHeader);(p/'kern_local_va_pixel.hpp').write_text(pixelHeader)
+ (p/'page.bin').write_bytes(page);(p/'safe.bin').write_bytes(safe);(p/'pixel.bin').write_bytes(pixel);(p/'test.cpp').write_text(code)
  extra=[]
  if args.intel_gen12:
   # Generated constructors do not use MOS utilities; omit only that unused
@@ -182,4 +215,4 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
   (p/'oracle.cpp').write_text(oracle.replace('#include "mos_utilities.h"',''))
   extra=['-DINTEL_GEN12_ORACLE','-I'+str(args.intel_gen12),str(p/'oracle.cpp')]
  subprocess.run(['clang++','-arch','x86_64','-std=c++17','-O1','-g','-I'+str(root/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')]+extra,check=True)
- subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin')]+([str(args.donor.resolve())] if args.donor else []),check=True)
+ subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin'),str(p/'pixel.bin')]+([str(args.donor.resolve())] if args.donor else []),check=True)
