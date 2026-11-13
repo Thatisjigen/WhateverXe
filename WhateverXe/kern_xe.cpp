@@ -16397,11 +16397,15 @@ bool xelpForceWakeIRQSerialize(void *,void *,OSSerialize *serializer) {
  const bool ok=data->serialize(serializer);data->release();return ok;
 }
 bool tglCSB12Enabled {false};
+// A transient stale Hardware Status Page read re-arms the ring instead of
+// panicking, at most once per this window per engine; a repeat inside the
+// window still panics so a genuinely wedged engine is still caught.
+constexpr uint64_t kTGLCSBRecoverWindowNs = 1000000000;
 struct TGLCSBEngine {
  void *streamer {};
  TGLCSB::State state;
  bool hardwareReady {false};
- uint64_t consumed {}, retries {}, fallback {}, resets {}, lastRaw {};
+ uint64_t consumed {}, retries {}, fallback {}, resets {}, lastRaw {}, lastRecoverNs {};
  uint32_t modeAtInit {UINT32_MAX};
 // Exact donor kIGHwCsDesc has six 0x79-byte records, IDs0..5. The scheduler's
 // `index > 4` exit is AFTER construction, so it also constructs ID5.
@@ -16685,6 +16689,19 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
   if (used<sizeof(reason)) snprintf(reason+used,sizeof(reason)-used," afterPtr=%x afterTail=%x",
    *reinterpret_cast<volatile uint32_t *>(io.bar+io.pointerReg),
    *reinterpret_cast<volatile uint32_t *>(io.hwsp+0xBC));
+  // A zero or all-ones (Sentinel) next slot behind a desynced head/tail is a
+  // stale Hardware Status Page read, not a classified-but-unhandled event, so
+  // the sanctioned native reset path from the TGLCSB::drain contract applies:
+  // re-arm the ring and return without dispatching, rather than panicking.
+  const bool staleSlot = error == TGLCSB::Error::Unavailable ||
+   (error == TGLCSB::Error::Rejected && (engine.lastRaw == 0 || engine.lastRaw == TGLCSB::Sentinel));
+  const uint64_t recoverNow = io.nowNs();
+  if (staleSlot && (!engine.lastRecoverNs || recoverNow - engine.lastRecoverNs >= kTGLCSBRecoverWindowNs)) {
+   engine.lastRecoverNs = recoverNow;
+   SYSLOG("igfx","%s -> recovered (CSB ring re-armed)",reason);
+   tglCSBInitialize(streamer);
+   return;
+  }
   const uint32_t words[] {static_cast<uint32_t>(engine.lastRaw),static_cast<uint32_t>(engine.lastRaw>>32)};
   tglHostCSBFatal(reason,words,streamer);
  }
