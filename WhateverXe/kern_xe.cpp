@@ -6477,11 +6477,83 @@ static uint32_t display13PanelPlaneControl(uint32_t value) {
 	thread_call_enter_delayed(display13PlaneWatchCall,deadline);
 	return value&~0x80000000U;
 }
+// The boot screen at the first modeset. The firmware scans the panel from the framebuffer's base memory, offset 0, in linear
+// layout. The first modeset keeps that memory but programs the plane as Y-tiled, so until WindowServer's first frame the boot
+// screen comes out as stripes. Until then, while the pitch is the firmware's, the hardware gets the plane as linear, with the
+// stride in 64-byte units. Reads through the register manager return what the framebuffer wrote, so its register cache stays
+// tiled, and the first real frame puts the tiled stride back before its own update. Off with -wex-panel-base-visible.
+// WEXDisplay13BootPlane = {controls kept linear, strides converted, strides fixed at the control write, reads answered tiled,
+// stride put back at the first real frame, firmware stride, tiled control, conversions given up}.
+static bool display13BootPlaneReady,display13BootLinear;
+static uint32_t display13BootFirmwareStride,display13BootTiledControl,display13BootPlaneRecord[8];
+static thread_call_t display13BootPlaneCall;
+using Display13RegisterRead=uint32_t (*)(void *,uint64_t);
+using Display13RegisterWrite=void (*)(void *,uint64_t,uint32_t);
+static void display13BootPlanePublish(thread_call_param_t,thread_call_param_t) {
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13BootPlane",display13BootPlaneRecord,sizeof(display13BootPlaneRecord));
+}
+static bool display13BootPlaneOpen(void *access) {
+	return access && access==display13FBPower.access && __atomic_load_n(&display13BootPlaneReady,__ATOMIC_ACQUIRE) &&
+		!__atomic_load_n(&display13PanelPlane,__ATOMIC_ACQUIRE);
+}
+// The register write hook calls this last, with the value the framebuffer means to write.
+static uint32_t display13BootPlaneWrite(void *access,uint64_t reg,uint32_t value,Display13RegisterRead read,Display13RegisterWrite write) {
+	if((reg!=0x70180 && reg!=0x70188) || !read || !write || !display13BootPlaneOpen(access))return value;
+	auto &firmware=display13BootFirmwareStride;
+	if(!firmware) {
+		// The framebuffer's first write to this plane finds the firmware's: enabled, linear, four bytes per pixel.
+		const auto control=read(access,0x70180),stride=read(access,0x70188);
+		firmware=(control&0x80000000U) && !((control>>10)&7) && Display13WM::supportedRGBControl(control) &&
+			stride && stride<0x1000 && !(stride&1) ? stride : UINT32_MAX;
+		display13BootPlaneRecord[5]=firmware;
+	}
+	if(firmware==UINT32_MAX)return value;
+	if(reg==0x70188) {
+		if(!__atomic_load_n(&display13BootLinear,__ATOMIC_ACQUIRE))return value;
+		if(value==firmware)return value;
+		if(value*2==firmware) {++display13BootPlaneRecord[1];return firmware;}
+		// Another pitch: the boot screen cannot be read linearly. The plane gets its tiled control back.
+		__atomic_store_n(&display13BootLinear,false,__ATOMIC_RELEASE);
+		write(access,0x70180,display13BootTiledControl);++display13BootPlaneRecord[7];
+		return value;
+	}
+	// A disable or a linear control passes; the next tiled enable converts again.
+	if(!(value&0x80000000U) || ((value>>10)&7)!=4)return value;
+	// The tiled stride may already be pending: the surface write latches both, so it changes now.
+	const auto stride=read(access,0x70188);
+	if(stride*2==firmware) {write(access,0x70188,firmware);++display13BootPlaneRecord[2];}
+	else if(stride!=firmware) {++display13BootPlaneRecord[7];return value;}
+	display13BootTiledControl=value;display13BootPlaneRecord[6]=value;++display13BootPlaneRecord[0];
+	__atomic_store_n(&display13BootLinear,true,__ATOMIC_RELEASE);
+	return value&~(7U<<10);
+}
+// What the framebuffer reads back is what it wrote.
+static uint32_t display13BootPlaneRead(void *access,uint64_t reg,uint32_t value) {
+	if((reg!=0x70180 && reg!=0x70188) || !__atomic_load_n(&display13BootLinear,__ATOMIC_ACQUIRE) || !display13BootPlaneOpen(access))return value;
+	if(reg==0x70180 && value==(display13BootTiledControl&~(7U<<10))) {++display13BootPlaneRecord[3];return display13BootTiledControl;}
+	if(reg==0x70188 && value==display13BootFirmwareStride) {++display13BootPlaneRecord[3];return display13BootFirmwareStride/2;}
+	return value;
+}
+// The watermark latch reads the hardware directly and compares the tiling its plan was made for.
+static uint32_t display13BootPlaneLatchControl(uint32_t value) {
+	return __atomic_load_n(&display13BootLinear,__ATOMIC_ACQUIRE) && value==(display13BootTiledControl&~(7U<<10)) ? display13BootTiledControl : value;
+}
+// The first real frame: the tiled stride goes back before the framebuffer's update latches it with the new surface.
+static void display13BootPlaneFirstFrame(Display13RegisterRead read,Display13RegisterWrite write) {
+	if(!__atomic_exchange_n(&display13BootLinear,false,__ATOMIC_ACQ_REL))return;
+	const auto access=display13FBPower.access;
+	if(access && read && write && read(access,0x70188)==display13BootFirmwareStride) {
+		write(access,0x70188,display13BootFirmwareStride/2);++display13BootPlaneRecord[4];
+	}
+	if(display13BootPlaneCall)thread_call_enter(display13BootPlaneCall);
+}
 void XE::wrapDisplay13PlaneUpdate(void *plane,bool arm) {
 	if(Display13FBMemory::field<uint32_t>(plane,0x98)==0x70180) {
 		const auto fb=Display13FBMemory::field<const void *>(plane,0x68);
 		if(fb && Display13FBMemory::field<uint32_t>(plane,0x120)!=Display13FBMemory::field<uint32_t>(fb,0x4330)) {
 			__atomic_store_n(&display13PanelPlane,plane,__ATOMIC_RELEASE);
+			display13BootPlaneFirstFrame(reinterpret_cast<Display13RegisterRead>(callbackXE->orgDisplay13GMBusRead),
+				reinterpret_cast<Display13RegisterWrite>(callbackXE->orgDisplay13GMBusWrite));
 			// The cache may have read the register while it was off: hwUpdateRegCache, when a path is allocated.
 			if(__atomic_exchange_n(&display13PlaneOff,false,__ATOMIC_ACQ_REL)) {
 				auto &control=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(plane)+0x100);
@@ -7650,6 +7722,8 @@ bool XE::processDisplay13FramebufferTC(KernelPatcher &patcher,size_t index,mach_
             KernelPatcher::RouteRequest route(planeUpdate,wrapDisplay13PlaneUpdate,orgDisplay13PlaneUpdate);
             black=display13PlaneWatchCall && patcher.routeMultipleShort(index,&route,1,address,size);patcher.clearError();
         }
+        if(black && !display13BootPlaneCall)display13BootPlaneCall=thread_call_allocate(display13BootPlanePublish,nullptr);
+        __atomic_store_n(&display13BootPlaneReady,black && display13BootPlaneCall,__ATOMIC_RELEASE);
         IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13HookRoutes",(routed?2U:0U)|(depth?8U:0U)|(depth==2?16U:0U)|(black?32U:0U),32);
         // HDR. On unless -wex-no-hdr-modes and -wex-no-hdr-sgx turn its two parts off, each its own step. WEXHDRReady: 1 the donor's validation, 4 its modeset, 8 the packet and 16 its way back to SDR (-wex-hdr-modes), 2 the sysctl's text (-wex-hdr-sgx).
         uint32_t hdrReady=0;
@@ -8467,6 +8541,7 @@ uint32_t XE::wrapDisplay13GMBusRead(void *access,uint64_t reg) {
     const auto caller=reinterpret_cast<uintptr_t>(__builtin_return_address(0));
     if(comboClockAccess(access))reg=comboClockTransaction.translation.reg(reg,XELPComboClock::donorPC(callbackXE->framebufferClockImage,caller));
     auto value=FunctionCast(wrapDisplay13GMBusRead,callbackXE->orgDisplay13GMBusRead)(access,reg);
+    value=display13BootPlaneRead(access,reg,value);
     const auto start=callbackXE->adlnGMBusFunction;
     adlnObserveGMBus(false,reg,value,caller,start);
     if(reg==0xC5108 && caller>=start && caller-start==0x7E8 && access==display13FBPower.access) {
@@ -8792,6 +8867,8 @@ void XE::wrapDisplay13GMBusWrite(void *access,uint64_t reg,uint32_t value) {
             arbitrationRecorded=trace;break;
         }
     }
+    value=display13BootPlaneWrite(access,reg,value,reinterpret_cast<Display13RegisterRead>(callbackXE->orgDisplay13GMBusRead),
+        reinterpret_cast<Display13RegisterWrite>(callbackXE->orgDisplay13GMBusWrite));
     FunctionCast(wrapDisplay13GMBusWrite,callbackXE->orgDisplay13GMBusWrite)(access,reg,value);
     if(arbitrationRecorded) {
         const auto pipe=static_cast<unsigned>(arbitration[1]);Display13FBDBUFIO io {display.map};
@@ -10561,7 +10638,10 @@ Display13WM::Latch XE::adlnVerifyWMLatch(IOService *fb,uint64_t nativeHz,uint64_
 	struct IO {
 		IOMemoryMap *map;
 		bool readable(uint32_t reg) const {return map && map->getLength()==0x1000000 && map->getVirtualAddress() && !(reg&3) && reg<=0xFFFFFC;}
-		uint32_t read(uint32_t reg) const {return *reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+reg);}
+		uint32_t read(uint32_t reg) const {
+			const auto v=*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+reg);
+			return reg==0x70180 ? display13BootPlaneLatchControl(v) : v;
+		}
 		uint64_t nativeClockHz() {Display13FBClockIO clockIO {map};return Display13Clock::read(clockIO,display13ClockVariant()).nativeHz();}
 		uint64_t nowUs() {uint64_t t=0,ns=0;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&ns);return ns/1000;}
 		void delayUs(unsigned us) {IOSleep(us/1000);}
