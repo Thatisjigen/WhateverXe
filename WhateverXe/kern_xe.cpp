@@ -6295,6 +6295,93 @@ static uint32_t display13GammaEvents[48][5],display13GammaEventCount;
 // getPixelInformation, so that refuses the deeper depth too. WEXDisplay13PanelDepth = {depths hidden or refused, bits of FB0, FB1, FB2}.
 static uint32_t display13EDIDBits[3],display13PanelDepthRecord[4];
 
+// A flight recorder for the panel, read only. From the publication of the BAR mapping it samples, once a millisecond for
+// 60 s, the registers that decide what the panel shows, and keeps a record each time one of them changes: the panel's link,
+// timing, power sequencer and backlight, pipe A with its plane and scaler, the clocks, the data buffer, and what pipe B and
+// the Type-C ports do meanwhile. A hotplug or DP Alt event starts another 30 s, seven times at most. Nothing is written to
+// the hardware. WEXDisplay13Flight0 is the boot window, WEXDisplay13Flight1..7 the events:
+// {version, records, changes lost to a full buffer, period in us, words per record, calendar sec and usec of the first
+// record, its time in the window, window, registers, uptime of the window's start in us, low and high}, the registers'
+// offsets, then the records: {us since the start, power wells, the registers in order}. A register in a domain without
+// power reads as 0. Compare masks keep the frame counter, the scanline and the flipped surface out of the change test, and
+// a register that alone asked for 64 records stops asking, so that one noisy register cannot fill the window.
+// domain: 0 PCH, 1 PW1 (transcoder A, its DDI and link, PSR, clocks, DBUF), 2 pipe A (planes, scalers), 3 pipe B
+struct Display13FlightReg {uint32_t reg;uint8_t domain;uint32_t compare;};
+static constexpr Display13FlightReg display13FlightRegs[] {
+	{0x70008,1,~0U},{0x60400,1,~0U},{0x64000,1,~0U},{0x60540,1,~0U},{0x60544,1,~0U},
+	{0x60000,1,~0U},{0x6000C,1,~0U},{0x60030,1,~0U},{0x60040,1,~0U},{0x60420,1,~0U},
+	{0x70180,2,~0U},{0x70188,2,~0U},{0x7018C,2,~0U},{0x70190,2,~0U},{0x7019C,2,0},{0x701AC,2,0},{0x7027C,2,~0U},
+	{0x6001C,2,~0U},{0x68180,2,~0U},{0x68170,2,~0U},{0x68174,2,~0U},{0x68280,2,~0U},{0x4A480,2,~0U},{0x70030,2,~0U},
+	{0x60800,1,~0U},{0x60840,1,0xE0000000U},{0x60900,1,~0U},{0x70040,2,0},{0x70000,2,0},
+	{0xC7200,0,~0U},{0xC7204,0,~0U},{0xC8250,0,~0U},{0xC8258,0,~0U},
+	{0x46000,1,~0U},{0x46070,1,~0U},{0x164280,1,~0U},{0x46010,1,~0U},{0x46014,1,~0U},{0x46030,1,~0U},
+	{0x4438C,1,~0U},{0x45008,1,~0U},{0x44FE8,1,~0U},{0x44300,1,~0U},{0x44304,1,~0U},
+	{0x71008,3,~0U},{0x61400,3,~0U},{0x71180,3,~0U},{0x7119C,3,0},{0x7127C,3,~0U},
+	{0x64300,1,~0U},{0x64400,1,~0U}
+};
+static constexpr unsigned display13FlightWindowLimit=8,display13FlightRegBudget=64;
+static thread_call_t display13FlightCall;
+static volatile uint8_t *display13FlightBase;
+static uint32_t display13Flight[768][2+arrsize(display13FlightRegs)],display13FlightSeen[2+arrsize(display13FlightRegs)];
+static uint32_t display13FlightHead[12],display13FlightWindows;
+static uint8_t display13FlightAsked[arrsize(display13FlightRegs)];
+static uint64_t display13FlightStart,display13FlightEnd;
+static bool display13FlightRunning;
+static void display13FlightTick(thread_call_param_t,thread_call_param_t) {
+	constexpr unsigned regs=arrsize(display13FlightRegs),words=arrsize(display13FlightSeen),limit=arrsize(display13Flight);
+	const auto base=display13FlightBase;if(!base)return;
+	const auto now=mach_absolute_time();uint64_t ns=0;absolutetime_to_nanoseconds(now-display13FlightStart,&ns);
+	uint32_t r[words];r[0]=static_cast<uint32_t>(ns/1000);
+	auto rd=[&](uint32_t reg) {return *reinterpret_cast<volatile uint32_t *>(base+reg);};
+	const auto wells=r[1]=rd(0x45404);
+	const bool pw1=wells!=UINT32_MAX && (wells&3)==3;
+	const bool on[] {true,pw1,Display13FBIRQ::powered(wells,0),Display13FBIRQ::powered(wells,1)};
+	auto &h=display13FlightHead;
+	bool changed=!h[1] || wells!=display13FlightSeen[1];
+	for(unsigned i=0;i<regs;++i) {
+		const auto &d=display13FlightRegs[i];r[2+i]=on[d.domain] ? rd(d.reg) : 0;
+		if(((r[2+i]^display13FlightSeen[2+i])&d.compare) && display13FlightAsked[i]<display13FlightRegBudget) {
+			changed=true;++display13FlightAsked[i];
+		}
+	}
+	if(!h[1]) {
+		clock_sec_t sec=0;clock_usec_t usec=0;clock_get_calendar_microtime(&sec,&usec);
+		h[5]=static_cast<uint32_t>(sec);h[6]=usec;h[7]=r[0];
+	}
+	if(changed) {
+		memcpy(display13FlightSeen,r,sizeof(r));
+		if(h[1]<limit)memcpy(display13Flight[h[1]++],r,sizeof(r));
+		else ++h[2];
+	}
+	if(now<display13FlightEnd) {
+		uint64_t deadline;clock_interval_to_deadline(1,kMillisecondScale,&deadline);
+		thread_call_enter_delayed(display13FlightCall,deadline);
+		return;
+	}
+	if(auto data=OSData::withCapacity(sizeof(h)+regs*sizeof(uint32_t)+h[1]*sizeof(display13Flight[0]))) {
+		data->appendBytes(h,sizeof(h));
+		for(unsigned i=0;i<regs;++i)data->appendBytes(&display13FlightRegs[i].reg,sizeof(uint32_t));
+		data->appendBytes(display13Flight,h[1]*sizeof(display13Flight[0]));
+		char name[32];snprintf(name,sizeof(name),"WEXDisplay13Flight%u",h[8]);
+		IORegistryEntry::getRegistryRoot()->setProperty(name,data);
+		data->release();
+	}
+	IOLog("WEX flight: window %u, %u records, %u lost\n",h[8],h[1],h[2]);
+	__atomic_store_n(&display13FlightRunning,false,__ATOMIC_RELEASE);
+}
+// Also called with the native IRQ lock held: only flags, the clock and the thread call.
+static void display13FlightBegin(unsigned seconds) {
+	if(!display13FlightCall || !display13FlightBase || __atomic_load_n(&display13FlightWindows,__ATOMIC_ACQUIRE)>=display13FlightWindowLimit)return;
+	if(__atomic_exchange_n(&display13FlightRunning,true,__ATOMIC_ACQ_REL))return;
+	auto &h=display13FlightHead;memset(h,0,sizeof(h));memset(display13FlightAsked,0,sizeof(display13FlightAsked));
+	display13FlightStart=mach_absolute_time();
+	uint64_t interval,ns=0;clock_interval_to_absolutetime_interval(seconds,kSecondScale,&interval);
+	display13FlightEnd=display13FlightStart+interval;absolutetime_to_nanoseconds(display13FlightStart,&ns);
+	h[0]=2;h[3]=1000;h[4]=arrsize(display13FlightSeen);h[8]=__atomic_fetch_add(&display13FlightWindows,1,__ATOMIC_ACQ_REL);
+	h[9]=arrsize(display13FlightRegs);h[10]=static_cast<uint32_t>(ns/1000);h[11]=static_cast<uint32_t>((ns/1000)>>32);
+	thread_call_enter(display13FlightCall);
+}
+
 // Sleep, red, a diagnostic with the trace boot-arg: what the pipes hold through a wake, read only. Times count from the wake's
 // power restore. From the first modeset, 128 samples 100 ms apart, until the next sleep. WEXDisplay13WakeScanout, each sample = {ms, wells,
 // A: PLANE_CTL, SURF, SURFLIVE, STRIDE, frame counter, GAMMA_MODE, GGTT entry of SURF, 0,
@@ -6435,6 +6522,7 @@ void XE::wrapDisplay13FBProcessDE(IOService *controller,uint32_t *pipe,uint32_t 
 	const auto e=Display13FBIRQ::collect(io,c.state);c.status=e.status;
 	*pipe=e.pipe;*aux=e.aux;*hotplug=e.hotplug;
 	if(e.aux)display13TCReleaseArm(); // A DP Alt event: the port may have just lost its sink.
+	if(e.aux || e.hotplug)display13FlightBegin(30);
 	if(e.status==Display13FBIRQ::Status::Complete) {
 		const auto pulse=display13ReplayPulse(io);
 		if(pulse) {*aux|=pulse;display13TCReleaseArm();} // The watch's tick publishes WEXDisplay13TCReplay, in a thread.
@@ -11600,6 +11688,9 @@ void XE::wrapAlderLakeNPowerInit(void *power,void *controller) {
 			pci->mapDeviceMemoryWithRegister(0x10,kIOMapInhibitCache) : nullptr;
 		if(map && map->getLength()==0x1000000 && map->getPhysicalAddress()==physical && map->getVirtualAddress()) {
 			c.controller=controller;c.power=power;c.map=map;
+			// The flight recorder reads through this mapping, which lives until reboot.
+			if(!display13FlightCall)display13FlightCall=thread_call_allocate(display13FlightTick,nullptr);
+			display13FlightBase=reinterpret_cast<volatile uint8_t *>(map->getVirtualAddress());display13FlightBegin(60);
 			c.access=*reinterpret_cast<void **>(static_cast<uint8_t *>(controller)+0xC40);
 			// Reference failures retain mappings/objects for diagnosis until reboot.
 			service->retain();static_cast<OSObject *>(power)->retain();static_cast<OSObject *>(c.access)->retain();
