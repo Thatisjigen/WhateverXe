@@ -6442,7 +6442,9 @@ static void display13ScanoutBegin() {
 // whenever the displays are rearranged. That memory holds an old image, the boot logo or a desktop frame, and clearing it would take the
 // aperture, first suspect of an earlier panic. So the plane stays off in that interval and the pipe shows black. Only the
 // write of the control changes, the cache keeps its enable bit, and the flip programs the control again. Not before the first real frame of
-// this boot, so the boot screen and a panic's text stay visible; if no flip comes within 10 s the watch turns the plane back on.
+// this boot, so the boot screen and a panic's text stay visible. If no flip comes within 30 s the watch turns the plane back on: it only
+// guards against a WindowServer that never flips again, since the plane then shows the base memory, stripes when that is still the
+// firmware's linear boot screen. Rearranging the displays across both GPUs has taken WindowServer more than 13 s.
 // WEXDisplay13PlaneBlack = {writes turned off, flips that put back the cached enable, turned on by the watch, PIPE_BOTTOM_COLOR_A}.
 static void *display13PanelPlane;
 static bool display13PlaneOff;
@@ -6473,7 +6475,7 @@ static uint32_t display13PanelPlaneControl(uint32_t value) {
 	if(!fb || Display13FBMemory::field<uint32_t>(plane,0x120)!=Display13FBMemory::field<uint32_t>(fb,0x4330))return value;
 	__atomic_store_n(&display13PlaneOff,true,__ATOMIC_RELEASE);
 	++display13PlaneRecord[0];
-	uint64_t deadline;clock_interval_to_deadline(10,kSecondScale,&deadline);
+	uint64_t deadline;clock_interval_to_deadline(30,kSecondScale,&deadline);
 	thread_call_enter_delayed(display13PlaneWatchCall,deadline);
 	return value&~0x80000000U;
 }
