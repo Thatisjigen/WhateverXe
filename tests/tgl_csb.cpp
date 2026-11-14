@@ -100,8 +100,12 @@ static void eventTests() {
 	check(2, 2, true, 0, Kind::NewQueueComplete, 0, 1);
 	check(2, 2, false, 0, Kind::ElementComplete, 0, 1);
 	check(2, 2, true, 0, Kind::NewQueueComplete, 63, 0);
-	// Captured r82 event3: keep an explicit invalid classification. No bypass.
-	assert(classify(0x0001000000010000ULL).kind == Kind::Invalid);
+	// Captured r82 event3 / 9720 r113 (ID6->ID6): no new queue, detail0. Distinct
+	// kind whose handler requires exec-list proof; never a plain ElementSwitch.
+	assert(classify(0x0001000000010000ULL).kind == Kind::ElementSameContext);
+	assert(handlerFor(classify(0x0003000000030000ULL)) == Handler::SameContextElementSwitch);
+	for (unsigned detail = 1; detail <= 15; ++detail)
+		check(6, 6, false, detail, Kind::Invalid);
 	for (unsigned detail = 6; detail <= 15; ++detail) {
 		check(1, 2, false, detail, Kind::Invalid);
 		check(1, idle, true, detail, Kind::Invalid);
@@ -137,28 +141,37 @@ int main(int argc, char **argv) {
 	}
 	assert(handlerFor(classify(0x0000800503FF8000ULL)) == Handler::IncompleteToIdle);
 	assert(handlerFor(classify(0x03FF800003FF8001ULL)) == Handler::IdlePreempt);
-	assert(handlerFor(classify(0x0001000000010000ULL)) == Handler::Invalid);
+	assert(handlerFor(classify(0x0001000000010000ULL)) == Handler::SameContextElementSwitch);
 	for (unsigned detail = 1; detail <= 4; ++detail) {
 		assert(handlerFor(classify((static_cast<uint64_t>(0x8000 | detail) << 32) | 0x10000))
 			== Handler::IncompleteElementSwitch);
 	}
 	// Feed the historical sequence through intake and classification together.
-	// Event3's unexplained same-submission transition must not be skipped or
-	// promoted into a made-up lite restore; event4 remains undispatched.
-	{
+	// Event3 (ID2 -> ID2, no new queue) is element 0 -> element 1 of one context.
+	// It is never skipped or turned into lite restore: without exec-list proof
+	// the caller rejects it and event4 stays undispatched; with proof (both ELSP
+	// elements hold ID2) it is an element switch and the sequence drains.
+	for (const bool proven : {false, true}) {
 		State state; IO io; fresh(state, io); io.tail = 4;
 		const uint64_t sequence[] {0x03FF800000008001ULL, 0x0000800003FF8000ULL,
 			0x03FF800000010001ULL, 0x0001000000010000ULL, 0x0001000003FF8000ULL};
 		for (unsigned i = 0; i < 5; ++i) io.slots[i] = sequence[i];
 		unsigned accepted = 0, rejected = 0;
 		auto accept = [&](const Sample &sample) {
-			if (classify(sample.raw).kind == Kind::Invalid) { ++rejected; return false; }
+			const auto kind = classify(sample.raw).kind;
+			if (kind == Kind::Invalid || (kind == Kind::ElementSameContext && !proven))
+				{ ++rejected; return false; }
 			++accepted; return true;
 		};
-		assert(drain(state, io, accept) == Error::Rejected);
-		assert(accepted == 3 && rejected == 1 && state.head == 3);
-		assert(io.slots[4] == sequence[4]);
-		assert(drain(state, io, accept) == Error::Rejected && rejected == 1);
+		if (!proven) {
+			assert(drain(state, io, accept) == Error::Rejected);
+			assert(accepted == 3 && rejected == 1 && state.head == 3);
+			assert(io.slots[4] == sequence[4]);
+			assert(drain(state, io, accept) == Error::Rejected && rejected == 1);
+		} else {
+			assert(drain(state, io, accept) == Error::None);
+			assert(accepted == 5 && rejected == 0 && state.head == 4);
+		}
 	}
 	// Independent expected modular order for every valid head/tail combination.
 	for (unsigned head = 0; head < 12; ++head) {

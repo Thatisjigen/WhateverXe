@@ -33,7 +33,7 @@ struct Identity {
 enum class Kind : uint8_t {
 	Invalid, IdleToActive, PreemptToIdle, IdlePreempt,
 	NewQueueComplete, NewQueueWait, NewQueuePreempt, LiteRestore,
-	ElementComplete, ElementWait,
+	ElementComplete, ElementWait, ElementSameContext,
 	ActiveToIdleComplete, ActiveToIdleWait, ActiveToIdlePreempt
 };
 
@@ -81,6 +81,13 @@ inline Event classify(uint64_t raw) {
 		} else if (!(event.away == event.to)) {
 			if (!event.detail) event.kind = Kind::ElementComplete;
 			else if (event.detail <= 4) event.kind = Kind::ElementWait;
+		} else if (!event.detail) {
+			// Element 0 completed and element 1 carries the SAME context identity
+			// (the donor submits one context in both ELSP ports and never varies
+			// the counter). Not lite restore: no new-queue bit. Never dispatched
+			// from the raw event alone; the caller must prove both exec-list
+			// elements hold this context (9720 r113 panic at 2.76M events).
+			event.kind = Kind::ElementSameContext;
 		}
 	}
 	return event;
@@ -114,7 +121,8 @@ inline LegacyEntry legacyEntry(const Event &event) {
 
 enum class Handler : uint8_t {
 	Invalid, IdleToActive, NewQueue, ElementSwitch, ActiveToIdle,
-	IdlePreempt, IncompleteToIdle, IncompleteElementSwitch
+	IdlePreempt, IncompleteToIdle, IncompleteElementSwitch,
+	SameContextElementSwitch
 };
 
 // The native handlers retain detail4 in their dependency wait queue and skip
@@ -132,6 +140,7 @@ inline Handler handlerFor(const Event &event) {
 		case Kind::NewQueueComplete: case Kind::NewQueueWait:
 		case Kind::NewQueuePreempt: case Kind::LiteRestore: return Handler::NewQueue;
 		case Kind::ElementComplete: return Handler::ElementSwitch;
+		case Kind::ElementSameContext: return Handler::SameContextElementSwitch;
 		case Kind::ElementWait: return nativeSemaphoreWait(event)
 			? Handler::ElementSwitch : Handler::IncompleteElementSwitch;
 		case Kind::ActiveToIdleComplete: return Handler::ActiveToIdle;

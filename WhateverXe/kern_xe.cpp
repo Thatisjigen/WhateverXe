@@ -17753,7 +17753,7 @@ struct TGLCSBEngine {
  void *streamer {};
  TGLCSB::State state;
  bool hardwareReady {false};
- uint64_t consumed {}, retries {}, fallback {}, resets {}, lastRaw {}, lastRecoverNs {};
+ uint64_t consumed {}, retries {}, fallback {}, resets {}, lastRaw {}, lastRecoverNs {}, sameContext {};
  // Stale-slot recoveries: an entry that landed late, a sequence the hardware restarted at slot 0, a re-arm.
  uint64_t late {}, resyncs {}, rearms {};
  uint32_t modeAtInit {UINT32_MAX};
@@ -18036,6 +18036,23 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
    case TGLCSB::Handler::NewQueue: handler=1;break;
    case TGLCSB::Handler::ElementSwitch: handler=2;break;
    case TGLCSB::Handler::ActiveToIdle: handler=3;break;
+   case TGLCSB::Handler::SameContextElementSwitch: {
+    // Dispatch only when the live exec list proves the event: element 0 is the
+    // away context (the donor validator's own check) and element 1 exists and
+    // is the same context. Anything else keeps the r82 fatal decision.
+    const auto active=*reinterpret_cast<uint32_t *>(io.streamer+0x50);
+    if (active>1) return false;
+    auto contextId=[&](unsigned slot)->uint32_t {
+     auto item=*reinterpret_cast<uint8_t **>(io.streamer+0x30+active*16+slot*8);
+     auto context=item ? *reinterpret_cast<uint8_t **>(item) : nullptr;
+     return context ? *reinterpret_cast<uint32_t *>(context+0x7C) : UINT32_MAX;
+    };
+    if (contextId(0)!=event.away.id || contextId(1)!=event.to.id) return false;
+    if (++engine.sameContext<=8)
+     IOLog("WhateverXe: CSB12 e=%u same-context element switch id=%u raw=%llx (#%llu)\n",
+      io.engine,event.away.id,sample.raw,engine.sameContext);
+    handler=2;break;
+   }
    default: return false;
   }
   // Original validators still run inside handlers. No manufactured legacy
