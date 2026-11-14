@@ -173,5 +173,6 @@
   "-wex-nv-video": [],
   "-wex-no-gpu-panic": [],
   "-wex-no-objpreempt": [],
-  "-wex-no-display-sleep-irq": []
+  "-wex-no-display-sleep-irq": [],
+  "-wex-tgl-s0-csb-resync": []
 }
