@@ -13914,8 +13914,14 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			// Write20EC with mask bits1:0 (bit1 on, bit0 off), then restore EDX
 			// to r135's10000 before it also feeds2580. Do not alter compute mode.
 			// The replaced MMIO read was overwritten by the following MOV immediate.
+			// Outside Tiger Lake the same write sets bit0, the global object-level preemption enable that
+			// r144 selects: r135's erratum is Tiger Lake B0, and without object preemption a long draw keeps
+			// every other context waiting (14-18 ms at worst on Raptor Lake-P, 6-10 ms with it, measured by
+			// kitsuneislife). -wex-no-objpreempt keeps r135's state.
+			const bool objectPreemptOn=xeProfile.family!=XELP::Family::Unknown && xeProfile.family!=XELP::Family::TigerLake &&
+				!checkKernelArgument("-wex-no-objpreempt");
 			const uint8_t ffDopFind[] {0x8B,0x90,0xEC,0x20,0,0,0xBA,0,0,1,0,0x89,0x90,0xEC,0x20,0,0};
-			const uint8_t ffDopReplace[] {0xBA,2,0,3,0,0x89,0x90,0xEC,0x20,0,0,0xBA,0,0,1,0,0x90};
+			const uint8_t ffDopReplace[] {0xBA,uint8_t(objectPreemptOn?3:2),0,3,0,0x89,0x90,0xEC,0x20,0,0,0xBA,0,0,1,0,0x90};
 			auto ffDopSite=reinterpret_cast<uint8_t *>(address+0x25166);
 			bool ffDopOK=selectorOK && !memcmp(ffDopSite,ffDopFind,sizeof(ffDopFind));
 			patcher.clearError();
@@ -13942,6 +13948,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLFFDOPClockDisableReady",ffDopOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionGlobalReady",selectorOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionDisabledReady",objectPreemptOK);
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionEnabled",objectPreemptOn && ffDopOK);
 			patcher.clearError();
 			// r116: GT2 with 80 EU has ten enabled subslices, but the donor
 			// recognizes only twelve and leaves hwInfo+0x54 (URB banks) zero.
