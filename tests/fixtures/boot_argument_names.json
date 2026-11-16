@@ -172,5 +172,6 @@
   "-wex-no-nv-webkit": [],
   "-wex-nv-video": [],
   "-wex-no-gpu-panic": [],
-  "-wex-no-objpreempt": []
+  "-wex-no-objpreempt": [],
+  "-wex-no-display-sleep-irq": []
 }

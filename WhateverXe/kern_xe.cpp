@@ -6101,6 +6101,10 @@ bool XE::processDisplay13FramebufferWMBackend(KernelPatcher &patcher,size_t inde
 	patcher.clearError();return ready;
 }
 
+// On by default, -wex-no-display-sleep-irq turns off the idle-timer guard below. The guard removes the donor's
+// own late re-enable of the display interrupt master; the re-arm at the first lit pipe after a display sleep or
+// a power loss (wrapDisplay13FBEnableIRQ, wrapDisplay13FBConfigureVBL) replaces it and is not switched.
+static bool display13SleepIRQ=true;
 bool XE::processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
 	// Exact donor entry/layout plus its unchanged native event consumers.
 	static const char *symbols[] {
@@ -6182,7 +6186,9 @@ bool XE::processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach
 	// the GT master re-fires forever: CPU 0 livelock, then lock-timeout or NVMe-timeout panics a few
 	// seconds after display wake (Precision 5570). Skip that recovery branch (js -> jmp). Exact
 	// donor bytes only; a mismatch leaves it alone and is visible as WEXIdleTimerGuard = false.
-	if(swRouted) {
+	display13SleepIRQ=!checkKernelArgument("-wex-no-display-sleep-irq");
+	IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplaySleepIRQ",display13SleepIRQ);
+	if(swRouted && display13SleepIRQ) {
 		const char *idleSymbol="__ZN31AppleIntelFramebufferController14IdleTimerFiredEv";
 		const auto idle=patcher.solveSymbol<mach_vm_address_t>(index,idleSymbol,address,size);patcher.clearError();
 		const uint8_t idleBefore[] {0x85,0xDB,0x78,0x5C},idleAfter[] {0x85,0xDB,0xEB,0x5C};
