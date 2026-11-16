@@ -361,12 +361,83 @@ bool tglRecoveryNotifySerialize(void *,void *,OSSerialize *serializer) {
 	const bool ok=out->serialize(serializer);out->release();return ok;
 }
 }
+namespace {
+bool tglVMRead(uint64_t address,uint64_t &value); // defined with tglVM
+// The same channel recovered again within 30 s means its replayed work hung again: with the notification the
+// streamer recovers after every reset, and the guilty stamp is replayed and hangs each time until WindowServer
+// misses its watchdog. Like i915's request skip, replace every MI_BATCH_BUFFER_START (opcode 0x31, 3 dwords, any
+// flags) in that channel's ring with MI_NOOPs before the reset: the replay then retires the stamps without running
+// the batches. Stamp and flush commands stay. On by default; -wex-no-reset-skip turns it off.
+// WEXRecoverySkip: q[0] schema, [1] skips, [2] dwords NOOPed, [3] last index, [4] last skipped index, [5] last ring
+// length, [6] last status (0 ok, 1 bad ring, 2 bad length), then the dump: non-zero dwords, dwords with opcode 0x31,
+// offset of the first non-zero dword, 64 dwords from there (before the NOOP pass), the ring's CPU address low bits.
+bool tglRecoverySkipOn {};
+uint64_t tglResetSkip[8] {1};
+uint32_t tglResetSkipDump[68] {};
+uint32_t tglResetLastIndex=UINT32_MAX;
+uint64_t tglResetLastTime {};
+bool tglResetSkipSerialize(void *,void *,OSSerialize *serializer) {
+	uint8_t both[sizeof(tglResetSkip)+sizeof(tglResetSkipDump)];
+	memcpy(both,tglResetSkip,sizeof(tglResetSkip));memcpy(both+sizeof(tglResetSkip),tglResetSkipDump,sizeof(tglResetSkipDump));
+	auto out=OSData::withBytes(both,sizeof(both));if (!out) return false;
+	const bool ok=out->serialize(serializer);out->release();return ok;
+}
+void tglResetSkipGuilty(void *channel,uint32_t index) {
+	uint64_t ring=0,buffer=0,cpu=0,length=0;
+	tglResetSkip[4]=index;
+	if (!tglVMRead(reinterpret_cast<uint64_t>(channel)+0x130,ring) || !tglKernelPointer(reinterpret_cast<void *>(ring)) ||
+	    !tglVMRead(ring+0x80,buffer) || !tglKernelPointer(reinterpret_cast<void *>(buffer)) ||
+	    !tglVMRead(buffer+0x38,cpu) || !tglKernelPointer(reinterpret_cast<void *>(cpu)) || (cpu&4095) ||
+	    !tglVMRead(ring+0x88,length)) {tglResetSkip[6]=1;return;}
+	length>>=32; // ring+0x8C
+	tglResetSkip[5]=length;
+	if (length<4096 || length>32768 || (length&(length-1))) {tglResetSkip[6]=2;return;}
+	auto dw=reinterpret_cast<volatile uint32_t *>(cpu);
+	{
+		uint32_t nonzero=0,opcode=0,first=UINT32_MAX;
+		for (uint32_t i=0;i<length/4;++i) {
+			const auto d=dw[i];
+			if (d) {++nonzero;if (first==UINT32_MAX) first=i;}
+			if ((d>>23)==0x31) ++opcode;
+		}
+		tglResetSkipDump[0]=nonzero;tglResetSkipDump[1]=opcode;tglResetSkipDump[2]=first==UINT32_MAX?0:first*4;
+		for (uint32_t j=0;j<64;++j) tglResetSkipDump[3+j]=first!=UINT32_MAX && first+j<length/4 ? dw[first+j] : 0;
+		tglResetSkipDump[67]=static_cast<uint32_t>(cpu);
+	}
+	uint64_t noops=0;
+	for (uint32_t i=0;i+2<length/4;++i) {
+		// MI_BATCH_BUFFER_START, 3 dwords, any address-space/second-level flags.
+		if ((dw[i]>>23)==0x31 && (dw[i]&0xFF)==1) {
+			dw[i]=0;dw[i+1]=0;dw[i+2]=0;noops+=3;i+=2;
+		}
+	}
+	__asm__ volatile("mfence" ::: "memory");
+	for (uint32_t off=0;off<length;off+=64) __asm__ volatile("clflush (%0)" :: "r"(cpu+off) : "memory");
+	__asm__ volatile("mfence" ::: "memory");
+	tglResetSkip[1]++;tglResetSkip[2]+=noops;tglResetSkip[6]=0;
+}
+void tglRecoverySkip(void *channel) {
+	if (!tglRecoverySkipOn) return;
+	auto ring=TGLRecovery::field<uint8_t *>(channel,0x130);
+	auto context=tglKernelPointer(ring) ? TGLRecovery::field<uint8_t *>(ring,0x20) : nullptr;
+	auto affected=tglKernelPointer(context) ? TGLRecovery::field<uint8_t *>(context,0xB8) : nullptr;
+	if (!tglKernelPointer(affected)) return;
+	const auto index=TGLRecovery::field<uint32_t>(affected,0x20);
+	uint64_t now=0,ns=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&ns);
+	if (index==tglResetLastIndex && ns-tglResetLastTime<30000000000ULL) {
+		tglResetSkipGuilty(channel,index);
+		gpuResetTrace(20,channel,index,tglResetSkip[6]|(tglResetSkip[2]<<8));
+	}
+	tglResetLastIndex=index;tglResetLastTime=ns;tglResetSkip[3]=index;
+}
+}
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
 	gpuResetTrace(1,channel,n,0);
 	gpuWatchNoteReset();
 	__atomic_store_n(&gpuResetInRecovery,true,__ATOMIC_RELEASE);
+	tglRecoverySkip(channel);
 	const auto result=TGLRecovery::resetAndResume(channel,tglRecoveryStamp);
 	tglRecoveryNotify(channel,result.affected);
 	__atomic_store_n(&gpuResetInRecovery,false,__ATOMIC_RELEASE);
@@ -14211,6 +14282,12 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 					IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryNotifyReady",tglRecoveryNotifyOn);
 					if (tglRecoveryNotifyOn) if (auto live=OSSerializer::forTarget(nullptr,tglRecoveryNotifySerialize)) {
 						IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryNotify",live);live->release();
+					}
+					// The guilty-batch skip (tglRecoverySkip) reads the ring through the nofault reader.
+					tglRecoverySkipOn=tglVM.nofault && !checkKernelArgument("-wex-no-reset-skip");
+					IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoverySkipReady",tglRecoverySkipOn);
+					if (tglRecoverySkipOn) if (auto live=OSSerializer::forTarget(nullptr,tglResetSkipSerialize)) {
+						IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoverySkip",live);live->release();
 					}
 				}
 			}
