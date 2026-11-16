@@ -7,7 +7,7 @@
 namespace {
 alignas(16) uint8_t channel[0x180],affected[0x180],ring[0x100],context[0xD0];
 alignas(16) uint8_t owner[0x1300],otherOwner[0x1300],scheduler[0x200],otherScheduler[0x200];
-alignas(16) uint8_t events[0x10],otherEvents[0x10],ringVT[0x200],schedulerVT[0x200],eventsVT[0x200];
+alignas(16) uint8_t events[0x300],otherEvents[0x10],ringVT[0x200],schedulerVT[0x200],eventsVT[0x200];
 uint32_t tglRecoveryCalls {},tglRecoveryReturns {};
 uint64_t tglRecoveryRecords[16][16] {},ticks {};
 unsigned resets,resumes,stage;bool nativeOK,replaceScheduler,replaceOwner,timeout,expectStamp;
@@ -16,6 +16,8 @@ uint32_t initialFailures;
 // wrapper calls it and with what.
 struct {unsigned traces,dumps,watched,skips,notifies;uint64_t traced;} hooks;
 bool gpuResetInRecovery;
+// Stamp state the completion step reads from the event machine: word 17 stands at 5, 9 is the last value handed out.
+volatile uint32_t stampWord,*stampTable[18];
 using TGLRecovery::field;
 
 bool reset(void *r,void *c) {
@@ -30,6 +32,7 @@ bool reset(void *r,void *c) {
 void resume(void *s) {
     assert(s==(replaceScheduler ? otherScheduler : scheduler) && stage++==1);++resumes;
     assert(field<uint32_t>(affected,0x17C)==initialFailures+unsigned(!nativeOK && field<void *>(context,0xB8)));
+    assert(stampWord==(field<void *>(context,0xB8) ? 9U : 5U)); // Outstanding work is completed before the resume.
     if (replaceOwner) field<void *>(channel,0x18)=otherOwner;
 }
 void increment(void *e,int index) {
@@ -75,6 +78,8 @@ int main() {
         field<void *>(owner,0x1250)=scheduler;field<void *>(owner,0x380)=events;field<void *>(otherOwner,0x380)=otherEvents;
         field<void *>(scheduler,0)=schedulerVT;field<void *>(otherScheduler,0)=schedulerVT;
         field<void *>(events,0)=eventsVT;field<void *>(otherEvents,0)=eventsVT;
+        stampWord=5;stampTable[17]=&stampWord;field<volatile uint32_t **>(events,0x28)=stampTable;
+        field<int32_t>(events,0x30)=18;field<uint32_t>(events,0xFC+24*17)=9;
         field<decltype(&reset)>(ringVT,0x168)=reset;field<decltype(&resume)>(schedulerVT,0x180)=resume;
         field<decltype(&increment)>(eventsVT,0x1D8)=increment;
         field<uint32_t>(affected,0x20)=17;field<uint32_t>(affected,0x17C)=initial;
@@ -97,6 +102,7 @@ int main() {
         assert(q[13]==(expectStamp ? 0x12345U : 0U) && q[14]==(expectStamp ? 0x12345U-unsigned(expired) : 0U));
         assert(field<uint32_t>(affected,0x17C)==failed && field<uint32_t>(channel,0x17C)==0);
         assert(field<uint32_t>(affected,0x178)==(expectStamp ? 0x12345U : 0xABCDEFU));
+        assert(stampWord==(present ? 9U : 5U));
     }
     puts("BCS single-pass recovery: native ordering, bounded wait, failure accounting and real wrapper records");
 }
