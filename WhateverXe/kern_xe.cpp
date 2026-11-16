@@ -17414,24 +17414,41 @@ bool tglMarkFirstPendingFence(uint8_t *fences,const void *commandQueue,uint32_t 
  }
  return false;
 }
-void tglFailChannel(uint8_t *owner,uint8_t *channel,unsigned engine) {
- if (!tglFenceGuilty || !tglCommandQueueMeta || !owner || !channel) return;
+// WEXResetErrorReport: {1, calls, queues marked, marked before the native reset, no submission slot,
+// no submitter in the slot, submitter not a command queue, no fence machine or lock, retries after the reset}.
+uint32_t tglFailReport[9] {1};
+bool tglFailReportSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[arrsize(tglFailReport)];
+ for (unsigned i=0;i<arrsize(out);++i) out[i]=__atomic_load_n(&tglFailReport[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// Returns whether a fence was marked. The channel leads to the client's queue through its oldest pending
+// submission slot (+0x78), whose first field is the submitter, as in IOAccelFIFOChannel2::restart.
+bool tglFailChannel(uint8_t *owner,uint8_t *channel,unsigned engine,bool beforeReset) {
+ if (!tglFenceGuilty || !tglCommandQueueMeta || !owner || !channel) return false;
+ __atomic_fetch_add(&tglFailReport[1],1,__ATOMIC_RELAXED);
+ if (!beforeReset) __atomic_fetch_add(&tglFailReport[8],1,__ATOMIC_RELAXED);
  auto queue=*reinterpret_cast<uint8_t **>(channel+0x78);
  auto submitter=queue ? *reinterpret_cast<OSMetaClassBase **>(queue) : nullptr;
  auto commandQueue=submitter ? OSMetaClassBase::safeMetaCast(submitter,tglCommandQueueMeta) : nullptr;
  auto fences=*reinterpret_cast<uint8_t **>(owner+0x390);
- if (!commandQueue || !fences) return;
+ auto lock=fences ? *reinterpret_cast<IOLock **>(fences+0x28) : nullptr;
+ const unsigned reason=!queue ? 4 : !submitter ? 5 : !commandQueue ? 6 : !lock ? 7 : 0;
+ if (reason) {__atomic_fetch_add(&tglFailReport[reason],1,__ATOMIC_RELAXED);return false;}
  // guiltyForHardwareReset takes the fence machine lock: never wait for it here.
- auto lock=*reinterpret_cast<IOLock **>(fences+0x28);
- if (!lock) return;
  if (!IOLockTryLock(lock)) {
   ++tglFenceLockBusy;
-  if (tglMarkFirstPendingFence(fences,commandQueue,2)) {++tglFenceDirect;if (engine<arrsize(tglFailedQueues)) ++tglFailedQueues[engine];}
-  return;
+  if (!tglMarkFirstPendingFence(fences,commandQueue,2)) return false;
+  ++tglFenceDirect;
+ } else {
+  IOLockUnlock(lock);
+  reinterpret_cast<void (*)(void *,const void *,uint32_t)>(tglFenceGuilty)(fences,commandQueue,2);
  }
- IOLockUnlock(lock);
- reinterpret_cast<void (*)(void *,const void *,uint32_t)>(tglFenceGuilty)(fences,commandQueue,2);
  if (engine<arrsize(tglFailedQueues)) ++tglFailedQueues[engine];
+ __atomic_fetch_add(&tglFailReport[2],1,__ATOMIC_RELAXED);
+ if (beforeReset) __atomic_fetch_add(&tglFailReport[3],1,__ATOMIC_RELAXED);
+ return true;
 }
 mach_vm_address_t tglInitModeRegisters {},tglInitHWSRegisters {};
 uint32_t tglEngineBase(const TGLCSBIO &io) {return io.modeReg>=0x29C ? io.modeReg-0x29C : 0;}
@@ -17572,6 +17589,9 @@ void wexResolveAccelFence(KernelPatcher &patcher,size_t index,mach_vm_address_t 
  patcher.clearError();
  if (guilty && meta) {tglCommandQueueMeta=reinterpret_cast<const OSMetaClass *>(meta);tglFenceGuilty=guilty;}
  IORegistryEntry::getRegistryRoot()->setProperty("TGLResetErrorReportReady",guilty && meta);
+ if (guilty && meta) if (auto live=OSSerializer::forTarget(nullptr,tglFailReportSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXResetErrorReport",live);live->release();
+ }
 }
 
 bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
@@ -17809,13 +17829,17 @@ void XE::wrapTGLCSBReset(void *streamer) {
   auto channel=context ? *reinterpret_cast<uint8_t **>(context+0xB8) : nullptr;
   if (channel) {killedStamp=*reinterpret_cast<int32_t *>(channel+0x20);killedChannel=channel;}
  }
+ // Mark the killed work failed while the channel still leads to the client's queue: once the
+ // native reset has processed the element, it may not (observed: with one command buffer in
+ // flight, nothing was marked afterwards and Metal reported the killed work as completed).
+ const bool markedEarly=killedStamp>=0 && owner && tglFailChannel(owner,killedChannel,self,true);
  FunctionCast(wrapTGLCSBReset,callbackXE->orgTGLCSBReset)(streamer);
  gpuResetTrace(10,streamer,0,0);
  // Its outstanding events can no longer complete on the GPU: complete them to the
  // last issued value (event machine = accelerator+0x380), as for the attributed
  // channel in TGLRecovery::resetAndResume. Never beyond the last issued value.
  if (killedStamp>=0 && owner) {
-  tglFailChannel(owner,killedChannel,self); // error first: it marks only fences not yet complete
+  if (!markedEarly) tglFailChannel(owner,killedChannel,self,false); // error first: it marks only fences not yet complete
   const auto c=TGLRecovery::completeStamp(*reinterpret_cast<void **>(owner+0x380),static_cast<uint32_t>(killedStamp));
   if (c.forced && self<arrsize(tglStampCompletions)) ++tglStampCompletions[self];
  }
