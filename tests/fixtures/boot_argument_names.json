@@ -156,6 +156,7 @@
   "-wex-no-reset-recover": [
     "-wex-reset-recover"
   ],
+  "-wex-no-ccs-restore": [],
   "-wex-no-hdr-modes": [
     "-wex-hdr-modes"
   ],
