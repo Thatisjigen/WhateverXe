@@ -13448,6 +13448,11 @@ static bool gpuResetDefaultsSerialize(void *,void *,OSSerialize *serializer) {
 // Set while a ring other than the RCS is reset in the render GDRST domain: that reset clears the RCS too.
 static bool gpuResetRenderShared;
 namespace { uint32_t tglCSBResetSharedDomain(unsigned which); }
+// Render-domain engines whose status page the GDRST cleared, one bit per CSB engine, noted in gpuResetScheduler
+// before the restores below write the status pages back. wrapTGLCSBReset recognizes a sibling the reset cleared by its
+// status page, which these restores have already put back by the time it runs, so it reads the note instead.
+static uint32_t gpuResetWipedEngines;
+namespace { uint32_t tglCSBWipedRenderEngines(); }
 // The donor's second render ring (the compute command streamer at 0x1A000) shares the render GDRST domain (mask 2)
 // with the RCS, as in Linux. Its own restore list (_ccsResetRegisters) names four registers: status page, INSTPM,
 // MI_MODE and GFX_MODE. A reset of the RCS clears them too and restores only the RCS list, so the CCS comes back with
@@ -13572,7 +13577,11 @@ static uint64_t gpuResetEngine(void *ring,void *context) {
  gpuResetTrace(4,context,arg,r&0xFF);return r;
 }
 static uint64_t gpuResetScheduler(void *scheduler,uint32_t type,void *context) {
- gpuResetTrace(5,context,type,0);
+ // Event 5: the result is the mask of render-domain engines the GDRST cleared, noted before any restore.
+ const uint32_t wiped=__atomic_load_n(&gpuResetRenderDomain,__ATOMIC_ACQUIRE) &&
+  __atomic_load_n(&gpuResetInRecovery,__ATOMIC_ACQUIRE) ? tglCSBWipedRenderEngines() : 0;
+ __atomic_store_n(&gpuResetWipedEngines,wiped,__ATOMIC_RELEASE);
+ gpuResetTrace(5,context,type,wiped);
  if(__atomic_load_n(&gpuResetRestoreOn,__ATOMIC_ACQUIRE))
   gpuResetTrace(11,context,type,gpuResetRestoreRCS(scheduler));
  // Event 17: the CCS state a render-domain GDRST cleared, written back before the replay (gpuResetRestoreCCS).
@@ -13590,6 +13599,7 @@ static uint64_t gpuResetScheduler(void *scheduler,uint32_t type,void *context) {
     __atomic_load_n(&gpuResetInRecovery,__ATOMIC_ACQUIRE))
   gpuResetTrace(18,context,type,tglCSBResetSharedDomain(1));
  auto r=FunctionCast(gpuResetScheduler,gpuResetOrgScheduler)(scheduler,type,context);
+ __atomic_store_n(&gpuResetWipedEngines,0U,__ATOMIC_RELEASE);
  gpuResetTrace(6,context,type,r);return r;
 }
 static uint64_t gpuResetResume(void *scheduler) {
@@ -18190,6 +18200,22 @@ uint32_t tglCSBResetSharedDomain(unsigned which) {
  return unread;
 }
 
+// Render-domain engines (RCS and CCS) whose status page no longer holds the value recorded before the first
+// submission, one bit per engine: the GDRST has just cleared them. Read before any register restore.
+uint32_t tglCSBWipedRenderEngines() {
+ uint32_t mask=0;
+ if (!tglCSB12Enabled) return mask;
+ for (unsigned i=0;i<arrsize(tglCSBEngines) && i<arrsize(tglHWSPGA);++i) {
+  auto &e=tglCSBEngines[i];
+  if (!e.streamer || !e.hardwareReady || !tglHWSPGA[i]) continue;
+  TGLCSBIO io(e.streamer,0);const auto base=tglEngineBase(io);
+  if (base!=0x2000 && base!=0x1A000) continue;
+  io.acquire();
+  if (*reinterpret_cast<volatile uint32_t *>(io.bar+base+0x80)!=tglHWSPGA[i]) mask|=1U<<i;
+ }
+ return mask;
+}
+
 // TGLCSB12Recovery = per engine {entries that landed late, sequences restarted at slot 0, re-arms};
 // TGLCSB12LastRecovery = the intake state at the last stale-slot recovery, as the fatal path would report it.
 char tglCSBLastRecovery[640];
@@ -18460,14 +18486,18 @@ void XE::wrapTGLCSBReset(void *streamer) {
  auto renderDomain=[](uint32_t base){return base==0x2000 || base==0x1A000;};
  const bool domain=renderDomain(selfBase);
  // Find siblings this reset wiped BEFORE anything is restored (their HWS_PGA is
- // gone); they need their own CSB reset and resubmission afterwards.
+ // gone); they need their own CSB reset and resubmission afterwards. The render and
+ // compute register restores of IGScheduler5::processGPUReset (gpuResetScheduler)
+ // run before this and put a sibling's HWS_PGA back, so the mask it noted right
+ // after the GDRST counts too; it is consumed here, so the sibling calls below see 0.
+ const uint32_t noted=__atomic_exchange_n(&gpuResetWipedEngines,0U,__ATOMIC_ACQ_REL);
  bool wiped[arrsize(tglCSBEngines)] {};
  if (domain) for (unsigned i=0;i<arrsize(tglCSBEngines) && i<arrsize(tglHWSPGA);++i) {
   auto &e=tglCSBEngines[i];
   if (i==self || !e.streamer || !e.hardwareReady || !tglHWSPGA[i]) continue;
   TGLCSBIO io(e.streamer,0);const auto base=tglEngineBase(io);
   if (!renderDomain(base)) continue;
-  io.acquire();wiped[i]=*reinterpret_cast<volatile uint32_t *>(io.bar+base+0x80)!=tglHWSPGA[i];
+  io.acquire();wiped[i]=*reinterpret_cast<volatile uint32_t *>(io.bar+base+0x80)!=tglHWSPGA[i] || ((noted>>i)&1);
  }
  if (domain && owner && tglInitModeRegisters && tglInitHWSRegisters) {
   TGLCSBIO io(streamer,0);io.acquire();
