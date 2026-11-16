@@ -329,12 +329,16 @@ bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 static void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_t result);
 static void gpuResetDumpAfter(void *channel);
 static void gpuWatchNoteReset();
+// Set while IOAccel's restart runs through this wrapper, the only path that resets the GPU after boot.
+static bool gpuResetInRecovery;
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
 	gpuResetTrace(1,channel,n,0);
 	gpuWatchNoteReset();
+	__atomic_store_n(&gpuResetInRecovery,true,__ATOMIC_RELEASE);
 	const auto result=TGLRecovery::resetAndResume(channel,tglRecoveryStamp);
+	__atomic_store_n(&gpuResetInRecovery,false,__ATOMIC_RELEASE);
 	gpuResetTrace(2,channel,n,result.resetOK|(uint64_t(result.failuresAfter)<<8));
 	gpuResetDumpAfter(channel);
 	uint64_t after {};clock_get_uptime(&after);
@@ -12872,6 +12876,98 @@ static bool gpuResetDefaultsSerialize(void *,void *,OSSerialize *serializer) {
  auto out=OSData::withBytes(data,sizeof(data));if(!out)return false;
  const bool result=out->serialize(serializer);out->release();return result;
 }
+// Set while a ring other than the RCS is reset in the render GDRST domain: that reset clears the RCS too.
+static bool gpuResetRenderShared;
+namespace { uint32_t tglCSBResetSharedDomain(unsigned which); }
+// The donor's second render ring (the compute command streamer at 0x1A000) shares the render GDRST domain (mask 2)
+// with the RCS, as in Linux. Its own restore list (_ccsResetRegisters) names four registers: status page, INSTPM,
+// MI_MODE and GFX_MODE. A reset of the RCS clears them too and restores only the RCS list, so the CCS comes back with
+// no status page and execlists off, and the next compute submission hangs. RCU_MODE bit 0 (the CCS enable), 0xCE90
+// bit 0 and the CCS FORCE_TO_NONPRIV0 entry are written only by initModeRegisters at engine start, and no restore list
+// names them. Just before a render-domain reset, from a running CCS (status page set, execlists on, enabled in
+// RCU_MODE), save the list's registers; after the GDRST, with the donor's forcewake still held and before any work is
+// replayed, write back what the reset cleared: RCU_MODE, 0xCE90 and 0x1A4D0 as initModeRegisters programs them, and,
+// when the reset was not the CCS's own, the list with the donor's restore rule (getDefaultResetValue when it is not
+// zero, otherwise the saved value; masked registers with all enable bits). On by default when the CCS is enabled
+// (accelerator +0x1190 bit 33); -wex-no-ccs-restore turns it off.
+static bool gpuResetCCSOn;
+static const uint64_t *gpuResetCCSList; // IGVector<resetRegisterInfo>: count, capacity, entries of 0x24 bytes
+static uint32_t (*gpuResetDefaultValue)(void *,uint32_t);
+static uint32_t gpuResetCCSSaved[4];
+static bool gpuResetCCSValid,gpuResetRenderDomain,gpuResetOwnCCS;
+// WEXGPUResetCCS: {1, snapshot valid, snapshots, restore passes, RCU_MODE rewrites, 0xCE90 rewrites,
+// 0x1A4D0 rewrites, list restores, last RCU_MODE seen after the GDRST, RCU_MODE after the pass, saved list values}.
+static uint32_t gpuResetCCSStats[8];
+static bool gpuResetCCSEnabled(const uint8_t *accel) {
+ uint64_t features;memcpy(&features,accel+0x1190,sizeof(features));return (features>>33)&1;
+}
+// The list is filled by the donor's static constructor, after this kext patched it: check it at each use.
+static const uint8_t *gpuResetCCSEntries() {
+ auto list=gpuResetCCSList;
+ if(!list || list[0]!=arrsize(gpuResetCCSSaved) || !list[2])return nullptr;
+ auto entries=reinterpret_cast<const uint8_t *>(list[2]);
+ return *reinterpret_cast<const uint32_t *>(entries)==0x1A080 ? entries : nullptr;
+}
+static void gpuResetSaveCCS(uint8_t *accel) {
+ auto entries=gpuResetCCSEntries();
+ auto mmio=*reinterpret_cast<uint8_t **>(accel+0x1240);
+ if(!gpuResetCCSOn || !gpuResetForceWake || !entries || !mmio || !gpuResetCCSEnabled(accel))return;
+ uint32_t values[arrsize(gpuResetCCSSaved)];
+ gpuResetForceWake(accel,true,7);
+ for(unsigned i=0;i<arrsize(values);++i)
+  values[i]=*reinterpret_cast<volatile uint32_t *>(mmio+*reinterpret_cast<const uint32_t *>(entries+i*0x24));
+ const uint32_t rcu=*reinterpret_cast<volatile uint32_t *>(mmio+0x14800);
+ const uint32_t mode=*reinterpret_cast<volatile uint32_t *>(mmio+0x1A29C);
+ gpuResetForceWake(accel,false,7);
+ // Keep the last copy from a running CCS across back-to-back failed recoveries.
+ if(values[0] && values[0]!=UINT32_MAX && mode!=UINT32_MAX && (mode&8) && rcu!=UINT32_MAX && (rcu&1)) {
+  memcpy(gpuResetCCSSaved,values,sizeof(values));
+  __atomic_store_n(&gpuResetCCSValid,true,__ATOMIC_RELEASE);
+  __atomic_fetch_add(&gpuResetCCSStats[0],1,__ATOMIC_RELAXED);
+ }
+}
+// Returns what was rewritten (bit 0 RCU_MODE, 1 0xCE90, 2 0x1A4D0, 3 the list) and RCU_MODE as the GDRST left it
+// in the high half.
+static uint32_t gpuResetRestoreCCS(void *scheduler) {
+ auto accel=*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(scheduler)+0x10);
+ if(!gpuResetCCSOn || !accel || !gpuResetCCSEnabled(accel))return 0;
+ auto mmio=*reinterpret_cast<uint8_t **>(accel+0x1240);
+ if(!mmio)return 0;
+ auto reg=[mmio](uint32_t r)->volatile uint32_t & {return *reinterpret_cast<volatile uint32_t *>(mmio+r);};
+ uint32_t done=0;
+ const uint32_t rcu=reg(0x14800);
+ if(rcu!=UINT32_MAX && !(rcu&1)) {reg(0x14800)=0x10001;done|=1;__atomic_fetch_add(&gpuResetCCSStats[2],1,__ATOMIC_RELAXED);}
+ uint32_t flags;memcpy(&flags,accel+0xFE6,sizeof(flags));
+ if((flags>>28)&1) {
+  const uint32_t chicken=reg(0xCE90);
+  if(chicken!=UINT32_MAX && !(chicken&1)) {reg(0xCE90)=0x10001;done|=2;__atomic_fetch_add(&gpuResetCCSStats[3],1,__ATOMIC_RELAXED);}
+ }
+ if((accel[0x1191]&1) && reg(0x1A4D0)!=0xB134) {reg(0x1A4D0)=0xB134;done|=4;__atomic_fetch_add(&gpuResetCCSStats[4],1,__ATOMIC_RELAXED);}
+ auto entries=gpuResetCCSEntries();
+ if(entries && !__atomic_load_n(&gpuResetOwnCCS,__ATOMIC_ACQUIRE) && __atomic_load_n(&gpuResetCCSValid,__ATOMIC_ACQUIRE) &&
+    !reg(0x1A080)) {
+  for(unsigned i=0;i<arrsize(gpuResetCCSSaved);++i) {
+   const uint32_t r=*reinterpret_cast<const uint32_t *>(entries+i*0x24);
+   uint32_t value=gpuResetDefaultValue(accel,r);
+   if(!value)value=gpuResetCCSSaved[i];
+   if(entries[i*0x24+8])value|=0xFFFF0000;
+   reg(r)=value;
+  }
+  (void)reg(0x1A080); // posting read
+  done|=8;__atomic_fetch_add(&gpuResetCCSStats[5],1,__ATOMIC_RELAXED);
+ }
+ __atomic_fetch_add(&gpuResetCCSStats[1],1,__ATOMIC_RELAXED);
+ __atomic_store_n(&gpuResetCCSStats[6],rcu,__ATOMIC_RELAXED);
+ __atomic_store_n(&gpuResetCCSStats[7],uint32_t(reg(0x14800)),__ATOMIC_RELAXED);
+ return done|(rcu<<16);
+}
+static bool gpuResetCCSSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t data[2+arrsize(gpuResetCCSStats)+arrsize(gpuResetCCSSaved)] {1,__atomic_load_n(&gpuResetCCSValid,__ATOMIC_ACQUIRE)};
+ for(unsigned i=0;i<arrsize(gpuResetCCSStats);++i)data[2+i]=__atomic_load_n(&gpuResetCCSStats[i],__ATOMIC_RELAXED);
+ for(unsigned i=0;i<arrsize(gpuResetCCSSaved);++i)data[2+arrsize(gpuResetCCSStats)+i]=gpuResetCCSSaved[i];
+ auto out=OSData::withBytes(data,sizeof(data));if(!out)return false;
+ const bool result=out->serialize(serializer);out->release();return result;
+}
 static uint64_t gpuResetEngine(void *ring,void *context) {
  // IGHardwareRingBuffer: +0x10 accelerator (MMIO at +0x1240), +0x40 engine
  // index, +0x8B8 per-engine state with reset flags at +0xA4.
@@ -12891,16 +12987,39 @@ static uint64_t gpuResetEngine(void *ring,void *context) {
    *reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(ring)+0x70)|(uint64_t(restore?*restore:0)<<24));
  }
  gpuResetTrace(3,context,arg,0);
- if(accel && __atomic_load_n(&gpuResetRestoreOn,__ATOMIC_ACQUIRE) &&
-    (*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(ring)+0x70)&2))
+ const bool renderDomain=*reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(ring)+0x70)&2;
+ if(accel && __atomic_load_n(&gpuResetRestoreOn,__ATOMIC_ACQUIRE) && renderDomain) {
   gpuResetTrace(13,context,arg,gpuResetSaveRCS(accel));
+  gpuResetSaveCCS(accel);
+ }
+ __atomic_store_n(&gpuResetRenderShared,engine!=0 && renderDomain,__ATOMIC_RELEASE);
+ // The native reset restores the list at +0x78 itself: the CCS's own list when it is the CCS that is reset.
+ __atomic_store_n(&gpuResetOwnCCS,gpuResetCCSList &&
+  *reinterpret_cast<const uint64_t *const *>(static_cast<uint8_t *>(ring)+0x78)==gpuResetCCSList,__ATOMIC_RELEASE);
+ __atomic_store_n(&gpuResetRenderDomain,renderDomain,__ATOMIC_RELEASE);
  auto r=FunctionCast(gpuResetEngine,gpuResetOrgEngine)(ring,context);
+ __atomic_store_n(&gpuResetRenderDomain,false,__ATOMIC_RELEASE);
+ __atomic_store_n(&gpuResetRenderShared,false,__ATOMIC_RELEASE);
  gpuResetTrace(4,context,arg,r&0xFF);return r;
 }
 static uint64_t gpuResetScheduler(void *scheduler,uint32_t type,void *context) {
  gpuResetTrace(5,context,type,0);
  if(__atomic_load_n(&gpuResetRestoreOn,__ATOMIC_ACQUIRE))
   gpuResetTrace(11,context,type,gpuResetRestoreRCS(scheduler));
+ // Event 17: the CCS state a render-domain GDRST cleared, written back before the replay (gpuResetRestoreCCS).
+ if(__atomic_load_n(&gpuResetRestoreOn,__ATOMIC_ACQUIRE) && gpuResetCCSOn &&
+    __atomic_load_n(&gpuResetRenderDomain,__ATOMIC_ACQUIRE))
+  gpuResetTrace(17,context,type,gpuResetRestoreCCS(scheduler));
+ // Event 16: the RCS intake re-initialized after a shared-domain reset, only inside IOAccel's restart;
+ // the result counts the entries it had not read yet (0xFFFFFFFF: intake not running,
+ // 0xFFFFFFFE: invalid pointers, 0xFFFFFFFD: RCS scheduling not paused, left alone).
+ if(type!=0 && __atomic_load_n(&gpuResetRenderShared,__ATOMIC_ACQUIRE) &&
+    __atomic_load_n(&gpuResetInRecovery,__ATOMIC_ACQUIRE))
+  gpuResetTrace(16,context,type,tglCSBResetSharedDomain(0));
+ // Event 18: the same for the CCS intake when it is the RCS that is reset, with the same results.
+ if(type==0 && gpuResetCCSOn && __atomic_load_n(&gpuResetRenderDomain,__ATOMIC_ACQUIRE) &&
+    __atomic_load_n(&gpuResetInRecovery,__ATOMIC_ACQUIRE))
+  gpuResetTrace(18,context,type,tglCSBResetSharedDomain(1));
  auto r=FunctionCast(gpuResetScheduler,gpuResetOrgScheduler)(scheduler,type,context);
  gpuResetTrace(6,context,type,r);return r;
 }
@@ -12940,6 +13059,19 @@ static bool gpuResetTraceInstall(KernelPatcher &patcher,size_t index,mach_vm_add
    gpuResetForceWake=reinterpret_cast<void (*)(void *,bool,unsigned)>(at);
  }
  const bool restore=ready && gpuResetForceWake;
+ // The CCS restore (gpuResetSaveCCS): the donor's CCS restore list and its default-value lookup, exact entries.
+ if(restore && !checkKernelArgument("-wex-no-ccs-restore")) {
+  static const uint8_t lookupHead[] {0x55,0x48,0x89,0xE5,0x48,0x8B,0x8F,0xC0,0x12,0x00,0x00};
+  const auto list=patcher.solveSymbol<mach_vm_address_t>(index,"_ccsResetRegisters",address,size);
+  patcher.clearError();
+  const auto lookup=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator20getDefaultResetValueEj",address,size);
+  patcher.clearError();
+  if(list==address+0x14AEB8 && lookup==address+0x2E60A && !memcmp(reinterpret_cast<void *>(lookup),lookupHead,sizeof(lookupHead))) {
+   gpuResetCCSList=reinterpret_cast<const uint64_t *>(list);
+   gpuResetDefaultValue=reinterpret_cast<uint32_t (*)(void *,uint32_t)>(lookup);
+   gpuResetCCSOn=true;
+  }
+ }
  if(restore && !gpuResetStampCall)gpuResetStampCall=thread_call_allocate(gpuResetStampSweep,nullptr);
  if(ready && !checkKernelArgument("-wex-no-gpu-panic")) {
   if(!gpuWatchLock)gpuWatchLock=IOSimpleLockAlloc();
@@ -12967,6 +13099,10 @@ static bool gpuResetTraceInstall(KernelPatcher &patcher,size_t index,mach_vm_add
  auto root=IORegistryEntry::getRegistryRoot();
  root->setProperty("WEXGPUResetTraceReady",ready);
  root->setProperty("WEXGPUResetRestoreReady",restore);
+ root->setProperty("WEXGPUResetCCSReady",gpuResetCCSOn);
+ if(gpuResetCCSOn)if(auto live=OSSerializer::forTarget(nullptr,gpuResetCCSSerialize)) {
+  root->setProperty("WEXGPUResetCCS",live);live->release();
+ }
  if(ready)if(auto live=OSSerializer::forTarget(nullptr,gpuResetTraceSerialize)) {
   root->setProperty("WEXGPUResetTrace",live);live->release();
  }
@@ -16906,6 +17042,8 @@ struct TGLCSBEngine {
  TGLCSB::State state;
  bool hardwareReady {false};
  uint64_t consumed {}, retries {}, fallback {}, resets {}, lastRaw {}, lastRecoverNs {};
+ // Stale-slot recoveries: an entry that landed late, a sequence the hardware restarted at slot 0, a re-arm.
+ uint64_t late {}, resyncs {}, rearms {};
  uint32_t modeAtInit {UINT32_MAX};
 // Exact donor kIGHwCsDesc has six 0x79-byte records, IDs0..5. The scheduler's
 // `index > 4` exit is AFTER construction, so it also constructs ID5.
@@ -16967,6 +17105,57 @@ void tglCSBInitialize(void *streamer,uint32_t flags=0) {
  engine.modeAtInit=*reinterpret_cast<volatile uint32_t *>(io.bar+io.modeReg);
  *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=engine.state.head;
  engine.hardwareReady=true;++engine.resets;
+}
+
+// A reset of another ring in the render GDRST domain (the second render ring) clears the RCS as well:
+// its CSB write pointer goes back to the reset value and its next entry lands in slot 0, but the
+// native reset re-initializes only the ring it was called for. Detecting the restart afterwards
+// fails once the RCS has written past the old head: with the head at 0, two entries are enough, and
+// the drain reads the new slot 1 as the next entry and loses slot 0 without an error. Re-initialize
+// the RCS intake during that reset, as the native reset does for its own ring, but only inside
+// IOAccel's restart and with the RCS streamer's scheduling paused; entries the RCS wrote before the
+// reset are dropped, as in that reset. A reset of the RCS clears the second render ring (engine 1,
+// the CCS) the same way, and its intake is re-initialized under the same conditions.
+uint32_t tglCSBResetSharedDomain(unsigned which) {
+ auto &e=tglCSBEngines[which];
+ if (!tglCSB12Enabled || !e.streamer || !e.hardwareReady) return UINT32_MAX;
+ // IGAccelEventMachine::eventTimeout pauses every streamer (IGScheduler5::pause sets +0x1C00, which
+ // makes the context switch handler return at once) before it hands IOAccel the channel to reset.
+ if (!*reinterpret_cast<volatile uint8_t *>(static_cast<uint8_t *>(e.streamer)+0x1C00)) return UINT32_MAX-2;
+ uint32_t unread;
+ {
+  TGLCSBIO io(e.streamer,0);const uint32_t tail=io.readTail();
+  unread=tail<TGLCSB::Capacity && e.state.head<TGLCSB::Capacity ?
+   (tail+TGLCSB::Capacity-e.state.head)%TGLCSB::Capacity : UINT32_MAX-1;
+ }
+ tglCSBInitialize(e.streamer);
+ return unread;
+}
+
+// TGLCSB12Recovery = per engine {entries that landed late, sequences restarted at slot 0, re-arms};
+// TGLCSB12LastRecovery = the intake state at the last stale-slot recovery, as the fatal path would report it.
+char tglCSBLastRecovery[640];
+bool tglCSBRecoverySerialize(void *,void *,OSSerialize *serializer) {
+ uint64_t out[arrsize(tglCSBEngines)][3] {};
+ for (unsigned i=0;i<arrsize(tglCSBEngines);++i) {
+  out[i][0]=tglCSBEngines[i].late;out[i][1]=tglCSBEngines[i].resyncs;out[i][2]=tglCSBEngines[i].rearms;
+ }
+ auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+// The registry is lost when the machine freezes, and this kext's IOLog lines do not reach the unified
+// log: each recovery also goes to os_log, from a thread call, never from the interrupt path.
+thread_call_t tglCSBRecoveryLogCall;
+void tglCSBRecoveryLog(thread_call_param_t,thread_call_param_t) {
+ char copy[sizeof(tglCSBLastRecovery)];memcpy(copy,tglCSBLastRecovery,sizeof(copy));copy[sizeof(copy)-1]=0;
+ unsigned long long late=0,resyncs=0,rearms=0;
+ for (const auto &e:tglCSBEngines) {late+=e.late;resyncs+=e.resyncs;rearms+=e.rearms;}
+ os_log(OS_LOG_DEFAULT,"WhateverXe CSB12 recovery (late %llu, restarted %llu, re-armed %llu): %{public}s",late,resyncs,rearms,copy);
+}
+bool tglCSBLastRecoverySerialize(void *,void *,OSSerialize *serializer) {
+ char copy[sizeof(tglCSBLastRecovery)];memcpy(copy,tglCSBLastRecovery,sizeof(copy));copy[sizeof(copy)-1]=0;
+ auto text=OSString::withCString(copy);if (!text) return false;
+ const bool ok=text->serialize(serializer);text->release();return ok;
 }
 
 bool tglCSBModeSerialize(void *,void *,OSSerialize *serializer) {
@@ -17070,6 +17259,11 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   if (data) {root->setProperty("TGLCSB12Live",data);data->release();}
   auto modes=OSSerializer::forTarget(nullptr,tglCSBModeSerialize);
   if (modes) {root->setProperty("TGLCSBModeAtInit",modes);modes->release();}
+  auto recovery=OSSerializer::forTarget(nullptr,tglCSBRecoverySerialize);
+  if (recovery) {root->setProperty("TGLCSB12Recovery",recovery);recovery->release();}
+  auto last=OSSerializer::forTarget(nullptr,tglCSBLastRecoverySerialize);
+  if (last) {root->setProperty("TGLCSB12LastRecovery",last);last->release();}
+  if (!tglCSBRecoveryLogCall) tglCSBRecoveryLogCall=thread_call_allocate(tglCSBRecoveryLog,nullptr);
  }
  tglCSB12Enabled=ok;patcher.clearError();return ok;
 }
@@ -17195,10 +17389,45 @@ void XE::wrapTGLCSBProcess(void *streamer,uint32_t flags) {
   // re-arm the ring and return without dispatching, rather than panicking.
   const bool staleSlot = error == TGLCSB::Error::Unavailable ||
    (error == TGLCSB::Error::Rejected && (engine.lastRaw == 0 || engine.lastRaw == TGLCSB::Sentinel));
+  if (staleSlot) {
+   // A stale slot hides a real event. The tail can reach the HWSP before its entry, and the
+   // hardware can restart its sequence at slot 0 without the software's head (the panics this
+   // path replaced show tail 0, slot 0 valid, the rest empty, the head further on). Re-arming
+   // throws that event away: a lost switch leaves the native scheduler waiting on a context the
+   // engine no longer runs, and the engine hangs with work queued. Read the event, in order.
+   const uint32_t cap=TGLCSB::Capacity;
+   // Unavailable stops before the missing slot; Rejected has consumed it as an empty MMIO read.
+   const uint32_t before=error==TGLCSB::Error::Unavailable ? engine.state.head : (engine.state.head+cap-1)%cap;
+   const uint32_t missing=before+1==cap ? 0 : before+1;
+   auto again=[&](uint32_t head) {
+    engine.state.head=head;engine.state.error=TGLCSB::Error::None;
+    *reinterpret_cast<uint32_t *>(io.streamer+0x1C04)=head;
+    return TGLCSB::drain(engine.state,io,consume)==TGLCSB::Error::None;
+   };
+   auto note=[&](const char *how) {
+    snprintf(tglCSBLastRecovery,sizeof(tglCSBLastRecovery),"%s: %s",how,reason);
+    if (tglCSBRecoveryLogCall) thread_call_enter(tglCSBRecoveryLogCall);
+   };
+   uint64_t raw=TGLCSB::Sentinel;
+   for (unsigned i=0;i<2000 && ((raw=io.readEntry(missing))==TGLCSB::Sentinel || !raw);++i) io.delayUs(1);
+   if (raw!=TGLCSB::Sentinel && raw) {
+    if (again(before)) {++engine.late;note("late entry");return;}
+   } else {
+    const uint32_t tail=io.readTail();
+    bool restarted=tail<cap;
+    for (uint32_t i=0;restarted && i<=tail;++i) {const auto r=io.readEntry(i);restarted=r!=TGLCSB::Sentinel && r;}
+    if (restarted && again(TGLCSB::ResetIndex)) {++engine.resyncs;note("sequence restarted at slot 0");return;}
+   }
+  }
+  // A retry that met a real unhandled event keeps the fatal decision; only an empty slot re-arms.
+  const bool stillStale = engine.state.error == TGLCSB::Error::Unavailable ||
+   (engine.state.error == TGLCSB::Error::Rejected && (engine.lastRaw == 0 || engine.lastRaw == TGLCSB::Sentinel));
   const uint64_t recoverNow = io.nowNs();
-  if (staleSlot && (!engine.lastRecoverNs || recoverNow - engine.lastRecoverNs >= kTGLCSBRecoverWindowNs)) {
+  if (staleSlot && stillStale && (!engine.lastRecoverNs || recoverNow - engine.lastRecoverNs >= kTGLCSBRecoverWindowNs)) {
    engine.lastRecoverNs = recoverNow;
    SYSLOG("igfx","%s -> recovered (CSB ring re-armed)",reason);
+   ++engine.rearms;snprintf(tglCSBLastRecovery,sizeof(tglCSBLastRecovery),"re-armed: %s",reason);
+   if (tglCSBRecoveryLogCall) thread_call_enter(tglCSBRecoveryLogCall);
    tglCSBInitialize(streamer);
    return;
   }
