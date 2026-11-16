@@ -5,6 +5,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
 #include <kern/thread_call.h>
+#include <os/log.h>
 //
 //  kern_xe.cpp
 //  WhateverGreen
@@ -332,10 +333,12 @@ bool tglRecoverySerialize(void *,void *,OSSerialize *serializer) {
 
 static void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_t result);
 static void gpuResetDumpAfter(void *channel);
+static void gpuWatchNoteReset();
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
 	gpuResetTrace(1,channel,n,0);
+	gpuWatchNoteReset();
 	const auto result=TGLRecovery::resetAndResume(channel,tglRecoveryStamp);
 	gpuResetTrace(2,channel,n,result.resetOK|(uint64_t(result.failuresAfter)<<8));
 	gpuResetDumpAfter(channel);
@@ -12874,10 +12877,11 @@ static void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_
  for(unsigned i=0;i<arrsize(gpuResetTraceRegs);++i)
   e.regs[i]=mmio?*reinterpret_cast<volatile uint32_t *>(mmio+gpuResetTraceRegs[i]):0;
  // The unified log survives the forced restart that usually follows a failed
- // recovery; the registry copy does not.
+ // recovery; the registry copy does not. IOLog lines from this kext do not reach
+ // it on this system, os_log ones do.
  const auto &v=e.regs;
- IOLog("WEXReset %u ev=%u res=%x obj=%llx arg=%llx gdrst=%x 4a08=%x tail=%x head=%x start=%x ctl=%x ipehr=%x "
-  "instdone=%x acthd=%x mimode=%x resetctl=%x mode=%x els=%x csb=%x elc=%x fwack=%x\n",n,event,e.result,e.object,arg,
+ os_log(OS_LOG_DEFAULT,"WEXReset %u ev=%u res=%x obj=%llx arg=%llx gdrst=%x 4a08=%x tail=%x head=%x start=%x ctl=%x ipehr=%x "
+  "instdone=%x acthd=%x mimode=%x resetctl=%x mode=%x els=%x csb=%x elc=%x fwack=%x",n,event,e.result,e.object,arg,
   v[0],v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],v[12],v[13],v[14],v[15]);
 }
 static bool gpuResetTraceSerialize(void *,void *,OSSerialize *serializer) {
@@ -12922,22 +12926,148 @@ static uint32_t gpuResetTableSaved[64+32];
 // recovery, complete any stamp slot that is still behind its last issued value
 // and has not moved since: {returned +0, issued +8} in 64-byte slots at the
 // ring's +0x30, 64 slots. This fails the lost work instead of waiting forever.
+// A stamp can also stop after that first sweep, when the work a recovery
+// replayed hangs again: IOAccel then flags it for as long as the machine runs,
+// three times a minute, and the display that waits on it freezes for good.
+// While any slot stays behind, the sweep comes back every 30 s and completes the
+// slots that have not moved for a whole period.
 static uint8_t *volatile gpuResetStampBase;
 static uint32_t gpuResetStampSeen[64];
 static thread_call_t gpuResetStampCall;
 static volatile uint32_t gpuResetStampForced;
 static void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_t result);
+// A GPU that cannot be brought back. IOAccel watches every stamp that is behind; one that has not
+// moved for its timeout makes it request a restart, and restart_channel asks eventTimeout for the
+// channel to reset. After a lost event the reset can succeed and the replayed work hang again, or the
+// stamp has no channel left and every request is skipped: the displays stop, and about half an hour
+// later the whole machine, with nothing in any log. A restart beats a machine frozen for hours. Each
+// sign of failure marks its minute: a restart request, a GPU reset, a stamp the driver had to
+// complete. When 10 of the last 15 minutes carry one, panic with the counts. A healthy GPU makes no
+// requests, and a recovery that takes a few minutes stays far below. -wex-no-gpu-panic turns it off.
+static constexpr uint32_t gpuWatchWindowMinutes=15,gpuWatchFailedMinutes=10;
+enum GPUWatchSign : unsigned {GPUWatchRequest,GPUWatchSkipped,GPUWatchReset,GPUWatchCompleted,GPUWatchSigns};
+static IOSimpleLock *gpuWatchLock;
+static thread_call_t gpuWatchCall;
+static bool gpuWatchOn,gpuWatchArmed;
+static uint64_t gpuWatchMask,gpuWatchMinute;
+static uint32_t gpuWatchCounts[GPUWatchSigns];
+// The unified log cannot decode a kext that OpenCore injects: its IOLog lines arrive as compose
+// failures and its os_log lines not at all. The registry keeps the watch's state too (WEXGPUWatch):
+// failed minutes in the window, requests, requests without a channel, resets, completed stamps,
+// requests since boot, then the last 16 requests, oldest first.
+struct GPUWatchRequestRecord {uint64_t time;int32_t stamp;uint32_t found,done,issued,expected,unused;};
+static GPUWatchRequestRecord gpuWatchRequests[16];
+static uint32_t gpuWatchRequestCount;
+static uint64_t gpuWatchNowMinute() {
+ uint64_t now,ns;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&ns);return ns/(60*1000000000ULL);
+}
+// With the lock held: shift the mask to the current minute.
+static void gpuWatchAge(uint64_t minute) {
+ if(minute<=gpuWatchMinute)return;
+ const auto shift=minute-gpuWatchMinute;
+ gpuWatchMask=shift>=64 ? 0 : gpuWatchMask<<shift;gpuWatchMinute=minute;
+}
+static void gpuWatchNote(GPUWatchSign sign) {
+ if(!__atomic_load_n(&gpuWatchOn,__ATOMIC_ACQUIRE))return;
+ const auto minute=gpuWatchNowMinute();
+ IOSimpleLockLock(gpuWatchLock);
+ gpuWatchAge(minute);gpuWatchMask|=1;++gpuWatchCounts[sign];
+ const bool arm=!gpuWatchArmed;gpuWatchArmed=true;
+ IOSimpleLockUnlock(gpuWatchLock);
+ if(arm) {
+  uint64_t deadline;clock_interval_to_deadline(60,kSecondScale,&deadline);
+  thread_call_enter_delayed(gpuWatchCall,deadline);
+ }
+}
+static void gpuWatchCheck(thread_call_param_t,thread_call_param_t) {
+ uint32_t counts[GPUWatchSigns];
+ IOSimpleLockLock(gpuWatchLock);
+ gpuWatchAge(gpuWatchNowMinute());
+ const auto failed=uint32_t(__builtin_popcountll(gpuWatchMask&((1ULL<<gpuWatchWindowMinutes)-1)));
+ for(unsigned i=0;i<GPUWatchSigns;++i)counts[i]=gpuWatchCounts[i];
+ // A quiet window ends the episode: the next sign starts a new count.
+ if(!failed) {gpuWatchArmed=false;for(auto &count:gpuWatchCounts)count=0;}
+ IOSimpleLockUnlock(gpuWatchLock);
+ if(!failed)return;
+ os_log(OS_LOG_DEFAULT,"WEXGPUWatch failures in %u of the last %u minutes: %u restart requests (%u without a channel), "
+  "%u GPU resets, %u stamps completed",failed,gpuWatchWindowMinutes,counts[GPUWatchRequest],counts[GPUWatchSkipped],
+  counts[GPUWatchReset],counts[GPUWatchCompleted]);
+ if(failed>=gpuWatchFailedMinutes)
+  panic("WhateverXe: the Intel GPU cannot be recovered: failures in %u of the last %u minutes, %u restart requests "
+   "from IOAccel (%u without a channel), %u GPU resets, %u stamps completed by the driver. Restarting instead of "
+   "leaving the displays frozen; -wex-no-gpu-panic turns this off.",failed,gpuWatchWindowMinutes,
+   counts[GPUWatchRequest],counts[GPUWatchSkipped],counts[GPUWatchReset],counts[GPUWatchCompleted]);
+ uint64_t deadline;clock_interval_to_deadline(60,kSecondScale,&deadline);
+ thread_call_enter_delayed(gpuWatchCall,deadline);
+}
+static void gpuWatchNoteReset() {gpuWatchNote(GPUWatchReset);}
+// Each restart request, with both views of its stamp: the ring's table, which the sweep completes,
+// and the last value IOAccel issued (IOAccelEventMachineFast2 keeps 24 bytes a stamp from +0xF0,
+// issued at +0x14; the object is 0xDC0 bytes, so the read stays inside it). A stamp whose work never
+// reached the ring is behind for IOAccel only, and the sweep cannot see it.
+static void gpuWatchRequest(void *machine,int index,uint64_t channel) {
+ gpuWatchNote(GPUWatchRequest);
+ if(!channel)gpuWatchNote(GPUWatchSkipped);
+ const auto stamps=*reinterpret_cast<const int32_t *>(static_cast<uint8_t *>(machine)+0x30);
+ if(index<0 || index>=64 || index>=stamps)return;
+ uint32_t done=UINT32_MAX,issued=UINT32_MAX;
+ if(auto base=__atomic_load_n(&gpuResetStampBase,__ATOMIC_ACQUIRE)) {
+  auto slot=reinterpret_cast<volatile uint32_t *>(base+index*64);done=slot[0];issued=slot[2];
+ }
+ const uint32_t expected=*reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(machine)+0xF0+index*0x18+0x14);
+ if(__atomic_load_n(&gpuWatchOn,__ATOMIC_ACQUIRE)) {
+  GPUWatchRequestRecord record {0,index,channel!=0,done,issued,expected,0};
+  uint64_t now;clock_get_uptime(&now);absolutetime_to_nanoseconds(now,&record.time);
+  IOSimpleLockLock(gpuWatchLock);
+  gpuWatchRequests[gpuWatchRequestCount++%arrsize(gpuWatchRequests)]=record;
+  IOSimpleLockUnlock(gpuWatchLock);
+ }
+ os_log(OS_LOG_DEFAULT,"WEXRestartRequest stamp %d, %s: ring done %x issued %x, IOAccel issued %x",index,
+  channel ? "channel found" : "no channel",done,issued,expected);
+}
+static bool gpuWatchSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t head[2+GPUWatchSigns];GPUWatchRequestRecord records[arrsize(gpuWatchRequests)];
+ IOSimpleLockLock(gpuWatchLock);
+ gpuWatchAge(gpuWatchNowMinute());
+ head[0]=uint32_t(__builtin_popcountll(gpuWatchMask&((1ULL<<gpuWatchWindowMinutes)-1)));
+ for(unsigned i=0;i<GPUWatchSigns;++i)head[1+i]=gpuWatchCounts[i];
+ const uint32_t total=gpuWatchRequestCount,used=total<arrsize(records)?total:uint32_t(arrsize(records));
+ head[1+GPUWatchSigns]=total;
+ for(uint32_t i=0;i<used;++i)records[i]=gpuWatchRequests[(total-used+i)%arrsize(gpuWatchRequests)];
+ IOSimpleLockUnlock(gpuWatchLock);
+ auto out=OSData::withCapacity(sizeof(head)+used*sizeof(GPUWatchRequestRecord));if(!out)return false;
+ out->appendBytes(head,sizeof(head));out->appendBytes(records,used*sizeof(GPUWatchRequestRecord));
+ const bool result=out->serialize(serializer);out->release();return result;
+}
+
 static void gpuResetStampSweep(thread_call_param_t,thread_call_param_t) {
  auto base=__atomic_load_n(&gpuResetStampBase,__ATOMIC_ACQUIRE);
  if(!base)return;
- uint64_t mask=0;uint32_t forced=0;
+ uint64_t mask=0,behind=0;uint32_t forced=0,listed=0;
+ // Up to eight slots behind their issued value, to compare with the stamps IOAccel flags.
+ uint32_t list[8][3] {};
  for(unsigned i=0;i<arrsize(gpuResetStampSeen);++i) {
   auto slot=reinterpret_cast<volatile uint32_t *>(base+i*64);
   const uint32_t done=slot[0],issued=slot[2];
-  if(int32_t(issued-done)>0 && done==gpuResetStampSeen[i]) {slot[0]=issued;mask|=1ULL<<i;++forced;}
+  if(int32_t(issued-done)>0) {
+   if(listed<arrsize(list)) {list[listed][0]=i;list[listed][1]=done;list[listed][2]=issued;++listed;}
+   if(done==gpuResetStampSeen[i]) {slot[0]=issued;mask|=1ULL<<i;++forced;}
+   else behind|=1ULL<<i;
+  }
+  gpuResetStampSeen[i]=slot[0];
  }
  __atomic_fetch_add(&gpuResetStampForced,forced,__ATOMIC_RELAXED);
- gpuResetTrace(14,base,mask,forced);
+ if(forced)gpuWatchNote(GPUWatchCompleted);
+ // Event 14: completed slots in the argument; slots still moving counted in the result's high half.
+ gpuResetTrace(14,base,mask,forced|(uint64_t(__builtin_popcountll(behind))<<16));
+ if(listed)os_log(OS_LOG_DEFAULT,"WEXStamps behind %u: %u %x/%x, %u %x/%x, %u %x/%x, %u %x/%x, %u %x/%x, %u %x/%x, %u %x/%x, %u %x/%x",
+  listed,list[0][0],list[0][1],list[0][2],list[1][0],list[1][1],list[1][2],list[2][0],list[2][1],list[2][2],
+  list[3][0],list[3][1],list[3][2],list[4][0],list[4][1],list[4][2],list[5][0],list[5][1],list[5][2],
+  list[6][0],list[6][1],list[6][2],list[7][0],list[7][1],list[7][2]);
+ if(behind && gpuResetStampCall) {
+  uint64_t deadline;clock_interval_to_deadline(30,kSecondScale,&deadline);
+  thread_call_enter_delayed(gpuResetStampCall,deadline);
+ }
 }
 static void gpuResetStampArm() {
  auto base=__atomic_load_n(&gpuResetStampBase,__ATOMIC_ACQUIRE);
@@ -12968,11 +13098,34 @@ static uint64_t gpuResetEventTimeout(void *machine,int index) {
    gpuResetTimeoutSeen[index]=done;gpuResetTimeoutStrikes[index]=1;
   } else if(++gpuResetTimeoutStrikes[index]>=3) {
    slot[0]=issued;gpuResetTimeoutStrikes[index]=0;
-   __atomic_fetch_add(&gpuResetStampForced,1,__ATOMIC_RELAXED);
+   __atomic_fetch_add(&gpuResetStampForced,1,__ATOMIC_RELAXED);gpuWatchNote(GPUWatchCompleted);
    gpuResetTrace(15,machine,uint64_t(uint32_t(index))|(uint64_t(done)<<32),issued);
   }
  }
- return FunctionCast(gpuResetEventTimeout,gpuResetOrgEventTimeout)(machine,index);
+ // IOAccel queues the restart when it signals the stamp and runs it seconds later. If the stamp has
+ // reached everything submitted on it since (IOAccelEventMachineFast2: stamp table at +0x28, count at
+ // +0x30, last submitted value at +0x104 + 24*index), the restart has nothing to recover, yet IOAccel
+ // forces it ("ring is empty and all finished ... Forcing restart"), and on this GPU it resets both render
+ // engines and discards the work running on them. Answer "no channel" instead, before the native
+ // eventTimeout pauses the scheduler (it pauses it whenever it returns a channel). Stamps nothing was
+ // submitted on (display stamps) still go to the native function, which completes them itself.
+ {
+  auto m=static_cast<uint8_t *>(machine);
+  const auto count=*reinterpret_cast<const int32_t *>(m+0x30);
+  auto table=*reinterpret_cast<volatile uint32_t *const *const *>(m+0x28);
+  if(index>=0 && index<count && index<64 && table && table[index]) {
+   const uint32_t done=*table[index],submitted=*reinterpret_cast<const uint32_t *>(m+0x104+index*0x18);
+   if(submitted && int32_t(submitted-done)<=0) {
+    // Event 21: argument = index | submitted << 32, result = the stamp it reached.
+    gpuResetTrace(21,machine,uint64_t(uint32_t(index))|(uint64_t(submitted)<<32),done);
+    gpuWatchRequest(machine,index,0);
+    return 0;
+   }
+  }
+ }
+ const auto channel=FunctionCast(gpuResetEventTimeout,gpuResetOrgEventTimeout)(machine,index);
+ gpuWatchRequest(machine,index,channel);
+ return channel;
 }
 // Before/after copies of the donor hang report's register set, for diffing a
 // recovered engine against its pre-reset state (both taken with forcewake).
@@ -13203,6 +13356,15 @@ static bool gpuResetTraceInstall(KernelPatcher &patcher,size_t index,mach_vm_add
  }
  const bool restore=ready && gpuResetForceWake;
  if(restore && !gpuResetStampCall)gpuResetStampCall=thread_call_allocate(gpuResetStampSweep,nullptr);
+ if(ready && !checkKernelArgument("-wex-no-gpu-panic")) {
+  if(!gpuWatchLock)gpuWatchLock=IOSimpleLockAlloc();
+  if(!gpuWatchCall)gpuWatchCall=thread_call_allocate(gpuWatchCheck,nullptr);
+  __atomic_store_n(&gpuWatchOn,gpuWatchLock && gpuWatchCall,__ATOMIC_RELEASE);
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXGPUWatchReady",__atomic_load_n(&gpuWatchOn,__ATOMIC_ACQUIRE));
+ if(__atomic_load_n(&gpuWatchOn,__ATOMIC_ACQUIRE))if(auto live=OSSerializer::forTarget(nullptr,gpuWatchSerialize)) {
+  IORegistryEntry::getRegistryRoot()->setProperty("WEXGPUWatch",live);live->release();
+ }
  if(restore) {
   // IGAccelEventMachine::eventTimeout(int): exact donor entry, no other route.
   static const uint8_t timeout[] {0x55,0x48,0x89,0xE5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xEC,0x18};

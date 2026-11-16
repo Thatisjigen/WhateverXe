@@ -169,5 +169,6 @@
     "-wex-hidpi-dbuf"
   ],
   "-wex-no-nv-webkit": [],
-  "-wex-nv-video": []
+  "-wex-nv-video": [],
+  "-wex-no-gpu-panic": []
 }
