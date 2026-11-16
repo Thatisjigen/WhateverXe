@@ -14,7 +14,7 @@ unsigned resets,resumes,stage;bool nativeOK,replaceScheduler,replaceOwner,timeou
 uint32_t initialFailures;
 // Hooks the wrapper calls around the helper. Their bodies are outside this check: each stub pins where the
 // wrapper calls it and with what.
-struct {unsigned traces,dumps,watched;uint64_t traced;} hooks;
+struct {unsigned traces,dumps,watched,notifies;uint64_t traced;} hooks;
 bool gpuResetInRecovery;
 using TGLRecovery::field;
 
@@ -54,6 +54,10 @@ void gpuResetTrace(uint32_t event,const void *object,uint64_t arg,uint64_t resul
 }
 void gpuResetDumpAfter(void *c) {assert(c==channel && hooks.traces==2 && !hooks.dumps++);}
 void gpuWatchNoteReset() {assert(hooks.traces==1 && stage==0 && !hooks.watched++);}
+void tglRecoveryNotify(void *c,uintptr_t a) {
+    assert(c==channel && gpuResetInRecovery && stage==(expectStamp ? 5U : 2U) && !hooks.notifies++);
+    assert(a==reinterpret_cast<uintptr_t>(field<void *>(context,0xB8)));
+}
 }
 #define arrsize(a) (sizeof(a)/sizeof((a)[0]))
 struct XE { static void wrapTGLRecovery(void *); };
@@ -80,7 +84,7 @@ int main() {
         XE::wrapTGLRecovery(channel);
         assert(resets==1 && resumes==1 && stage==(expectStamp ? 5 : 2));
         assert(tglRecoveryCalls==1 && tglRecoveryReturns==1);
-        assert(hooks.traces==2 && hooks.dumps==1 && hooks.watched==1 && !gpuResetInRecovery);
+        assert(hooks.traces==2 && hooks.dumps==1 && hooks.watched==1 && hooks.notifies==1 && !gpuResetInRecovery);
         const auto q=tglRecoveryRecords[0];
         const uint32_t failed=initial+unsigned(present && (!ok || (expectStamp && expired)));
         assert(hooks.traced==(uint64_t(ok)|(uint64_t(present ? failed : 0U)<<8)));
