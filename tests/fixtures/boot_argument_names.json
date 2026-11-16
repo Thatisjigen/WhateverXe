@@ -180,5 +180,6 @@
   "-wex-no-adln-ctx-invalidate": [
     "-wex-adln-ctx-invalidate"
   ],
-  "-wex-no-reset-notify": []
+  "-wex-no-reset-notify": [],
+  "-wex-no-reset-skip": []
 }
