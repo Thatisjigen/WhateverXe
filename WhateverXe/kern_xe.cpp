@@ -344,9 +344,17 @@ inline bool tglKernelPointer(const void *p) {return p && (reinterpret_cast<uintp
 // consumer fills the software queue) and with them this call: after a reset the streamer is idle and ready, but the
 // scheduler sends it no more work. Make only the call, on the exact IGAccelEventMachine vtable, never the extra stamp
 // or the wait. On by default; -wex-no-reset-notify turns it off. WEXRecoveryNotify counts the calls.
+// incrementStamp only raises the channel's last issued value (+0xFC + 24*index). The stamp command that would write
+// that value is the one the single-pass caller drops, so logCommandSubmission never copies it to the submitted value
+// IOAccel's progress check compares (+0x104), and nothing ever writes it to the stamp table. finishStamp waits for
+// the last issued value, restarting the channel after each timed-out wait, and finishAllStamps calls it for every
+// stamp from systemWillSleep, display_mode_will_change and framebuffer_will_power_off: once the channel has no later
+// work, those would wait for this value forever. Complete it right after the call, as the channel's earlier values
+// were completed before the resume; completeStamp never raises a stamp beyond its last issued value.
+// WEXRecoveryNotify counts these completions, and reset trace event 19 records each one.
 uintptr_t tglRecoveryEventVtable {};
 bool tglRecoveryNotifyOn {};
-uint32_t tglRecoveryNotified {};
+uint32_t tglRecoveryNotified {},tglRecoveryNotifyCompleted {};
 void tglRecoveryNotify(void *channel,uintptr_t affected) {
 	if (!tglRecoveryNotifyOn || !tglKernelPointer(reinterpret_cast<void *>(affected))) return;
 	auto owner=TGLRecovery::field<uint8_t *>(channel,0x18);
@@ -357,11 +365,16 @@ void tglRecoveryNotify(void *channel,uintptr_t affected) {
 	if (!tglKernelPointer(reinterpret_cast<void *>(increment))) return;
 	const auto stamp=TGLRecovery::field<uint32_t>(reinterpret_cast<void *>(affected),0x20);
 	increment(machine,static_cast<int>(stamp));
+	const auto c=TGLRecovery::completeStamp(machine,stamp);
 	__atomic_fetch_add(&tglRecoveryNotified,1,__ATOMIC_RELAXED);
-	gpuResetTrace(19,channel,stamp,0);
+	if (c.forced) __atomic_fetch_add(&tglRecoveryNotifyCompleted,1,__ATOMIC_RELAXED);
+	// The argument carries the stamp index and, in its high half, the stamp before; the result is the value it was
+	// raised to (completed when it is ahead of the stamp before).
+	gpuResetTrace(19,channel,stamp|(uint64_t(c.before)<<32),c.target);
 }
 bool tglRecoveryNotifySerialize(void *,void *,OSSerialize *serializer) {
-	const uint32_t data[2] {1,__atomic_load_n(&tglRecoveryNotified,__ATOMIC_RELAXED)};
+	const uint32_t data[3] {2,__atomic_load_n(&tglRecoveryNotified,__ATOMIC_RELAXED),
+		__atomic_load_n(&tglRecoveryNotifyCompleted,__ATOMIC_RELAXED)};
 	auto out=OSData::withBytes(data,sizeof(data));if (!out) return false;
 	const bool ok=out->serialize(serializer);out->release();return ok;
 }
