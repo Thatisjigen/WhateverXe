@@ -17136,9 +17136,10 @@ struct TGLCSBIO {
 };
 
 
-// S0 wake experiment. Take an immutable pre-sleep snapshot *after* the
-// accelerator's native sleep preparation. The wake decision is opt-in and
-// rejects a missing snapshot or any changed software context ownership.
+// S0 wake. Take an immutable pre-sleep snapshot *after* the accelerator's
+// native sleep preparation. The wake decision is on by default
+// (-wex-no-s0-csb-resync turns it off: no route, no snapshot) and rejects a
+// missing snapshot or any changed software context ownership.
 struct TGLS0SleepRecord {
  TGLCSB::WakeBaseline before {};
  uintptr_t slots[4] {};
@@ -17357,7 +17358,7 @@ bool XE::installTGLCSB12(KernelPatcher &patcher,size_t index,mach_vm_address_t a
   if (last) {root->setProperty("TGLCSB12LastRecovery",last);last->release();}
   if (!tglCSBRecoveryLogCall) tglCSBRecoveryLogCall=thread_call_allocate(tglCSBRecoveryLog,nullptr);
  }
- if (ok && checkKernelArgument("-wex-tgl-s0-csb-resync")) {
+ if (ok && !checkKernelArgument("-wex-no-s0-csb-resync")) {
   // Both path and address are qualified against the analyzed donor build.
   const auto symbol="__ZN16IntelAccelerator15systemWillSleepEv";
   const auto target=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);
@@ -17394,9 +17395,10 @@ bool XE::wrapTGLCSBInit(void *streamer,void *owner,void *loop,void *scheduler,un
  return ok;
 }
 void XE::wrapTGLCSBWake(void *streamer) {
- // Default behavior stays identical to 0.8.2. Do not invoke the native
- // six-entry reset (pointer 7) in the patched twelve-entry scheduler.
- if (!checkKernelArgument("-wex-tgl-s0-csb-resync") || !tglS0SleepHookRouted) {
+ // Without the sleep snapshot (-wex-no-s0-csb-resync, or the route refused)
+ // the behavior is that of 0.8.2. Do not invoke the native six-entry reset
+ // (pointer 7) in the patched twelve-entry scheduler.
+ if (!tglS0SleepHookRouted) {
   tglCSBInitialize(streamer);
   return;
  }

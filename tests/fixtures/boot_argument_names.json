@@ -174,5 +174,7 @@
   "-wex-no-gpu-panic": [],
   "-wex-no-objpreempt": [],
   "-wex-no-display-sleep-irq": [],
-  "-wex-tgl-s0-csb-resync": []
+  "-wex-no-s0-csb-resync": [
+    "-wex-tgl-s0-csb-resync"
+  ]
 }
