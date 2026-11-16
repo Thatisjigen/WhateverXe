@@ -336,6 +336,36 @@ static void gpuResetDumpAfter(void *channel);
 static void gpuWatchNoteReset();
 // Set while IOAccel's restart runs through this wrapper, the only path that resets the GPU after boot.
 static bool gpuResetInRecovery;
+namespace {
+inline bool tglKernelPointer(const void *p) {return p && (reinterpret_cast<uintptr_t>(p)>>47)==0x1FFFF;}
+// The donor's resetHardwareAndReplay, after the scheduler resume, calls the event machine at accelerator +0x380
+// (vtable +0x1D8, IOAccelEventMachineFast2::incrementStamp) with the affected channel's stamp index, then submits a
+// stamp and waits up to a second for it. The single-pass caller drops the stamp and the wait on purpose (a stopped
+// consumer fills the software queue) and with them this call: after a reset the streamer is idle and ready, but the
+// scheduler sends it no more work. Make only the call, on the exact IGAccelEventMachine vtable, never the extra stamp
+// or the wait. On by default; -wex-no-reset-notify turns it off. WEXRecoveryNotify counts the calls.
+uintptr_t tglRecoveryEventVtable {};
+bool tglRecoveryNotifyOn {};
+uint32_t tglRecoveryNotified {};
+void tglRecoveryNotify(void *channel,uintptr_t affected) {
+	if (!tglRecoveryNotifyOn || !tglKernelPointer(reinterpret_cast<void *>(affected))) return;
+	auto owner=TGLRecovery::field<uint8_t *>(channel,0x18);
+	auto machine=tglKernelPointer(owner) ? TGLRecovery::field<uint8_t *>(owner,0x380) : nullptr;
+	if (!tglKernelPointer(machine) || TGLRecovery::field<uintptr_t>(machine,0)!=tglRecoveryEventVtable) return;
+	using Increment=void (*)(void *,int);
+	auto increment=TGLRecovery::field<Increment>(reinterpret_cast<void *>(tglRecoveryEventVtable),0x1D8);
+	if (!tglKernelPointer(reinterpret_cast<void *>(increment))) return;
+	const auto stamp=TGLRecovery::field<uint32_t>(reinterpret_cast<void *>(affected),0x20);
+	increment(machine,static_cast<int>(stamp));
+	__atomic_fetch_add(&tglRecoveryNotified,1,__ATOMIC_RELAXED);
+	gpuResetTrace(19,channel,stamp,0);
+}
+bool tglRecoveryNotifySerialize(void *,void *,OSSerialize *serializer) {
+	const uint32_t data[2] {1,__atomic_load_n(&tglRecoveryNotified,__ATOMIC_RELAXED)};
+	auto out=OSData::withBytes(data,sizeof(data));if (!out) return false;
+	const bool ok=out->serialize(serializer);out->release();return ok;
+}
+}
 void XE::wrapTGLRecovery(void *channel) {
 	const auto n=__atomic_fetch_add(&tglRecoveryCalls,1,__ATOMIC_RELAXED);
 	uint64_t before {};clock_get_uptime(&before);
@@ -343,6 +373,7 @@ void XE::wrapTGLRecovery(void *channel) {
 	gpuWatchNoteReset();
 	__atomic_store_n(&gpuResetInRecovery,true,__ATOMIC_RELEASE);
 	const auto result=TGLRecovery::resetAndResume(channel,tglRecoveryStamp);
+	tglRecoveryNotify(channel,result.affected);
 	__atomic_store_n(&gpuResetInRecovery,false,__ATOMIC_RELEASE);
 	gpuResetTrace(2,channel,n,result.resetOK|(uint64_t(result.failuresAfter)<<8));
 	gpuResetDumpAfter(channel);
@@ -14864,6 +14895,17 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				}
 				if (recoveryOK) if (auto live=OSSerializer::forTarget(nullptr,tglRecoverySerialize)) {
 					IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoveryLive",live);live->release();
+				}
+				// The post-resume notification (tglRecoveryNotify): the exact IGAccelEventMachine vtable.
+				if (recoveryOK) {
+					const auto vtable=patcher.solveSymbol<mach_vm_address_t>(index,"__ZTV19IGAccelEventMachine",address,size);
+					patcher.clearError();
+					tglRecoveryEventVtable=vtable==address+0xCE9F8 ? vtable+0x10 : 0;
+					tglRecoveryNotifyOn=tglRecoveryEventVtable && !checkKernelArgument("-wex-no-reset-notify");
+					IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryNotifyReady",tglRecoveryNotifyOn);
+					if (tglRecoveryNotifyOn) if (auto live=OSSerializer::forTarget(nullptr,tglRecoveryNotifySerialize)) {
+						IORegistryEntry::getRegistryRoot()->setProperty("WEXRecoveryNotify",live);live->release();
+					}
 				}
 			}
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLRecoverySinglePassRequested",recoveryRequested);
