@@ -13870,12 +13870,12 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				(XELP::kernelOS(version)==XELP::OS::Tahoe);
 			const bool completionCacheRequested=tahoeTrialScope && !(tglTahoeDisabledTrials&1);
 			// Linux applies Wa_18022495364 to TGL, ADL and RPL (Xe_LP 12.00-12.10).
-			// The ADL-N backend also drives ADL-P/RPL-P; opt in on the same Tahoe
-			// host-scheduler target with -wex-adln-ctx-invalidate. That scope only
-			// enables the indirect trial and declines an unqualified image per
-			// context instead of failing construction.
+			// The ADL-N backend also drives ADL-P/RPL-P; on by default on the same
+			// Tahoe host-scheduler target, -wex-no-adln-ctx-invalidate turns it off.
+			// That scope only enables the indirect trial and declines an unqualified
+			// image per context instead of failing construction.
 			const bool adlnContextCacheRequested=adlnDetected && checkKernelArgument("-disablegfxfirmware") &&
-				(XELP::kernelOS(version)==XELP::OS::Tahoe) && checkKernelArgument("-wex-adln-ctx-invalidate");
+				(XELP::kernelOS(version)==XELP::OS::Tahoe) && !checkKernelArgument("-wex-no-adln-ctx-invalidate");
 			const bool contextCacheRequested=(tahoeTrialScope && !(tglTahoeDisabledTrials&2)) || adlnContextCacheRequested;
 			TGLContextCache::soft()=adlnContextCacheRequested;
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLTahoeDisabledTrials",tglTahoeDisabledTrials,32);

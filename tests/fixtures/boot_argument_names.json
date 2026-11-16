@@ -177,5 +177,7 @@
   "-wex-no-s0-csb-resync": [
     "-wex-tgl-s0-csb-resync"
   ],
-  "-wex-adln-ctx-invalidate": []
+  "-wex-no-adln-ctx-invalidate": [
+    "-wex-adln-ctx-invalidate"
+  ]
 }
