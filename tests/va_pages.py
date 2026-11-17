@@ -7,7 +7,7 @@ image as argument the real pages are checked and the packet generator is replaye
 from pathlib import Path
 import argparse,hashlib,re,subprocess,tempfile
 root=Path(__file__).resolve().parents[1]
-ap=argparse.ArgumentParser();ap.add_argument('donor',nargs='?',type=Path);ap.add_argument('--intel-gen12',type=Path);args=ap.parse_args()
+ap=argparse.ArgumentParser();ap.add_argument('donor',nargs='?',type=Path);ap.add_argument('--intel-gen12',type=Path);ap.add_argument('--metal',type=Path);args=ap.parse_args()
 s=(root/'WhateverXe/kern_va_pages.hpp').read_text()
 production=s[s.index('static mach_vm_address_t vaOriginalPage;'):]
 header=(root/'WhateverXe/kern_local_va_vfe.hpp').read_text()
@@ -16,6 +16,17 @@ identity=re.search(r'ReferenceSHA256\[\]\{([^}]+)\}',header);expected=bytes(int(
 first=re.search(r'\{0x786000,\{([^}]+)\}',safeHeader)
 pixelHeader=(root/'WhateverXe/kern_local_va_pixel.hpp').read_text()
 pfirst=re.search(r'\{0x2b000,\{([^}]+)\}',pixelHeader)
+mpsHeader=(root/'WhateverXe/kern_mtl_mps_page.hpp').read_text()
+mpsIdentity=re.search(r'ReferenceSHA256\[\]\[32\]\{\{([^}]+)\}\}',mpsHeader)
+mpsOriginal=bytes(int(n,0) for n in re.search(r'Original\[\]\{([^}]+)\}',mpsHeader)[1].split(','))
+if args.metal:
+ # The Metal driver image: its real page must be the one the header names.
+ mps=args.metal.read_bytes()[0x2b000:0x2c000];assert hashlib.sha256(mps).digest()==bytes(int(n,0) for n in mpsIdentity[1].split(','))
+ assert mps[0xb80:0xb80+len(mpsOriginal)]==mpsOriginal
+else:
+ # A synthetic page carrying the first bytes of isMPSIntelPluginEnabled() where the driver has them.
+ mps=bytearray((i*41+3)%256 for i in range(4096));mps[0xb80:0xb80+len(mpsOriginal)]=mpsOriginal
+ mpsHeader=mpsHeader[:mpsIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(mps).digest())+mpsHeader[mpsIdentity.end(1):]
 if args.donor:
  data=args.donor.read_bytes();page=data[0x2c000:0x2d000];assert hashlib.sha256(page).digest()==expected
  safe=data[0x786000:0x787000];assert hashlib.sha256(safe).digest()==bytes(int(n,0) for n in first[1].split(','))
@@ -38,6 +49,7 @@ code=r'''
 #include "kern_local_va_l3.hpp"
 #include "kern_local_va_safe.hpp"
 #include "kern_local_va_pixel.hpp"
+#include "kern_mtl_mps_page.hpp"
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
 #include <cassert>
@@ -68,7 +80,8 @@ static std::vector<uint8_t> read(const char*p){std::ifstream f(p,std::ios::binar
 static void walker(void*,uint32_t*x,uint32_t*y,unsigned i){*x=16+i;*y=32+i;}
 template<class T>void put(uint8_t*p,unsigned o,T v){memcpy(p+o,&v,sizeof(v));}
 int main(int argc,char**argv){
- assert(argc==4 || argc==5);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]);assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096);unsigned cases=0;
+ assert(argc==7);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]);assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096);unsigned cases=0;
+ const bool haveImage=strcmp(argv[5],"-"),haveMetal=strcmp(argv[6],"-");
  KernelPatcher patcher;IOPCIDevice gpu;
  // Scope: exact device and revision, no override, Tahoe, the route, and the renderer switch.
  for(unsigned bits=0;bits<32;++bits){
@@ -77,16 +90,21 @@ int main(int argc,char**argv){
   prepareVAPages(patcher,&gpu,profile,renderer);
   const bool scope=(bits&8) && !(bits&16);
   assert(vaGen12Enabled==(scope && renderer) && vaSafeEnabled==(scope && renderer) && vaPixelEnabled==(scope && renderer));
+  assert(vaPageHookReady==(scope && renderer && (bits&4) && routeOK));
+  // Intel's MPS plug-in: off for every GPU this kext drives on Tahoe, whatever the VA switch says.
+  assert(mpsPluginOffReady==(profile.admitted() && (bits&4) && routeOK));
+  prepareVAPages(patcher,&gpu,profile,renderer,true);assert(!mpsPluginOffReady);
   assert(vaPageHookReady==(scope && renderer && (bits&4) && routeOK));++cases;
  }
  kernel=Tahoe;routeOK=true;
- prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled);++cases;
- prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled);++cases;
+ prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled);
+ assert(mpsPluginOffReady==XELP::identify(0x46808086,0x0c).admitted());++cases;
  for(const char *servicing:{"Darwin Kernel Version 25.6.0: other date; root:xnu-new/RELEASE_X86_64","Darwin Kernel Version 25.7.2: future date; root:xnu-next/RELEASE_X86_64"}) {
   version=servicing;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);++cases;
  }
  version="Darwin Kernel Version 24.6.0: Mon Jul 14 11:28:17 PDT 2025; root:xnu-11417.140.69~1/RELEASE_X86_64";
- prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled);++cases;
  version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);
  // The VFE packet generator: validated executable code pages only, rechecked under the write lock.
@@ -138,10 +156,42 @@ int main(int argc,char**argv){
   ++cases;
  }
  vaPixelEnabled=vaPageHookReady=true;
+ // Intel's MPS plug-in page: a code page of another image at the offset of a pixel page. Its switch alone decides.
+ unsigned mpsCases=0;
+ for(unsigned condition=0;condition<11;++condition){
+  auto data=mps;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=0;
+  validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
+  writeOK=condition!=4;race=condition==5;mpsPluginOffReady=condition!=6;vaPageHookReady=condition!=9;
+  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=condition!=10;
+  if(condition==7)data[64]^=1;
+  int valid=-1,t=-1,nx=-1;
+  const uint64_t offset=MetalMPSPlugin::FileOffset+(condition==8?4096:0);
+  vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
+  assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
+  const bool patched=condition==0 || condition==9 || condition==10;
+  assert(mpsPluginPages==(patched?1U:0U) && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
+  if(patched){auto expected=mps;const uint8_t off[]{0x31,0xc0,0xc3};memcpy(expected.data()+0xb80,off,sizeof(off));assert(data==expected);
+   assert(!MetalMPSPlugin::matches(data.data(),4096,offset,true,false));}
+  else if(condition!=5 && condition!=7)assert(data==mps);
+  ++mpsCases;
+ }
+ mpsPluginOffReady=vaPageHookReady=vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=true;writeOK=true;race=false;validation=15;taint=nxValue=0;
+ // The pixel page of the VA driver sits at the same offset: neither correction takes the other's page.
+ assert(!MetalMPSPlugin::matches(pixel.data(),4096,0x2b000,true,false) && LocalVAPixel::match(mps.data(),4096,0x2b000,true,false)==-1);
+ printf("PASS: %u MPS plug-in page cases: its own switch, validated executable pages only, mutation race, and independence from the VA switches\n",mpsCases);
+ if(haveMetal){
+  // The real function, corrected and called: it returns false at once, without reading the bundle's Info.plist.
+  auto image=read(argv[6]);assert(image.size()>=MetalMPSPlugin::FileOffset+4096);
+  auto code=(uint8_t*)mmap(nullptr,4096,7,MAP_ANON|MAP_PRIVATE,-1,0);assert(code!=MAP_FAILED);memcpy(code,image.data()+MetalMPSPlugin::FileOffset,4096);
+  assert(MetalMPSPlugin::matches(code,4096,MetalMPSPlugin::FileOffset,true,false));MetalMPSPlugin::apply(code);
+  unsigned changed=0;for(unsigned i=0;i<4096;++i)changed+=code[i]!=image[MetalMPSPlugin::FileOffset+i];assert(changed==3);
+  assert(!((bool(*)())(code+MetalMPSPlugin::PatchOffset))());munmap(code,4096);
+  puts("PASS: isMPSIntelPluginEnabled() of the real Metal driver returns false after the correction; three bytes change");
+ }
  assert(!LocalVAVFE::matches(page.data(),4095,LocalVAVFE::FileOffset,true,false));
  printf("PASS: %u production callback cases: exact scope, both switches, validated pages, mutation race, permissions, NX and original outputs preserved\n",cases);
- if(argc==4)return 0;
- auto image=read(argv[4]);
+ if(!haveImage)return 0;
+ auto image=read(argv[5]);
  // The pixel-transfer pages of the real image: both match, and every patch lands where expected.
  for(unsigned i=0;i<LocalVAPixel::PageCount;++i) {
   const auto &p=LocalVAPixel::Pages[i];assert(p.offset+4096<=image.size());
@@ -205,6 +255,7 @@ int main(int argc,char**argv){
 '''.replace('PRODUCTION',production)
 with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
  p=Path(tmp);(p/'kern_local_va_vfe.hpp').write_text(header);(p/'kern_local_va_safe.hpp').write_text(safeHeader);(p/'kern_local_va_pixel.hpp').write_text(pixelHeader)
+ (p/'kern_mtl_mps_page.hpp').write_text(mpsHeader);(p/'mps.bin').write_bytes(mps)
  (p/'page.bin').write_bytes(page);(p/'safe.bin').write_bytes(safe);(p/'pixel.bin').write_bytes(pixel);(p/'test.cpp').write_text(code)
  extra=[]
  if args.intel_gen12:
@@ -215,4 +266,5 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
   (p/'oracle.cpp').write_text(oracle.replace('#include "mos_utilities.h"',''))
   extra=['-DINTEL_GEN12_ORACLE','-I'+str(args.intel_gen12),str(p/'oracle.cpp')]
  subprocess.run(['clang++','-arch','x86_64','-std=c++17','-O1','-g','-I'+str(root/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')]+extra,check=True)
- subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin'),str(p/'pixel.bin')]+([str(args.donor.resolve())] if args.donor else []),check=True)
+ subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin'),str(p/'pixel.bin'),str(p/'mps.bin'),
+  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-'],check=True)

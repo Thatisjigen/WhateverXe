@@ -143,8 +143,9 @@ void XeHost::processKernel(KernelPatcher &patcher) {
  // The host must dispatch framebuffer patches and accelerator rejection
  // hooks even when the selected profile deliberately has no Render backend.
  active=profile.displayAdmitted();
- // Exact corrections of the Intel VA driver's pages, armed with its renderer advertised.
- prepareVAPages(patcher,gpu,profile,checkKernelArgument("-wex-va-renderer"));
+ // Exact corrections of the Intel VA driver's pages, armed with its renderer advertised, and Intel's MPS plug-in
+ // switched off in the Metal driver, whose kernel sources the Metal compiler of macOS 26 rejects.
+ prepareVAPages(patcher,gpu,profile,checkKernelArgument("-wex-va-renderer"),checkKernelArgument("-wex-intel-mps-plugin"));
 
  const auto display=XELP::displayAdapter(profile.family);
  systemWakeRecovery=active && (display==XELP::DisplayAdapter::ADLP || display==XELP::DisplayAdapter::ADLN);
