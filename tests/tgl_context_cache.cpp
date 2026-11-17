@@ -19,6 +19,12 @@ int main() {
  for(unsigned i=3;i<16;++i)assert(!words[i]);
  for(unsigned i=0;i<8192;++i)if(i<4096||i>=4160)assert(page[i]==0xA5);
  for(uint32_t old=0;old<65536;++old)assert(((old&~(words[2]>>16))|(words[2]&0xffff))==(old|0x40));
+ // With the aux table invalidation: GEN12_CCS_AUX_INV bit 0 first, as in Linux, then the same state cache load.
+ page.fill(0xA5);TGLContextCache::batch(page.data(),true);memcpy(words,page.data()+4096,64);
+ assert(words[0]==0x11000001 && words[1]==0x4208 && words[2]==1);
+ assert(words[3]==0x11000001 && words[4]==0x20D8 && words[5]==0x00400040);
+ for(unsigned i=6;i<16;++i)assert(!words[i]);
+ for(unsigned i=0;i<8192;++i)if(i<4096||i>=4160)assert(page[i]==0xA5);
  // Closed (TGL trial) mode refuses construction; soft (ADL-N opt-in) mode keeps
  // the native constructor result. Each path counts separately.
  auto c=TGLContextCache::counts();assert(!TGLContextCache::soft() && !c[0] && !c[1] && !c[2]);
