@@ -118,6 +118,7 @@
   "-wex-tgl-off": [
     "-igfxtgloff"
   ],
+  "-wex-tgl-no-hangwake": [],
   "-wex-tgl-prog-off": [
     "-tglprogoff"
   ],
