@@ -9,6 +9,9 @@
 // The same validator route also switches off Intel's plug-in for Metal
 // Performance Shaders in the Metal driver, on Tahoe and for every GPU this kext
 // drives (kern_mtl_mps_page.hpp); -wex-intel-mps-plugin leaves the plug-in on.
+// On the same Raptor Lake-P it also gives Metal compute kernels the 64 KB class
+// of thread-group memory in place of the 16 and 32 KB ones
+// (kern_mtl_slm_page.hpp); -wex-no-slm-64k keeps the driver's classes.
 #pragma once
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
@@ -17,9 +20,10 @@
 #include "kern_local_va_safe.hpp"
 #include "kern_local_va_pixel.hpp"
 #include "kern_mtl_mps_page.hpp"
+#include "kern_mtl_slm_page.hpp"
 static mach_vm_address_t vaOriginalPage;
-static bool vaPageHookReady,vaGen12Enabled,vaSafeEnabled,vaPixelEnabled,mpsPluginOffReady;
-static uint64_t vaVFEPages,vaL3Pages,vaSafePages,vaPixelPages,mpsPluginPages;
+static bool vaPageHookReady,vaGen12Enabled,vaSafeEnabled,vaPixelEnabled,mpsPluginOffReady,slmClassReady;
+static uint64_t vaVFEPages,vaL3Pages,vaSafePages,vaPixelPages,mpsPluginPages,slmClassPages;
 using VAPageValidator=void (*)(vnode_t,memory_object_t,memory_object_offset_t,const void *,int *,int *,int *);
 // Keep local hardware selection separate from servicing-build metadata.
 static bool vaPagesScope(const XELP::Profile &profile,XELP::OS os) {
@@ -30,6 +34,11 @@ static bool vaPagesScope(const XELP::Profile &profile,XELP::OS os) {
 static bool mpsPluginPageScope(const XELP::Profile &profile,XELP::OS os) {return os==XELP::OS::Tahoe && profile.admitted();}
 static bool mpsPluginSerialize(void *,void *,OSSerialize *serial) {
  const uint64_t q[]{1,mpsPluginOffReady,__atomic_load_n(&mpsPluginPages,__ATOMIC_ACQUIRE)};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serial);data->release();return ok;
+}
+static bool slmClassSerialize(void *,void *,OSSerialize *serial) {
+ const uint64_t q[]{1,slmClassReady,__atomic_load_n(&slmClassPages,__ATOMIC_ACQUIRE)};
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serial);data->release();return ok;
 }
@@ -47,6 +56,7 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
  // Code pages must be executable; the capability list lives in a data page.
  const bool accepted=validated && tainted && nx && *validated==0xf && !*tainted && !*nx;
  const bool mpsPage=mpsPluginOffReady && accepted && MetalMPSPlugin::matches(data,PAGE_SIZE,offset,true,false);
+ const bool slmPage=slmClassReady && accepted && MetalSLMClass::matches(data,PAGE_SIZE,offset,true,false);
  const bool safePage=vaPageHookReady && vaSafeEnabled && validated && tainted && nx &&
   LocalVASafe::match(data,PAGE_SIZE,offset,*validated==0xf,*tainted)==0;
  const int pixelPage=vaPageHookReady && vaPixelEnabled && accepted ?
@@ -54,11 +64,13 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
  const bool vaPage=vaPageHookReady && (safePage || pixelPage>=0 || (accepted && vaGen12Enabled &&
      (LocalVAVFE::matches(data,PAGE_SIZE,offset,true,false) ||
       LocalVAL3::matches(data,PAGE_SIZE,offset,true,false))));
- if(!mpsPage && !vaPage)return;
+ if(!mpsPage && !slmPage && !vaPage)return;
  if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return;
  // Readers may race: recheck the complete page under the existing write lock.
  if(mpsPage && MetalMPSPlugin::matches(data,PAGE_SIZE,offset,true,false)) {
   MetalMPSPlugin::apply(const_cast<void *>(data));__atomic_fetch_add(&mpsPluginPages,1ULL,__ATOMIC_RELEASE);
+ } else if(slmPage && MetalSLMClass::matches(data,PAGE_SIZE,offset,true,false)) {
+  MetalSLMClass::apply(const_cast<void *>(data));__atomic_fetch_add(&slmClassPages,1ULL,__ATOMIC_RELEASE);
  } else if(!vaPage) {
  } else if(safePage && LocalVASafe::match(data,PAGE_SIZE,offset,*validated==0xf,*tainted)==0) {
   // Only the first list; the others carry the ARGB conversions the window server needs.
@@ -74,17 +86,21 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
  MachInfo::setKernelWriting(false,KernelPatcher::kernelWriteLock);
 }
 static_assert(__is_same(decltype(&vaValidatePage),VAPageValidator),"Tahoe validator ABI");
-static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::Profile &profile,bool renderer,bool intelMPSPlugin=false) {
+static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::Profile &profile,bool renderer,bool intelMPSPlugin=false,
+ bool nativeSLMClass=false) {
  const bool scope=gpu && vaPagesScope(profile,XELP::kernelOS(version));
  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=scope && renderer;
  const bool mpsPluginOff=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !intelMPSPlugin;
- vaPageHookReady=mpsPluginOffReady=false;
+ // Seen on this device and revision only: the same scope as the VA pages, without their switch.
+ const bool slmClass=scope && !nativeSLMClass;
+ vaPageHookReady=mpsPluginOffReady=slmClassReady=false;
  // One route serves every page correction: a second one over the same function is not safe.
- if((vaGen12Enabled || vaSafeEnabled || vaPixelEnabled || mpsPluginOff) && getKernelVersion()==KernelVersion::Tahoe) {
+ if((vaGen12Enabled || vaSafeEnabled || vaPixelEnabled || mpsPluginOff || slmClass) && getKernelVersion()==KernelVersion::Tahoe) {
   KernelPatcher::RouteRequest route("_cs_validate_page",vaValidatePage,vaOriginalPage);
   const bool routed=patcher.routeMultipleLong(KernelPatcher::KernelID,&route,1);patcher.clearError();
   vaPageHookReady=routed && (vaGen12Enabled || vaSafeEnabled || vaPixelEnabled);
   mpsPluginOffReady=routed && mpsPluginOff;
+  slmClassReady=routed && slmClass;
  }
  auto root=IORegistryEntry::getRegistryRoot();
  root->setProperty("WEXVAPagesScope",scope);
@@ -95,4 +111,7 @@ static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::P
  // Whether Intel's MPS plug-in is being switched off, and how many times its page was corrected.
  root->setProperty("WEXMPSPluginOffReady",mpsPluginOffReady);
  if(auto live=OSSerializer::forTarget(nullptr,mpsPluginSerialize)){root->setProperty("WEXMPSPluginLive",live);live->release();}
+ // Whether thread-group memory gets the 64 KB class, and how many times that page was corrected.
+ root->setProperty("WEXMetalSLMClassReady",slmClassReady);
+ if(auto live=OSSerializer::forTarget(nullptr,slmClassSerialize)){root->setProperty("WEXMetalSLMClassLive",live);live->release();}
 }

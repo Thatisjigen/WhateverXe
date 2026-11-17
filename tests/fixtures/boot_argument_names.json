@@ -185,5 +185,6 @@
   ],
   "-wex-no-reset-notify": [],
   "-wex-no-reset-skip": [],
-  "-wex-intel-mps-plugin": []
+  "-wex-intel-mps-plugin": [],
+  "-wex-no-slm-64k": []
 }
