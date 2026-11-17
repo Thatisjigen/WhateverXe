@@ -551,6 +551,9 @@ bool tglCCSAlignmentSerialize(void *,void *,OSSerialize *serializer) {
 uintptr_t tglCPSAllocate {},tglCPSCPUAddress {},tglCPSGPUAddress {};
 uintptr_t tglCPSRestoreOriginal {},tglCPSRestoreCaller {};
 static bool tglContextCacheEnabled;
+// Linux's render-engine workarounds for Xe-LP that the per-context batch (tglCPSPrepare) rewrites on every context
+// restore: the thread-dispatch ones on every family, the semaphore idle message where Linux applies it.
+static bool tglEngineWorkarounds,tglEngineSemaphoreIdle,tglEngineSemaphoreIdleCompute;
 static uintptr_t tglContextCacheInitOriginal;
 static bool tglAlderLakeNGoldenRestore(void *context);
 static void adlnCaptureOwnedGolden(void *context);
@@ -590,8 +593,29 @@ static bool tglCPSPrepare(void *owner) {
  // complete TGL timer value after every context restore; no read/modify/write.
  // r160: Wa_1606931601, masked EU early-read disable. Existing multicast
  // steering is retained; this adds no CPU MMIO write or synchronization wait.
- const uint32_t batch[] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000,0x05000000};
- bzero(cpu,extent);memcpy(cpu,batch,sizeof(batch));
+ // Four more of Linux's Xe-LP workarounds (i915 rcs_engine_wa_init and gen12_ctx_workarounds_init, xe engine_was
+ // and lrc_was) go in the same load, so that every context restore rewrites them, after a reset too:
+ //   Wa_1409804808, ROW_CHICKEN2 bit 8: no hold on the dereference of push constants;
+ //   Wa_14010229206, ROW_CHICKEN4 bit 9: no push from the thread dispatcher;
+ //   Wa_1606376872, COMMON_SLICE_CHICKEN4 bit 6: no load-balancing calculation in the thread dispatch control;
+ //   Wa_1607297627, RING_PSMI_CTL bits 7 and 12: no power-down while the engine waits for an event, and no idle
+ //   message to the power unit while it waits on a semaphore. The donor's scheduler makes the render engine wait
+ //   on semaphores for other channels' stamps all the time. With the donor's second render ring in use, the
+ //   same bits go to its RING_PSMI_CTL at 0x1A050.
+ // The donor has all but the first in its engine start code, each behind a bit of the workaround mask that
+ // processTGLAccelerator completes for Alder and Raptor Lake. An engine reset clears the engine's registers, and
+ // neither the donor's restore list nor gpuResetRCSRegisters has ROW_CHICKEN4 or RING_PSMI_CTL.
+ uint32_t batch[20] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000};
+ unsigned words=8;
+ if(tglEngineWorkarounds) {
+  batch[7]=0x41004100;batch[words++]=0xE48C;batch[words++]=0x02000200;
+  batch[words++]=0x7300;batch[words++]=0x00400040;
+  if(tglEngineSemaphoreIdle) {batch[words++]=0x2050;batch[words++]=0x10801080;}
+  if(tglEngineSemaphoreIdleCompute) {batch[words++]=0x1A050;batch[words++]=0x10801080;}
+  batch[1]=0x11000000|(words-3); // MI_LOAD_REGISTER_IMM length: two dwords per register, minus one
+ }
+ batch[words++]=0x05000000;
+ bzero(cpu,extent);memcpy(cpu,batch,words*sizeof(uint32_t));
  if(tglContextCacheEnabled)TGLContextCache::batch(cpu);
  // Publish CPU writes before first GPU use, independent of LLC policy.
  for(unsigned i=0;i<extent;i+=64)asm volatile("clflush (%0)"::"r"(cpu+i):"memory");
@@ -13501,6 +13525,37 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionDisabledReady",objectPreemptOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionEnabled",objectPreemptOn && ffDopOK);
 			patcher.clearError();
+			// The donor picks its hardware workaround mask by PCI revision (InitTglLpHwWaTable): revisions 0 to 3,
+			// which in Linux's stepping tables is every Tiger Lake, get thirteen more workarounds than later ones.
+			// Raptor Lake-P is revision 4 and Alder Lake-P goes up to 0x0C, so there the donor leaves out
+			// workarounds that Linux applies on that silicon whatever the stepping. Add their bits to the
+			// later-revision mask, so that the donor's own engine start programs them: 23 FF_THREAD_MODE bit 19
+			// (Wa_14010919138), 38 COMMON_SLICE_CHICKEN4 bit 6 (Wa_1606376872), 47 ROW_CHICKEN4 bit 9
+			// (Wa_14010229206) and, where Linux applies Wa_1607297627, 43 RING_PSMI_CTL bits 7 and 12, with 44 for
+			// the second render ring when -wex-parallel-compute keeps it in use. The rest stay off: Linux has none
+			// of the writes they gate in its list for Alder or Raptor Lake. -wex-no-engine-wa leaves the mask alone.
+			if(xeProfile.family!=XELP::Family::Unknown && xeProfile.family!=XELP::Family::TigerLake &&
+			   !checkKernelArgument("-wex-no-engine-wa")) {
+				uint64_t mask=0x1F8C5FEC00ULL|1ULL<<23|1ULL<<38|1ULL<<47;
+				if(xeProfile.family!=XELP::Family::AlderLakeS && xeProfile.family!=XELP::Family::RaptorLakeS)
+					mask|=1ULL<<43|(checkKernelArgument("-wex-parallel-compute")?1ULL<<44:0);
+				// movabs $0x1F8C5FEC00,%rcx; cmovb %r11,%rcx
+				const uint8_t maskFind[] {0x48,0xB9,0x00,0xEC,0x5F,0x8C,0x1F,0x00,0x00,0x00,0x49,0x0F,0x42,0xCB};
+				uint8_t maskReplace[sizeof(maskFind)];
+				memcpy(maskReplace,maskFind,sizeof(maskFind));memcpy(maskReplace+2,&mask,sizeof(mask));
+				auto maskSite=reinterpret_cast<uint8_t *>(address+0x7B720);
+				bool maskOK=size>0x7B72E &&
+					patcher.solveSymbol<mach_vm_address_t>(index,"__Z18InitTglLpHwWaTableP9_WA_TABLEP18_SKU_FEATURE_TABLEjtt",address,size)==address+0x7B6B6 &&
+					!memcmp(maskSite,maskFind,sizeof(maskFind));
+				patcher.clearError();
+				if(maskOK) {
+					KernelPatcher::LookupPatch patch {currentGraphics,maskFind,maskReplace,sizeof(maskFind),1};
+					patcher.applyLookupPatch(&patch,maskSite,sizeof(maskFind)+1);
+					maskOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(maskSite,maskReplace,sizeof(maskReplace));
+					patcher.clearError();
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLWorkaroundMaskReady",maskOK);
+			}
 			// Compute on the render engine (wrapTGLAcceleratorStart clears EnableMultiContext outside Tiger Lake):
 			// IntelTGLMemoryManager::newUnifiedAddressRangeAllocator reserves the upper canonical half of each
 			// task's address allocator only with multi-context on. Drop that test (`je` after the accelerator-flag
@@ -14115,6 +14170,19 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				patcher.clearError();
 			}
 			tglContextCacheEnabled=contextCacheRequested && contextCacheOK;
+			// Linux programs Wa_1409804808 and Wa_14010229206 on every integrated Xe-LP, and Wa_1607297627 on
+			// Tiger Lake, Rocket Lake and Alder Lake-P, which there covers Alder Lake-N and Raptor Lake-P. The donor
+			// leaves ROW_CHICKEN2 bit 8, ROW_CHICKEN4 bit 9 and RING_PSMI_CTL bits 7 and 12 clear.
+			// -wex-no-engine-wa keeps the donor's values.
+			tglEngineWorkarounds=cpsOK && xeProfile.family!=XELP::Family::Unknown && !checkKernelArgument("-wex-no-engine-wa");
+			tglEngineSemaphoreIdle=tglEngineWorkarounds && xeProfile.family!=XELP::Family::AlderLakeS &&
+				xeProfile.family!=XELP::Family::RaptorLakeS;
+			// The second render ring is in use outside Tiger Lake only with -wex-parallel-compute; on Tiger Lake
+			// its register stays with the donor's own workaround mask.
+			tglEngineSemaphoreIdleCompute=tglEngineSemaphoreIdle && xeProfile.family!=XELP::Family::TigerLake &&
+				checkKernelArgument("-wex-parallel-compute");
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLEngineWorkaroundsSelected",
+				uint32_t(tglEngineWorkarounds)|uint32_t(tglEngineSemaphoreIdle)<<1|uint32_t(tglEngineSemaphoreIdleCompute)<<2,32);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLContextCacheIndirectReady",tglContextCacheEnabled);
 			if(tglContextCacheEnabled)if(auto live=OSSerializer::forTarget(nullptr,tglContextCacheSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLContextCacheLive",live);live->release();
