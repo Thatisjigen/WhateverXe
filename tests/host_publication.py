@@ -98,7 +98,7 @@ constexpr uint32_t kIOWindowServerActiveAttribute=1,kIOWSAA_StateMask=15,kIOWSAA
 constexpr IOReturn kIOReturnSuccess=0,kIOReturnNotReady=-1;
 #define FunctionCast(fn,addr) reinterpret_cast<decltype(&fn)>(addr)
 static bool checkKernelArgument(const char *){return false;}
-static void prepareVAPages(KernelPatcher &,IOPCIDevice *gpu,const XELP::Profile &profile,bool renderer,bool intelMPSPlugin){assert(!renderer && !intelMPSPlugin);if(profile.displayAdmitted())assert(gpu && published);}
+static void prepareVAPages(KernelPatcher &,IOPCIDevice *gpu,const XELP::Profile &profile,bool renderer,bool intelMPSPlugin,bool nativeSLMClass){assert(!renderer && !intelMPSPlugin && !nativeSLMClass);if(profile.displayAdmitted())assert(gpu && published);}
 struct XeHost {
  static XeHost *callbackHost;
  HOST_STATE

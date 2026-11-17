@@ -27,6 +27,16 @@ else:
  # A synthetic page carrying the first bytes of isMPSIntelPluginEnabled() where the driver has them.
  mps=bytearray((i*41+3)%256 for i in range(4096));mps[0xb80:0xb80+len(mpsOriginal)]=mpsOriginal
  mpsHeader=mpsHeader[:mpsIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(mps).digest())+mpsHeader[mpsIdentity.end(1):]
+slmHeader=(root/'WhateverXe/kern_mtl_slm_page.hpp').read_text()
+slmIdentity=re.search(r'ReferenceSHA256\[\]\[32\]\{\{([^}]+)\}\}',slmHeader)
+slm16,slm32=(bytes(int(n,0) for n in re.search(name+r'\[\]\{([^}]+)\}',slmHeader)[1].split(',')) for name in ('Class16K','Class32K'))
+if args.metal:
+ slm=args.metal.read_bytes()[0x38000:0x39000];assert hashlib.sha256(slm).digest()==bytes(int(n,0) for n in slmIdentity[1].split(','))
+ assert slm[0xfcc:0xfcc+len(slm16)]==slm16 and slm[0xfda:0xfda+len(slm32)]==slm32
+else:
+ # A synthetic page carrying the two instructions that load the 16 and 32 KB classes where the driver has them.
+ slm=bytearray((i*59+7)%256 for i in range(4096));slm[0xfcc:0xfcc+len(slm16)]=slm16;slm[0xfda:0xfda+len(slm32)]=slm32
+ slmHeader=slmHeader[:slmIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(slm).digest())+slmHeader[slmIdentity.end(1):]
 if args.donor:
  data=args.donor.read_bytes();page=data[0x2c000:0x2d000];assert hashlib.sha256(page).digest()==expected
  safe=data[0x786000:0x787000];assert hashlib.sha256(safe).digest()==bytes(int(n,0) for n in first[1].split(','))
@@ -50,6 +60,7 @@ code=r'''
 #include "kern_local_va_safe.hpp"
 #include "kern_local_va_pixel.hpp"
 #include "kern_mtl_mps_page.hpp"
+#include "kern_mtl_slm_page.hpp"
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
 #include <cassert>
@@ -80,8 +91,9 @@ static std::vector<uint8_t> read(const char*p){std::ifstream f(p,std::ios::binar
 static void walker(void*,uint32_t*x,uint32_t*y,unsigned i){*x=16+i;*y=32+i;}
 template<class T>void put(uint8_t*p,unsigned o,T v){memcpy(p+o,&v,sizeof(v));}
 int main(int argc,char**argv){
- assert(argc==7);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]);assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096);unsigned cases=0;
- const bool haveImage=strcmp(argv[5],"-"),haveMetal=strcmp(argv[6],"-");
+ assert(argc==8);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]);
+ assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096);unsigned cases=0;
+ const bool haveImage=strcmp(argv[6],"-"),haveMetal=strcmp(argv[7],"-");
  KernelPatcher patcher;IOPCIDevice gpu;
  // Scope: exact device and revision, no override, Tahoe, the route, and the renderer switch.
  for(unsigned bits=0;bits<32;++bits){
@@ -93,20 +105,24 @@ int main(int argc,char**argv){
   assert(vaPageHookReady==(scope && renderer && (bits&4) && routeOK));
   // Intel's MPS plug-in: off for every GPU this kext drives on Tahoe, whatever the VA switch says.
   assert(mpsPluginOffReady==(profile.admitted() && (bits&4) && routeOK));
-  prepareVAPages(patcher,&gpu,profile,renderer,true);assert(!mpsPluginOffReady);
+  // The thread-group memory class: this device and revision only, whatever the VA switch says.
+  assert(slmClassReady==(scope && (bits&4) && routeOK));
+  prepareVAPages(patcher,&gpu,profile,renderer,true);assert(!mpsPluginOffReady && slmClassReady==(scope && (bits&4) && routeOK));
+  prepareVAPages(patcher,&gpu,profile,renderer,false,true);assert(!slmClassReady && mpsPluginOffReady==(profile.admitted() && (bits&4) && routeOK));
   assert(vaPageHookReady==(scope && renderer && (bits&4) && routeOK));++cases;
  }
  kernel=Tahoe;routeOK=true;
- prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady);++cases;
- prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled);
+ prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled && !slmClassReady);
  assert(mpsPluginOffReady==XELP::identify(0x46808086,0x0c).admitted());++cases;
  for(const char *servicing:{"Darwin Kernel Version 25.6.0: other date; root:xnu-new/RELEASE_X86_64","Darwin Kernel Version 25.7.2: future date; root:xnu-next/RELEASE_X86_64"}) {
   version=servicing;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);++cases;
  }
  version="Darwin Kernel Version 24.6.0: Mon Jul 14 11:28:17 PDT 2025; root:xnu-11417.140.69~1/RELEASE_X86_64";
- prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled);++cases;
- version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);
+ version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && slmClassReady);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled && slmClassReady);
  // The VFE packet generator: validated executable code pages only, rechecked under the write lock.
  for(unsigned condition=0;condition<11;++condition){
   auto data=page;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=0;
@@ -179,19 +195,60 @@ int main(int argc,char**argv){
  // The pixel page of the VA driver sits at the same offset: neither correction takes the other's page.
  assert(!MetalMPSPlugin::matches(pixel.data(),4096,0x2b000,true,false) && LocalVAPixel::match(mps.data(),4096,0x2b000,true,false)==-1);
  printf("PASS: %u MPS plug-in page cases: its own switch, validated executable pages only, mutation race, and independence from the VA switches\n",mpsCases);
+ // The page of the Metal driver that turns a thread-group memory size into its class. Its switch alone decides.
+ unsigned slmCases=0;
+ for(unsigned condition=0;condition<11;++condition){
+  auto data=slm;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=slmClassPages=0;
+  validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
+  writeOK=condition!=4;race=condition==5;slmClassReady=condition!=6;vaPageHookReady=condition!=9;
+  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=mpsPluginOffReady=condition!=10;
+  if(condition==7)data[64]^=1;
+  int valid=-1,t=-1,nx=-1;
+  const uint64_t offset=MetalSLMClass::FileOffset+(condition==8?4096:0);
+  vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
+  assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
+  const bool patched=condition==0 || condition==9 || condition==10;
+  assert(slmClassPages==(patched?1U:0U) && !mpsPluginPages && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
+  if(patched){auto expected=slm;expected[0xfcf]=7;expected[0xfdd]=7;assert(data==expected);
+   assert(!MetalSLMClass::matches(data.data(),4096,offset,true,false));}
+  else if(condition!=5 && condition!=7)assert(data==slm);
+  ++slmCases;
+ }
+ slmClassReady=mpsPluginOffReady=vaPageHookReady=vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=true;writeOK=true;race=false;validation=15;taint=nxValue=0;
+ // Two pages of the same image: neither correction takes the other's.
+ assert(!MetalMPSPlugin::matches(slm.data(),4096,MetalSLMClass::FileOffset,true,false) && !MetalSLMClass::matches(mps.data(),4096,MetalMPSPlugin::FileOffset,true,false));
+ printf("PASS: %u thread-group memory class page cases: its own switch, validated executable pages only, mutation race, and independence from the other switches\n",slmCases);
  if(haveMetal){
   // The real function, corrected and called: it returns false at once, without reading the bundle's Info.plist.
-  auto image=read(argv[6]);assert(image.size()>=MetalMPSPlugin::FileOffset+4096);
+  auto image=read(argv[7]);assert(image.size()>=MetalSLMClass::FileOffset+4096);
   auto code=(uint8_t*)mmap(nullptr,4096,7,MAP_ANON|MAP_PRIVATE,-1,0);assert(code!=MAP_FAILED);memcpy(code,image.data()+MetalMPSPlugin::FileOffset,4096);
   assert(MetalMPSPlugin::matches(code,4096,MetalMPSPlugin::FileOffset,true,false));MetalMPSPlugin::apply(code);
   unsigned changed=0;for(unsigned i=0;i<4096;++i)changed+=code[i]!=image[MetalMPSPlugin::FileOffset+i];assert(changed==3);
   assert(!((bool(*)())(code+MetalMPSPlugin::PatchOffset))());munmap(code,4096);
   puts("PASS: isMPSIntelPluginEnabled() of the real Metal driver returns false after the correction; three bytes change");
+  // The real class computation, before and after the correction, run on its own: the instructions of PatchIDData from the
+  // load of the requested size (0x38f78) to where every branch has stored the class (0x38ffe), between a frame and a return.
+  const uint8_t frame[]{0x55,0x48,0x89,0xe5,0x48,0x83,0xec,0x40},back[]{0x48,0x8b,0x45,0xd0,0xc9,0xc3};
+  const unsigned from=0xf78,to=0xffe;
+  const auto classOf=[&](const uint8_t *source,uint32_t bytes){
+   memcpy(code,frame,sizeof(frame));memcpy(code+sizeof(frame),source+from,to-from);memcpy(code+sizeof(frame)+to-from,back,sizeof(back));
+   uint8_t packet[0x90]{};memcpy(packet+0x88,&bytes,sizeof(bytes));
+   return unsigned(((uint64_t(*)(void *,void *))code)(nullptr,packet)>>16);
+  };
+  code=(uint8_t*)mmap(nullptr,4096,7,MAP_ANON|MAP_PRIVATE,-1,0);assert(code!=MAP_FAILED);
+  const uint8_t *native=image.data()+MetalSLMClass::FileOffset;std::vector<uint8_t> corrected(native,native+4096);
+  assert(MetalSLMClass::matches(corrected.data(),4096,MetalSLMClass::FileOffset,true,false));MetalSLMClass::apply(corrected.data());
+  changed=0;for(unsigned i=0;i<4096;++i)changed+=corrected[i]!=native[i];assert(changed==2);
+  const struct {uint32_t bytes;unsigned before,after;} sizes[]{{0,0,0},{1,1,1},{1024,1,1},{1025,2,2},{4096,3,3},{4097,4,4},{8192,4,4},
+   {8193,5,7},{8720,5,7},{16384,5,7},{16385,6,7},{32768,6,7},{32769,7,7},{65536,7,7}};
+  for(const auto &s:sizes)assert(classOf(native,s.bytes)==s.before && classOf(corrected.data(),s.bytes)==s.after);
+  munmap(code,4096);
+  puts("PASS: the real class computation of the Metal driver gives the 64 KB class to every size above 8 KB after the correction and the same classes as before up to 8 KB; two bytes change");
  }
  assert(!LocalVAVFE::matches(page.data(),4095,LocalVAVFE::FileOffset,true,false));
  printf("PASS: %u production callback cases: exact scope, both switches, validated pages, mutation race, permissions, NX and original outputs preserved\n",cases);
  if(!haveImage)return 0;
- auto image=read(argv[5]);
+ auto image=read(argv[6]);
  // The pixel-transfer pages of the real image: both match, and every patch lands where expected.
  for(unsigned i=0;i<LocalVAPixel::PageCount;++i) {
   const auto &p=LocalVAPixel::Pages[i];assert(p.offset+4096<=image.size());
@@ -256,6 +313,7 @@ int main(int argc,char**argv){
 with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
  p=Path(tmp);(p/'kern_local_va_vfe.hpp').write_text(header);(p/'kern_local_va_safe.hpp').write_text(safeHeader);(p/'kern_local_va_pixel.hpp').write_text(pixelHeader)
  (p/'kern_mtl_mps_page.hpp').write_text(mpsHeader);(p/'mps.bin').write_bytes(mps)
+ (p/'kern_mtl_slm_page.hpp').write_text(slmHeader);(p/'slm.bin').write_bytes(slm)
  (p/'page.bin').write_bytes(page);(p/'safe.bin').write_bytes(safe);(p/'pixel.bin').write_bytes(pixel);(p/'test.cpp').write_text(code)
  extra=[]
  if args.intel_gen12:
@@ -266,5 +324,5 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
   (p/'oracle.cpp').write_text(oracle.replace('#include "mos_utilities.h"',''))
   extra=['-DINTEL_GEN12_ORACLE','-I'+str(args.intel_gen12),str(p/'oracle.cpp')]
  subprocess.run(['clang++','-arch','x86_64','-std=c++17','-O1','-g','-I'+str(root/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')]+extra,check=True)
- subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin'),str(p/'pixel.bin'),str(p/'mps.bin'),
+ subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin'),str(p/'pixel.bin'),str(p/'mps.bin'),str(p/'slm.bin'),
   str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-'],check=True)
