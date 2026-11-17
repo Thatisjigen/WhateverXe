@@ -184,5 +184,6 @@
     "-wex-adln-ctx-invalidate"
   ],
   "-wex-no-reset-notify": [],
-  "-wex-no-reset-skip": []
+  "-wex-no-reset-skip": [],
+  "-wex-intel-mps-plugin": []
 }
