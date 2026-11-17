@@ -159,6 +159,7 @@
   "-wex-no-ccs-restore": [],
   "-wex-parallel-compute": [],
   "-wex-no-engine-wa": [],
+  "-wex-no-aux-inv": [],
   "-wex-no-hdr-modes": [
     "-wex-hdr-modes"
   ],

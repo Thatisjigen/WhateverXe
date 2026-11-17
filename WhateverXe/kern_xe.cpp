@@ -550,7 +550,7 @@ bool tglCCSAlignmentSerialize(void *,void *,OSSerialize *serializer) {
 // r137 one-time MMIO write, this follows the context that will render.
 uintptr_t tglCPSAllocate {},tglCPSCPUAddress {},tglCPSGPUAddress {};
 uintptr_t tglCPSRestoreOriginal {},tglCPSRestoreCaller {};
-static bool tglContextCacheEnabled;
+static bool tglContextCacheEnabled,tglContextAuxInvalidate;
 // Linux's render-engine workarounds for Xe-LP that the per-context batch (tglCPSPrepare) rewrites on every context
 // restore: the thread-dispatch ones on every family, the semaphore idle message where Linux applies it.
 static bool tglEngineWorkarounds,tglEngineSemaphoreIdle,tglEngineSemaphoreIdleCompute;
@@ -616,7 +616,7 @@ static bool tglCPSPrepare(void *owner) {
  }
  batch[words++]=0x05000000;
  bzero(cpu,extent);memcpy(cpu,batch,words*sizeof(uint32_t));
- if(tglContextCacheEnabled)TGLContextCache::batch(cpu);
+ if(tglContextCacheEnabled)TGLContextCache::batch(cpu,tglContextAuxInvalidate);
  // Publish CPU writes before first GPU use, independent of LLC policy.
  for(unsigned i=0;i<extent;i+=64)asm volatile("clflush (%0)"::"r"(cpu+i):"memory");
  asm volatile("mfence":::"memory");
@@ -14183,6 +14183,11 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				patcher.clearError();
 			}
 			tglContextCacheEnabled=contextCacheRequested && contextCacheOK;
+			// Render compression goes through a per-task aux table, and the donor asks the engine to drop its
+			// cached entries only after it has changed a mapping. Linux also asks on every context restore, in the
+			// batch this plugin already installs for Wa_18022495364. -wex-no-aux-inv leaves that out.
+			tglContextAuxInvalidate=tglContextCacheEnabled && !checkKernelArgument("-wex-no-aux-inv");
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLContextAuxInvalidateSelected",tglContextAuxInvalidate);
 			// Linux programs Wa_1409804808 and Wa_14010229206 on every integrated Xe-LP, and Wa_1607297627 on
 			// Tiger Lake, Rocket Lake and Alder Lake-P, which there covers Alder Lake-N and Raptor Lake-P. The donor
 			// leaves ROW_CHICKEN2 bit 8, ROW_CHICKEN4 bit 9 and RING_PSMI_CTL bits 7 and 12 clear.
