@@ -160,6 +160,13 @@
   "-wex-parallel-compute": [],
   "-wex-no-engine-wa": [],
   "-wex-no-aux-inv": [],
+  "-wex-wa-all": [],
+  "-wex-wa-l3-clock-gate": [],
+  "-wex-wa-l3-arbiter": [],
+  "-wex-wa-unit-clock-gates": [],
+  "-wex-wa-render-dop": [],
+  "-wex-wa-l3-hash": [],
+  "-wex-wa-dfr": [],
   "-wex-no-hdr-modes": [
     "-wex-hdr-modes"
   ],
