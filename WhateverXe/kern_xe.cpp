@@ -13501,6 +13501,29 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionDisabledReady",objectPreemptOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionEnabled",objectPreemptOn && ffDopOK);
 			patcher.clearError();
+			// Compute on the render engine (wrapTGLAcceleratorStart clears EnableMultiContext outside Tiger Lake):
+			// IntelTGLMemoryManager::newUnifiedAddressRangeAllocator reserves the upper canonical half of each
+			// task's address allocator only with multi-context on. Drop that test (`je` after the accelerator-flag
+			// test, two NOPs) so the reservation stays and the address layout is the one this donor has always
+			// run with; with multi-context on the patched code does what the native one does. Same site as
+			// -wex-tgl-nomc in SaqibAlMalik's tgl-stability branch, a port of NootedGreen's -ngreennomc.
+			if(xeProfile.family!=XELP::Family::Unknown && xeProfile.family!=XELP::Family::TigerLake &&
+			   !checkKernelArgument("-wex-parallel-compute")) {
+				const uint8_t rangeFind[] {0xF6,0x80,0x94,0x11,0x00,0x00,0x02,0x74,0x26,0x41,0xF6,0x46,0x24,0x02};
+				const uint8_t rangeReplace[] {0xF6,0x80,0x94,0x11,0x00,0x00,0x02,0x90,0x90,0x41,0xF6,0x46,0x24,0x02};
+				auto rangeSite=reinterpret_cast<uint8_t *>(address+0x4BF0A);
+				bool rangeOK=size>0x4BF18 &&
+					patcher.solveSymbol<mach_vm_address_t>(index,"__ZN21IntelTGLMemoryManager31newUnifiedAddressRangeAllocatorEP11IGAccelTask",address,size)==address+0x4BED8 &&
+					!memcmp(rangeSite,rangeFind,sizeof(rangeFind));
+				patcher.clearError();
+				if(rangeOK) {
+					KernelPatcher::LookupPatch patch {currentGraphics,rangeFind,rangeReplace,sizeof(rangeFind),1};
+					patcher.applyLookupPatch(&patch,rangeSite,sizeof(rangeFind)+1);
+					rangeOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(rangeSite,rangeReplace,sizeof(rangeReplace));
+					patcher.clearError();
+				}
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLSerialComputeRangeReady",rangeOK);
+			}
 			// r116: GT2 with 80 EU has ten enabled subslices, but the donor
 			// recognizes only twelve and leaves hwInfo+0x54 (URB banks) zero.
 			// The MTL allocator then underflows after reserving push constants.
@@ -16548,6 +16571,25 @@ bool XE::wrapTGLAcceleratorStart(IOService *that, IOService *provider) {
 	if (callbackXE->adlpDisplaySelected && !checkKernelArgument("-wex-va-renderer")) {
 		that->removeProperty("IOVARendererID");
 		SYSLOG("igfx", "IOVARendererID not advertised (default on this display; -wex-va-renderer keeps it)");
+	}
+	// The donor's personalities set EnableMultiContext=1 in the Development dictionary: Metal compute then gets
+	// its hardware contexts on a second render-class engine, the compute command streamer at 0x1A000, which shares
+	// the execution units and the reset domain with the render engine. Linux exposes no such engine on Xe-LP,
+	// Tiger Lake to Raptor Lake (i915 and xe: render, blitter and video engines only). On Raptor Lake-P the
+	// render engine sometimes stalled inside a context restore, between the ring context and the engine state,
+	// each time with compute work in flight on the second engine (a long kernel, a background Core ML inference,
+	// a video filter), and the window server froze until the hang check reset the GPU. Outside Tiger Lake, clear
+	// the key before the donor reads it (populateAccelConfig): its own code then creates compute contexts on the
+	// render engine and leaves the second engine disabled in RCU_MODE. -wex-parallel-compute keeps the
+	// personality's value.
+	if (callbackXE->xeProfile.family!=XELP::Family::Unknown && callbackXE->xeProfile.family!=XELP::Family::TigerLake &&
+	    !checkKernelArgument("-wex-parallel-compute")) {
+		auto development=OSDynamicCast(OSDictionary,that->getProperty("Development"));
+		auto copy=development ? OSDictionary::withDictionary(development) : nullptr;
+		auto off=OSNumber::withNumber(0ULL,32);
+		const bool serial=copy && off && copy->setObject("EnableMultiContext",off) && that->setProperty("Development",copy);
+		OSSafeReleaseNULL(off);OSSafeReleaseNULL(copy);
+		IORegistryEntry::getRegistryRoot()->setProperty("TGLSerialComputeSelected",serial);
 	}
 
 	if (!tglBlitScratchSize || (*tglBlitScratchSize!=0xD240 && *tglBlitScratchSize!=0xE000)) {

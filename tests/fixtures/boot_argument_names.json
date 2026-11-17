@@ -157,6 +157,7 @@
     "-wex-reset-recover"
   ],
   "-wex-no-ccs-restore": [],
+  "-wex-parallel-compute": [],
   "-wex-no-hdr-modes": [
     "-wex-hdr-modes"
   ],
