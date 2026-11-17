@@ -586,6 +586,20 @@ static bool tglContextCacheEnabled,tglContextAuxInvalidate;
 // Linux's render-engine workarounds for Xe-LP that the per-context batch (tglCPSPrepare) rewrites on every context
 // restore: the thread-dispatch ones on every family, the semaphore idle message where Linux applies it.
 static bool tglEngineWorkarounds,tglEngineSemaphoreIdle,tglEngineSemaphoreIdleCompute;
+// Opt-in hardware writes for narrowing down a fault outside Tiger Lake. The donor makes the first three on Tiger
+// Lake, behind workaround-mask bits it drops from PCI revision 4 on (processTGLAccelerator adds the bits back);
+// Linux makes the last three on every Xe-LP and the donor never does (tglExtraWorkaroundsApply).
+enum : uint32_t {
+ TGLExtraL3ClockGate=1,    // mask bit 46: SLICE_UNIT_LEVEL_CLKGATE (0x94D4) bits 16 and 17, L3 clock gating off
+ TGLExtraL3Arbiter=2,      // mask bit 39: 0xB000 bit 30
+ TGLExtraUnitClockGates=4, // mask bits 42, 45 and 48: 0x9528 bit 9, 0x2248 bit 11, 0x9434 bit 3
+ TGLExtraRenderDOP=8,      // Wa_14015795083: MISCCPCTL (0x9424) bit 1 clear, render DOP clock gating off
+ TGLExtraL3Hash=16,        // L3 hashing mask tuning: GARBCNTL (0xB004) bit 7 clear
+ TGLExtraDFR=32,           // Wa_14011059788: DFR_RATIO_EN_AND_CHICKEN (0x9550) bit 9
+ TGLExtraAll=63
+};
+static uint32_t tglExtraWorkarounds;
+static bool tglExtraWorkaroundsReport;
 static uintptr_t tglContextCacheInitOriginal;
 static bool tglAlderLakeNGoldenRestore(void *context);
 static void adlnCaptureOwnedGolden(void *context);
@@ -14165,6 +14179,19 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				uint64_t mask=0x1F8C5FEC00ULL|1ULL<<23|1ULL<<38|1ULL<<47;
 				if(xeProfile.family!=XELP::Family::AlderLakeS && xeProfile.family!=XELP::Family::RaptorLakeS)
 					mask|=1ULL<<43|(checkKernelArgument("-wex-parallel-compute")?1ULL<<44:0);
+				// The other writes the donor makes on Tiger Lake only, and three of Linux's that it never makes, are
+				// off unless asked for: -wex-wa-all for every one, or one argument each, to tell which matters.
+				tglExtraWorkarounds=(checkKernelArgument("-wex-wa-all")?TGLExtraAll:0)|
+					(checkKernelArgument("-wex-wa-l3-clock-gate")?TGLExtraL3ClockGate:0)|
+					(checkKernelArgument("-wex-wa-l3-arbiter")?TGLExtraL3Arbiter:0)|
+					(checkKernelArgument("-wex-wa-unit-clock-gates")?TGLExtraUnitClockGates:0)|
+					(checkKernelArgument("-wex-wa-render-dop")?TGLExtraRenderDOP:0)|
+					(checkKernelArgument("-wex-wa-l3-hash")?TGLExtraL3Hash:0)|
+					(checkKernelArgument("-wex-wa-dfr")?TGLExtraDFR:0);
+				if(tglExtraWorkarounds&TGLExtraL3ClockGate)mask|=1ULL<<46;
+				if(tglExtraWorkarounds&TGLExtraL3Arbiter)mask|=1ULL<<39;
+				if(tglExtraWorkarounds&TGLExtraUnitClockGates)mask|=1ULL<<42|1ULL<<45|1ULL<<48;
+				tglExtraWorkaroundsReport=true;
 				// movabs $0x1F8C5FEC00,%rcx; cmovb %r11,%rcx
 				const uint8_t maskFind[] {0x48,0xB9,0x00,0xEC,0x5F,0x8C,0x1F,0x00,0x00,0x00,0x49,0x0F,0x42,0xCB};
 				uint8_t maskReplace[sizeof(maskFind)];
@@ -17857,6 +17884,33 @@ bool XE::wrapAlderLakeNNativeIRQ(IOService *that) {
 	return result;
 }
 
+// The opt-in writes that have no site in the donor (tglExtraWorkarounds), made as Linux makes them, read, change one
+// bit, write, once its engine start has returned and with its forcewake. Engine start runs again at wake.
+// TGLExtraWorkarounds reports the selection and then the registers as engine start left them: 0x94D4, 0xB000,
+// 0x9528, 0x2248 and 0x9434, which the mask bits govern, and 0x9424, 0xB004 and 0x9550 before and after the write.
+// It is published without a selection too, so that a boot with none of the arguments gives the values to compare.
+static void tglExtraWorkaroundsApply(void *accelerator) {
+ auto accel=static_cast<uint8_t *>(accelerator);
+ auto mmio=*reinterpret_cast<volatile uint8_t **>(accel+0x1240);
+ if(!tglExtraWorkaroundsReport || !gpuResetForceWake || !mmio)return;
+ auto reg=[mmio](uint32_t offset)->volatile uint32_t & {return *reinterpret_cast<volatile uint32_t *>(mmio+offset);};
+ uint32_t v[12] {tglExtraWorkarounds};
+ gpuResetForceWake(accel,true,7);
+ v[1]=reg(0x94D4);v[2]=reg(0xB000);v[3]=reg(0x9528);v[4]=reg(0x2248);v[5]=reg(0x9434);
+ v[6]=reg(0x9424);
+ if((tglExtraWorkarounds&TGLExtraRenderDOP) && v[6]!=UINT32_MAX)reg(0x9424)=v[6]&~2U;
+ v[7]=reg(0x9424);
+ v[8]=reg(0xB004);
+ if((tglExtraWorkarounds&TGLExtraL3Hash) && v[8]!=UINT32_MAX)reg(0xB004)=v[8]&~0x80U;
+ v[9]=reg(0xB004);
+ // Multicast: the read comes from the instance the steering register selects, the write goes to all of them.
+ v[10]=reg(0x9550);
+ if((tglExtraWorkarounds&TGLExtraDFR) && v[10]!=UINT32_MAX)reg(0x9550)=v[10]|0x200U;
+ v[11]=reg(0x9550);
+ gpuResetForceWake(accel,false,7);
+ IORegistryEntry::getRegistryRoot()->setProperty("TGLExtraWorkarounds",v,sizeof(v));
+}
+
 bool XE::wrapTGLAcceleratorEngine(IOService *that) {
  if (callbackXE->adlnDetected) {
   auto a=reinterpret_cast<uint8_t *>(that);
@@ -17925,6 +17979,7 @@ bool XE::wrapTGLAcceleratorEngine(IOService *that) {
  auto irq=tglFBIRQBegin(3,callbackXE->tglObservationController,0,reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
 	tglObserveAccelerator(that, 6, false, 0, 0);
 	const bool result = FunctionCast(wrapTGLAcceleratorEngine, callbackXE->orgTGLAcceleratorEngine)(that);
+	if (result) tglExtraWorkaroundsApply(that);
 	tglObserveAccelerator(that, 6, true, result, 0);
 	tglFBIRQEnd(irq,result);
 	if (tglHost.owner==that) tglHostPublish();
