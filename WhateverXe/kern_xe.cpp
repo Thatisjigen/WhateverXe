@@ -13031,6 +13031,64 @@ bool XE::processAlderLakeNTaskBoundary(KernelPatcher &patcher, size_t index, mac
 	return ready;
 }
 
+// Hang-report forcewake balance. IntelAccelerator::gatherKeyRingData(IGHwCsType)
+// (donor 0x2DBAC) takes a per-engine forcewake, gathers registers, then releases
+// "ebx" at its common exit (0x2E42D: SafeForceWake(false,ebx)). ebx defaults to 4
+// (GT, A188) and every case sets and acquires its own mask, except engine type 1:
+// its jump-table entry (0x2E448[1]) lands on the exit (0x2E3D1) without acquiring.
+// encodeDebugInfo and doHangAnalysis gather every engine, so each GPU hang releases
+// the GT forcewake twice without a get. The GT count goes negative (-2 per hang,
+// measured with the forcewake probe), SafeForceWake never sees 1 -> 0 again, the
+// GT request stays asserted and RC6 residency drops to 0% until reboot (GPU Active
+// 100%, sluggish desktop after any recovered hang, 9320 and 9720). Take the GT
+// wake the donor will release for type 1. Opt-out: -wex-tgl-no-hangwake.
+namespace {
+uintptr_t tglHangWakeOriginal {};
+using TGLSafeForceWake=void (*)(void *,bool,uint32_t);
+TGLSafeForceWake tglHangWakeGet {};
+uint32_t tglHangWakeCounts[2] {}; // calls, type-1 balanced
+bool tglHangWakeGather(void *accel,uint32_t type) {
+ __atomic_fetch_add(&tglHangWakeCounts[0],1,__ATOMIC_RELAXED);
+ if (type==1 && accel && tglHangWakeGet) {
+  tglHangWakeGet(accel,true,4);
+  __atomic_fetch_add(&tglHangWakeCounts[1],1,__ATOMIC_RELAXED);
+ }
+ return FunctionCast(tglHangWakeGather,tglHangWakeOriginal)(accel,type);
+}
+bool tglHangWakeSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[3] {1,__atomic_load_n(&tglHangWakeCounts[0],__ATOMIC_RELAXED),__atomic_load_n(&tglHangWakeCounts[1],__ATOMIC_RELAXED)};
+ auto data=OSData::withBytes(out,sizeof(out));if (!data) return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
+}
+static void tglInstallHangWakeBalance(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ auto root=IORegistryEntry::getRegistryRoot();
+ if (checkKernelArgument("-wex-tgl-no-hangwake")) { root->setProperty("TGLHangWakeBalanceReady",false);return; }
+ const char *symbol="__ZN16IntelAccelerator17gatherKeyRingDataE10IGHwCsType";
+ const auto fn=patcher.solveSymbol<mach_vm_address_t>(index,symbol,address,size);patcher.clearError();
+ const auto wake=patcher.solveSymbol<mach_vm_address_t>(index,"__ZN16IntelAccelerator13SafeForceWakeEbj",address,size);patcher.clearError();
+ // mov ebx,4 ; lea rcx,[rip+0x848] (jump table 0x2E448)
+ static const uint8_t mask[] {0xBB,0x04,0x00,0x00,0x00,0x48,0x8D,0x0D,0x48,0x08,0x00,0x00};
+ // exit: mov rdi,r12 ; xor esi,esi ; mov edx,ebx ; call SafeForceWake
+ static const uint8_t exit[] {0x4C,0x89,0xE7,0x31,0xF6,0x89,0xDA,0xE8};
+ bool ready=size>0x2E460 && fn==address+0x2DBAC && wake==address+0x28C2A &&
+  !memcmp(reinterpret_cast<void *>(address+0x2DBF4),mask,sizeof(mask)) &&
+  !memcmp(reinterpret_cast<void *>(address+0x2E42A),exit,sizeof(exit));
+ if (ready) {
+  int32_t entry1;memcpy(&entry1,reinterpret_cast<void *>(address+0x2E448+4),sizeof(entry1));
+  ready=entry1==static_cast<int32_t>(0x2E3D1-0x2E448);
+ }
+ if (ready) {
+  tglHangWakeGet=reinterpret_cast<TGLSafeForceWake>(wake);
+  KernelPatcher::RouteRequest route(symbol,tglHangWakeGather,tglHangWakeOriginal);
+  ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+  if (!ready) tglHangWakeGet=nullptr;
+ }
+ root->setProperty("TGLHangWakeBalanceReady",ready);
+ if (ready) if (auto live=OSSerializer::forTarget(nullptr,tglHangWakeSerialize)) {
+  root->setProperty("TGLHangWakeBalanceLive",live);live->release();
+ }
+}
 // -wex-reset-trace: record the donor's GPU hang recovery. Each entry is
 // {mach time, event, result, object number, arg, 16 registers}; events are enter/exit
 // pairs of the channel restart, engine reset, scheduler reset/resume and
@@ -14035,6 +14093,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
  }
  const bool surfaceABIReady=tglInstallSonomaSurfaceABI(patcher,index,address,size,false);
  IORegistryEntry::getRegistryRoot()->setProperty("TGLSonomaSurfaceAcceleratorReady",surfaceABIReady);
+ tglInstallHangWakeBalance(patcher,index,address,size);
  if(adlnDetected && (checkKernelArgument("-wex-adln-kernel-ctx") || adlnNativeRCSProfileRequested))adlnPrepareRCSProfile(patcher,index,address,size);
  if(checkKernelArgument("-wex-reset-trace") || !checkKernelArgument("-wex-no-reset-recover"))
   gpuResetTraceInstall(patcher,index,address,size);
