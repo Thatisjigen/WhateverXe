@@ -19,6 +19,9 @@
 // (kern_mtl_simd_page.hpp); -wex-simd8-dispatch keeps the driver's choice.
 // And compute pipelines report a power of two as their maximum thread count (kern_mtl_maxthreads_page.hpp), on Tahoe for
 // every GPU this kext drives; -wex-native-max-threads keeps the driver's value.
+// And the Intel graphics compiler that the adapter loads gives the carry of a 64-bit addition a GRF-aligned destination
+// (kern_igc_addc_page.hpp), with the adapter's check of the compiler's file accepting the corrected file too
+// (kern_xe_adapter_hash_page.hpp), on Tahoe for every GPU this kext drives; -wex-native-addc keeps both as shipped.
 #pragma once
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
@@ -31,9 +34,11 @@
 #include "kern_xe_adapter_page.hpp"
 #include "kern_mtl_simd_page.hpp"
 #include "kern_mtl_maxthreads_page.hpp"
+#include "kern_igc_addc_page.hpp"
+#include "kern_xe_adapter_hash_page.hpp"
 static mach_vm_address_t vaOriginalPage;
-static bool vaPageHookReady,vaGen12Enabled,vaSafeEnabled,vaPixelEnabled,mpsPluginOffReady,slmClassReady,computeLimitReady,simdChoiceReady,pow2MaxReady;
-static uint64_t vaVFEPages,vaL3Pages,vaSafePages,vaPixelPages,mpsPluginPages,slmClassPages,computeLimitPages,simdChoicePages,pow2MaxPages;
+static bool vaPageHookReady,vaGen12Enabled,vaSafeEnabled,vaPixelEnabled,mpsPluginOffReady,slmClassReady,computeLimitReady,simdChoiceReady,pow2MaxReady,addcAlignReady;
+static uint64_t vaVFEPages,vaL3Pages,vaSafePages,vaPixelPages,mpsPluginPages,slmClassPages,computeLimitPages,simdChoicePages,pow2MaxPages,addcAlignPages,adapterHashPages;
 using VAPageValidator=void (*)(vnode_t,memory_object_t,memory_object_offset_t,const void *,int *,int *,int *);
 // Keep local hardware selection separate from servicing-build metadata.
 static bool vaPagesScope(const XELP::Profile &profile,XELP::OS os) {
@@ -67,6 +72,11 @@ static bool pow2MaxSerialize(void *,void *,OSSerialize *serial) {
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serial);data->release();return ok;
 }
+static bool addcAlignSerialize(void *,void *,OSSerialize *serial) {
+ const uint64_t q[]{1,addcAlignReady,__atomic_load_n(&addcAlignPages,__ATOMIC_ACQUIRE),__atomic_load_n(&adapterHashPages,__ATOMIC_ACQUIRE)};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serial);data->release();return ok;
+}
 static bool vaPagesSerialize(void *,void *,OSSerialize *serial) {
  const uint64_t q[]{1,vaPageHookReady && vaGen12Enabled,vaPageHookReady && vaSafeEnabled,
   __atomic_load_n(&vaVFEPages,__ATOMIC_ACQUIRE),__atomic_load_n(&vaL3Pages,__ATOMIC_ACQUIRE),
@@ -85,6 +95,9 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
  const bool limitPage=computeLimitReady && accepted && XeAdapterComputeLimit::matches(data,PAGE_SIZE,offset,true,false);
  const bool simdPage=simdChoiceReady && accepted && MetalSIMDChoice::matches(data,PAGE_SIZE,offset,true,false);
  const bool maxPage=pow2MaxReady && accepted && MetalPow2MaxThreads::matches(data,PAGE_SIZE,offset,true,false);
+ const bool addcPage=addcAlignReady && accepted && IGCAddcAlign::matches(data,PAGE_SIZE,offset,true,false);
+ const bool hashCallPage=addcAlignReady && accepted && XeAdapterBackendHash::matchesCall(data,PAGE_SIZE,offset,true,false);
+ const bool hashHelperPage=addcAlignReady && accepted && XeAdapterBackendHash::matchesHelper(data,PAGE_SIZE,offset,true,false);
  const bool safePage=vaPageHookReady && vaSafeEnabled && validated && tainted && nx &&
   LocalVASafe::match(data,PAGE_SIZE,offset,*validated==0xf,*tainted)==0;
  const int pixelPage=vaPageHookReady && vaPixelEnabled && accepted ?
@@ -92,19 +105,26 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
  const bool vaPage=vaPageHookReady && (safePage || pixelPage>=0 || (accepted && vaGen12Enabled &&
      (LocalVAVFE::matches(data,PAGE_SIZE,offset,true,false) ||
       LocalVAL3::matches(data,PAGE_SIZE,offset,true,false))));
- if(!mpsPage && !slmPage && !limitPage && !simdPage && !maxPage && !vaPage)return;
+ if(!mpsPage && !slmPage && !limitPage && !hashCallPage && !hashHelperPage && !simdPage && !maxPage && !addcPage && !vaPage)return;
  if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return;
  // Readers may race: recheck the complete page under the existing write lock.
  if(mpsPage && MetalMPSPlugin::matches(data,PAGE_SIZE,offset,true,false)) {
   MetalMPSPlugin::apply(const_cast<void *>(data));__atomic_fetch_add(&mpsPluginPages,1ULL,__ATOMIC_RELEASE);
  } else if(slmPage && MetalSLMClass::matches(data,PAGE_SIZE,offset,true,false)) {
   MetalSLMClass::apply(const_cast<void *>(data));__atomic_fetch_add(&slmClassPages,1ULL,__ATOMIC_RELEASE);
- } else if(limitPage && XeAdapterComputeLimit::matches(data,PAGE_SIZE,offset,true,false)) {
-  XeAdapterComputeLimit::apply(const_cast<void *>(data));__atomic_fetch_add(&computeLimitPages,1ULL,__ATOMIC_RELEASE);
+ } else if((limitPage || hashCallPage) && XeAdapterComputeLimit::matches(data,PAGE_SIZE,offset,true,false) &&
+    XeAdapterBackendHash::matchesCall(data,PAGE_SIZE,offset,true,false)) {
+  // The adapter's first page carries two corrections, each under its own switch.
+  if(limitPage){XeAdapterComputeLimit::apply(const_cast<void *>(data));__atomic_fetch_add(&computeLimitPages,1ULL,__ATOMIC_RELEASE);}
+  if(hashCallPage){XeAdapterBackendHash::applyCall(const_cast<void *>(data));__atomic_fetch_add(&adapterHashPages,1ULL,__ATOMIC_RELEASE);}
+ } else if(hashHelperPage && XeAdapterBackendHash::matchesHelper(data,PAGE_SIZE,offset,true,false)) {
+  XeAdapterBackendHash::applyHelper(const_cast<void *>(data));__atomic_fetch_add(&adapterHashPages,1ULL,__ATOMIC_RELEASE);
  } else if(simdPage && MetalSIMDChoice::matches(data,PAGE_SIZE,offset,true,false)) {
   MetalSIMDChoice::apply(const_cast<void *>(data));__atomic_fetch_add(&simdChoicePages,1ULL,__ATOMIC_RELEASE);
  } else if(maxPage && MetalPow2MaxThreads::matches(data,PAGE_SIZE,offset,true,false)) {
   MetalPow2MaxThreads::apply(const_cast<void *>(data));__atomic_fetch_add(&pow2MaxPages,1ULL,__ATOMIC_RELEASE);
+ } else if(addcPage && IGCAddcAlign::matches(data,PAGE_SIZE,offset,true,false)) {
+  IGCAddcAlign::apply(const_cast<void *>(data));__atomic_fetch_add(&addcAlignPages,1ULL,__ATOMIC_RELEASE);
  } else if(!vaPage) {
  } else if(safePage && LocalVASafe::match(data,PAGE_SIZE,offset,*validated==0xf,*tainted)==0) {
   // Only the first list; the others carry the ARGB conversions the window server needs.
@@ -122,7 +142,7 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
 static_assert(__is_same(decltype(&vaValidatePage),VAPageValidator),"Tahoe validator ABI");
 static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::Profile &profile,bool renderer,bool intelMPSPlugin=false,
  bool nativeSLMClass=false,bool adapterRefusesLimit=false,bool driverSIMD8=false,
- bool nativeMaxThreads=false) {
+ bool nativeMaxThreads=false,bool nativeAddc=false) {
  const bool scope=gpu && vaPagesScope(profile,XELP::kernelOS(version));
  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=scope && renderer;
  const bool mpsPluginOff=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !intelMPSPlugin;
@@ -134,9 +154,11 @@ static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::P
  const bool simdChoice=scope && !driverSIMD8;
  // The driver file is the same for every GPU the Graphics package serves: the MPS plug-in's scope.
  const bool pow2Max=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !nativeMaxThreads;
- vaPageHookReady=mpsPluginOffReady=slmClassReady=computeLimitReady=simdChoiceReady=pow2MaxReady=false;
+ // The compiler is the same file for every GPU the Graphics package serves, like the adapter.
+ const bool addcAlign=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !nativeAddc;
+ vaPageHookReady=mpsPluginOffReady=slmClassReady=computeLimitReady=simdChoiceReady=pow2MaxReady=addcAlignReady=false;
  // One route serves every page correction: a second one over the same function is not safe.
- if((vaGen12Enabled || vaSafeEnabled || vaPixelEnabled || mpsPluginOff || slmClass || computeLimit || simdChoice || pow2Max) &&
+ if((vaGen12Enabled || vaSafeEnabled || vaPixelEnabled || mpsPluginOff || slmClass || computeLimit || simdChoice || pow2Max || addcAlign) &&
     getKernelVersion()==KernelVersion::Tahoe) {
   KernelPatcher::RouteRequest route("_cs_validate_page",vaValidatePage,vaOriginalPage);
   const bool routed=patcher.routeMultipleLong(KernelPatcher::KernelID,&route,1);patcher.clearError();
@@ -146,6 +168,7 @@ static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::P
   computeLimitReady=routed && computeLimit;
   simdChoiceReady=routed && simdChoice;
   pow2MaxReady=routed && pow2Max;
+  addcAlignReady=routed && addcAlign;
  }
  auto root=IORegistryEntry::getRegistryRoot();
  root->setProperty("WEXVAPagesScope",scope);
@@ -168,4 +191,8 @@ static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::P
  // Whether compute pipelines report a power of two as their maximum thread count, and how many times that page was corrected.
  root->setProperty("WEXMetalPow2MaxThreadsReady",pow2MaxReady);
  if(auto live=OSSerializer::forTarget(nullptr,pow2MaxSerialize)){root->setProperty("WEXMetalPow2MaxThreadsLive",live);live->release();}
+ // Whether the compiler gives the carry of a 64-bit addition a GRF-aligned destination, and how many times its page and
+ // the adapter's two pages of the compiler's file check were corrected.
+ root->setProperty("WEXIGCAddcAlignReady",addcAlignReady);
+ if(auto live=OSSerializer::forTarget(nullptr,addcAlignSerialize)){root->setProperty("WEXIGCAddcAlignLive",live);live->release();}
 }

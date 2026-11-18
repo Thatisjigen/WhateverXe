@@ -197,5 +197,6 @@
   "-wex-no-slm-64k": [],
   "-wex-no-compute-max-threads": [],
   "-wex-simd8-dispatch": [],
-  "-wex-native-max-threads": []
+  "-wex-native-max-threads": [],
+  "-wex-native-addc": []
 }
