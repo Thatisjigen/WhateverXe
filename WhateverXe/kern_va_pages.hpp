@@ -22,6 +22,8 @@
 // And the Intel graphics compiler that the adapter loads gives the carry of a 64-bit addition a GRF-aligned destination
 // (kern_igc_addc_page.hpp), with the adapter's check of the compiler's file accepting the corrected file too
 // (kern_xe_adapter_hash_page.hpp), on Tahoe for every GPU this kext drives; -wex-native-addc keeps both as shipped.
+// And a new compute context of the Metal driver starts with its pending-barrier flag clear (kern_mtl_barrier_page.hpp),
+// on Tahoe for every GPU this kext drives; -wex-native-barrier-flag keeps the driver's constructor.
 #pragma once
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
@@ -36,9 +38,10 @@
 #include "kern_mtl_maxthreads_page.hpp"
 #include "kern_igc_addc_page.hpp"
 #include "kern_xe_adapter_hash_page.hpp"
+#include "kern_mtl_barrier_page.hpp"
 static mach_vm_address_t vaOriginalPage;
-static bool vaPageHookReady,vaGen12Enabled,vaSafeEnabled,vaPixelEnabled,mpsPluginOffReady,slmClassReady,computeLimitReady,simdChoiceReady,pow2MaxReady,addcAlignReady;
-static uint64_t vaVFEPages,vaL3Pages,vaSafePages,vaPixelPages,mpsPluginPages,slmClassPages,computeLimitPages,simdChoicePages,pow2MaxPages,addcAlignPages,adapterHashPages;
+static bool vaPageHookReady,vaGen12Enabled,vaSafeEnabled,vaPixelEnabled,mpsPluginOffReady,slmClassReady,computeLimitReady,simdChoiceReady,pow2MaxReady,addcAlignReady,barrierFlagReady;
+static uint64_t vaVFEPages,vaL3Pages,vaSafePages,vaPixelPages,mpsPluginPages,slmClassPages,computeLimitPages,simdChoicePages,pow2MaxPages,addcAlignPages,adapterHashPages,barrierFlagPages;
 using VAPageValidator=void (*)(vnode_t,memory_object_t,memory_object_offset_t,const void *,int *,int *,int *);
 // Keep local hardware selection separate from servicing-build metadata.
 static bool vaPagesScope(const XELP::Profile &profile,XELP::OS os) {
@@ -77,6 +80,11 @@ static bool addcAlignSerialize(void *,void *,OSSerialize *serial) {
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serial);data->release();return ok;
 }
+static bool barrierFlagSerialize(void *,void *,OSSerialize *serial) {
+ const uint64_t q[]{1,barrierFlagReady,__atomic_load_n(&barrierFlagPages,__ATOMIC_ACQUIRE)};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serial);data->release();return ok;
+}
 static bool vaPagesSerialize(void *,void *,OSSerialize *serial) {
  const uint64_t q[]{1,vaPageHookReady && vaGen12Enabled,vaPageHookReady && vaSafeEnabled,
   __atomic_load_n(&vaVFEPages,__ATOMIC_ACQUIRE),__atomic_load_n(&vaL3Pages,__ATOMIC_ACQUIRE),
@@ -98,6 +106,7 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
  const bool addcPage=addcAlignReady && accepted && IGCAddcAlign::matches(data,PAGE_SIZE,offset,true,false);
  const bool hashCallPage=addcAlignReady && accepted && XeAdapterBackendHash::matchesCall(data,PAGE_SIZE,offset,true,false);
  const bool hashHelperPage=addcAlignReady && accepted && XeAdapterBackendHash::matchesHelper(data,PAGE_SIZE,offset,true,false);
+ const bool barrierPage=barrierFlagReady && accepted && MetalPendingBarrier::matches(data,PAGE_SIZE,offset,true,false);
  const bool safePage=vaPageHookReady && vaSafeEnabled && validated && tainted && nx &&
   LocalVASafe::match(data,PAGE_SIZE,offset,*validated==0xf,*tainted)==0;
  const int pixelPage=vaPageHookReady && vaPixelEnabled && accepted ?
@@ -105,7 +114,7 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
  const bool vaPage=vaPageHookReady && (safePage || pixelPage>=0 || (accepted && vaGen12Enabled &&
      (LocalVAVFE::matches(data,PAGE_SIZE,offset,true,false) ||
       LocalVAL3::matches(data,PAGE_SIZE,offset,true,false))));
- if(!mpsPage && !slmPage && !limitPage && !hashCallPage && !hashHelperPage && !simdPage && !maxPage && !addcPage && !vaPage)return;
+ if(!mpsPage && !slmPage && !limitPage && !hashCallPage && !hashHelperPage && !simdPage && !maxPage && !addcPage && !barrierPage && !vaPage)return;
  if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return;
  // Readers may race: recheck the complete page under the existing write lock.
  if(mpsPage && MetalMPSPlugin::matches(data,PAGE_SIZE,offset,true,false)) {
@@ -119,8 +128,12 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
   if(hashCallPage){XeAdapterBackendHash::applyCall(const_cast<void *>(data));__atomic_fetch_add(&adapterHashPages,1ULL,__ATOMIC_RELEASE);}
  } else if(hashHelperPage && XeAdapterBackendHash::matchesHelper(data,PAGE_SIZE,offset,true,false)) {
   XeAdapterBackendHash::applyHelper(const_cast<void *>(data));__atomic_fetch_add(&adapterHashPages,1ULL,__ATOMIC_RELEASE);
- } else if(simdPage && MetalSIMDChoice::matches(data,PAGE_SIZE,offset,true,false)) {
-  MetalSIMDChoice::apply(const_cast<void *>(data));__atomic_fetch_add(&simdChoicePages,1ULL,__ATOMIC_RELEASE);
+ } else if((simdPage || barrierPage) && MetalSIMDChoice::matches(data,PAGE_SIZE,offset,true,false) &&
+    MetalPendingBarrier::matches(data,PAGE_SIZE,offset,true,false)) {
+  // The driver's page with ChalExecuteKernel's binary choice and ChalContext's constructor: two corrections, each under
+  // its own switch.
+  if(simdPage){MetalSIMDChoice::apply(const_cast<void *>(data));__atomic_fetch_add(&simdChoicePages,1ULL,__ATOMIC_RELEASE);}
+  if(barrierPage){MetalPendingBarrier::apply(const_cast<void *>(data));__atomic_fetch_add(&barrierFlagPages,1ULL,__ATOMIC_RELEASE);}
  } else if(maxPage && MetalPow2MaxThreads::matches(data,PAGE_SIZE,offset,true,false)) {
   MetalPow2MaxThreads::apply(const_cast<void *>(data));__atomic_fetch_add(&pow2MaxPages,1ULL,__ATOMIC_RELEASE);
  } else if(addcPage && IGCAddcAlign::matches(data,PAGE_SIZE,offset,true,false)) {
@@ -142,7 +155,7 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
 static_assert(__is_same(decltype(&vaValidatePage),VAPageValidator),"Tahoe validator ABI");
 static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::Profile &profile,bool renderer,bool intelMPSPlugin=false,
  bool nativeSLMClass=false,bool adapterRefusesLimit=false,bool driverSIMD8=false,
- bool nativeMaxThreads=false,bool nativeAddc=false) {
+ bool nativeMaxThreads=false,bool nativeAddc=false,bool nativeBarrierFlag=false) {
  const bool scope=gpu && vaPagesScope(profile,XELP::kernelOS(version));
  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=scope && renderer;
  const bool mpsPluginOff=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !intelMPSPlugin;
@@ -156,9 +169,12 @@ static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::P
  const bool pow2Max=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !nativeMaxThreads;
  // The compiler is the same file for every GPU the Graphics package serves, like the adapter.
  const bool addcAlign=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !nativeAddc;
- vaPageHookReady=mpsPluginOffReady=slmClassReady=computeLimitReady=simdChoiceReady=pow2MaxReady=addcAlignReady=false;
+ // The driver file is the same for every GPU the Graphics package serves: the MPS plug-in's scope.
+ const bool barrierFlag=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !nativeBarrierFlag;
+ vaPageHookReady=mpsPluginOffReady=slmClassReady=computeLimitReady=simdChoiceReady=pow2MaxReady=addcAlignReady=barrierFlagReady=false;
  // One route serves every page correction: a second one over the same function is not safe.
- if((vaGen12Enabled || vaSafeEnabled || vaPixelEnabled || mpsPluginOff || slmClass || computeLimit || simdChoice || pow2Max || addcAlign) &&
+ if((vaGen12Enabled || vaSafeEnabled || vaPixelEnabled || mpsPluginOff || slmClass || computeLimit || simdChoice || pow2Max || addcAlign ||
+     barrierFlag) &&
     getKernelVersion()==KernelVersion::Tahoe) {
   KernelPatcher::RouteRequest route("_cs_validate_page",vaValidatePage,vaOriginalPage);
   const bool routed=patcher.routeMultipleLong(KernelPatcher::KernelID,&route,1);patcher.clearError();
@@ -169,6 +185,7 @@ static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::P
   simdChoiceReady=routed && simdChoice;
   pow2MaxReady=routed && pow2Max;
   addcAlignReady=routed && addcAlign;
+  barrierFlagReady=routed && barrierFlag;
  }
  auto root=IORegistryEntry::getRegistryRoot();
  root->setProperty("WEXVAPagesScope",scope);
@@ -195,4 +212,7 @@ static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::P
  // the adapter's two pages of the compiler's file check were corrected.
  root->setProperty("WEXIGCAddcAlignReady",addcAlignReady);
  if(auto live=OSSerializer::forTarget(nullptr,addcAlignSerialize)){root->setProperty("WEXIGCAddcAlignLive",live);live->release();}
+ // Whether a new compute context starts with its pending-barrier flag clear, and how many times that page was corrected.
+ root->setProperty("WEXMetalBarrierFlagReady",barrierFlagReady);
+ if(auto live=OSSerializer::forTarget(nullptr,barrierFlagSerialize)){root->setProperty("WEXMetalBarrierFlagLive",live);live->release();}
 }

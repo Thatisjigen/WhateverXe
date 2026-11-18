@@ -198,5 +198,6 @@
   "-wex-no-compute-max-threads": [],
   "-wex-simd8-dispatch": [],
   "-wex-native-max-threads": [],
-  "-wex-native-addc": []
+  "-wex-native-addc": [],
+  "-wex-native-barrier-flag": []
 }
