@@ -96,6 +96,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - TahoeのRaptor Lake-P `8086:A7A0` リビジョン04では既定で有効（`-wex-simd8-dispatch` で無効化）: 小さなMetalコンピュートディスパッチでは、カーネルのSIMD8バイナリの代わりにSIMD16バイナリを実行します。SIMD8バイナリではMetal Performance Shadersの畳み込みが誤った結果になっていました。状態は `WEXMetalSIMDChoiceReady` と `WEXMetalSIMDChoiceLive` で確認できます。
 - Tahoeでは既定で有効（`-wex-native-max-threads` で無効化）: コンピュートパイプラインが報告する最大スレッド数を2のべき乗にします（896の代わりに512、448の代わりに256）。他のGPU向けに書かれたカーネルはこれを前提としています。状態は `WEXMetalPow2MaxThreadsReady` と `WEXMetalPow2MaxThreadsLive` で確認できます。
 - Tahoeでは既定で有効（`-wex-native-addc` で無効化）: Xeコンパイラアダプタが読み込むIntelグラフィックスコンパイラが、64ビット加算の桁上がりを正しく読み取ります。これにより、Metal Performance ShadersとMPSGraphの畳み込みでタップが欠ける問題が直ります。状態は `WEXIGCAddcAlignReady` と `WEXIGCAddcAlignLive` で確認できます。
+- Tahoeでは既定で有効（`-wex-native-barrier-flag` で無効化）: 新しいMetalコンピュートコンテキストは保留中のバリアなしで始まり、エンコーダの最初のディスパッチも他と同じく同期されます。以前はMPSGraphのネットワークがランダムに誤った値を返していました。状態は `WEXMetalBarrierFlagReady` と `WEXMetalBarrierFlagLive` で確認できます。
 
 ## 動作確認済みの機能と既知の問題
 
