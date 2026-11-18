@@ -7,7 +7,8 @@ image as argument the real pages are checked and the packet generator is replaye
 from pathlib import Path
 import argparse,hashlib,re,subprocess,tempfile
 root=Path(__file__).resolve().parents[1]
-ap=argparse.ArgumentParser();ap.add_argument('donor',nargs='?',type=Path);ap.add_argument('--intel-gen12',type=Path);ap.add_argument('--metal',type=Path);args=ap.parse_args()
+ap=argparse.ArgumentParser();ap.add_argument('donor',nargs='?',type=Path);ap.add_argument('--intel-gen12',type=Path);ap.add_argument('--metal',type=Path)
+ap.add_argument('--adapter',type=Path);args=ap.parse_args()
 s=(root/'WhateverXe/kern_va_pages.hpp').read_text()
 production=s[s.index('static mach_vm_address_t vaOriginalPage;'):]
 header=(root/'WhateverXe/kern_local_va_vfe.hpp').read_text()
@@ -37,6 +38,18 @@ else:
  # A synthetic page carrying the two instructions that load the 16 and 32 KB classes where the driver has them.
  slm=bytearray((i*59+7)%256 for i in range(4096));slm[0xfcc:0xfcc+len(slm16)]=slm16;slm[0xfda:0xfda+len(slm32)]=slm32
  slmHeader=slmHeader[:slmIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(slm).digest())+slmHeader[slmIdentity.end(1):]
+limitHeader=(root/'WhateverXe/kern_xe_adapter_page.hpp').read_text()
+limitIdentity=re.search(r'ReferenceSHA256\[\]\[32\]\{\{([^}]+)\}\}',limitHeader)
+limitNative=bytes(int(n,0) for n in re.search(r'Native\[\]\{([^}]+)\}',limitHeader)[1].split(','))
+limitSite=int(re.search(r'Site=(0x[0-9a-f]+)',limitHeader)[1],16)
+if args.adapter:
+ # The Xe compiler adapter of WhateverXe Graphics: its real first page must be the one the header names.
+ limit=args.adapter.read_bytes()[0:4096];assert hashlib.sha256(limit).digest()==bytes(int(n,0) for n in limitIdentity[1].split(','))
+ assert limit[limitSite:limitSite+len(limitNative)]==limitNative
+else:
+ # A synthetic page carrying the adapter's compute state check where the adapter has it.
+ limit=bytearray((i*67+13)%256 for i in range(4096));limit[limitSite:limitSite+len(limitNative)]=limitNative
+ limitHeader=limitHeader[:limitIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(limit).digest())+limitHeader[limitIdentity.end(1):]
 if args.donor:
  data=args.donor.read_bytes();page=data[0x2c000:0x2d000];assert hashlib.sha256(page).digest()==expected
  safe=data[0x786000:0x787000];assert hashlib.sha256(safe).digest()==bytes(int(n,0) for n in first[1].split(','))
@@ -61,6 +74,7 @@ code=r'''
 #include "kern_local_va_pixel.hpp"
 #include "kern_mtl_mps_page.hpp"
 #include "kern_mtl_slm_page.hpp"
+#include "kern_xe_adapter_page.hpp"
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
 #include <cassert>
@@ -91,8 +105,8 @@ static std::vector<uint8_t> read(const char*p){std::ifstream f(p,std::ios::binar
 static void walker(void*,uint32_t*x,uint32_t*y,unsigned i){*x=16+i;*y=32+i;}
 template<class T>void put(uint8_t*p,unsigned o,T v){memcpy(p+o,&v,sizeof(v));}
 int main(int argc,char**argv){
- assert(argc==8);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]);
- assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096);unsigned cases=0;
+ assert(argc==9);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]),limit=read(argv[8]);
+ assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096 && limit.size()==4096);unsigned cases=0;
  const bool haveImage=strcmp(argv[6],"-"),haveMetal=strcmp(argv[7],"-");
  KernelPatcher patcher;IOPCIDevice gpu;
  // Scope: exact device and revision, no override, Tahoe, the route, and the renderer switch.
@@ -109,17 +123,21 @@ int main(int argc,char**argv){
   assert(slmClassReady==(scope && (bits&4) && routeOK));
   prepareVAPages(patcher,&gpu,profile,renderer,true);assert(!mpsPluginOffReady && slmClassReady==(scope && (bits&4) && routeOK));
   prepareVAPages(patcher,&gpu,profile,renderer,false,true);assert(!slmClassReady && mpsPluginOffReady==(profile.admitted() && (bits&4) && routeOK));
+  // The compiler adapter's thread limit: every GPU this kext drives on Tahoe, like the MPS plug-in, and its own switch.
+  assert(computeLimitReady==(profile.admitted() && (bits&4) && routeOK));
+  prepareVAPages(patcher,&gpu,profile,renderer,false,false,true);assert(!computeLimitReady && slmClassReady==(scope && (bits&4) && routeOK));
+  assert(mpsPluginOffReady==(profile.admitted() && (bits&4) && routeOK));
   assert(vaPageHookReady==(scope && renderer && (bits&4) && routeOK));++cases;
  }
  kernel=Tahoe;routeOK=true;
- prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady);++cases;
+ prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled && !slmClassReady);
  assert(mpsPluginOffReady==XELP::identify(0x46808086,0x0c).admitted());++cases;
  for(const char *servicing:{"Darwin Kernel Version 25.6.0: other date; root:xnu-new/RELEASE_X86_64","Darwin Kernel Version 25.7.2: future date; root:xnu-next/RELEASE_X86_64"}) {
   version=servicing;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);++cases;
  }
  version="Darwin Kernel Version 24.6.0: Mon Jul 14 11:28:17 PDT 2025; root:xnu-11417.140.69~1/RELEASE_X86_64";
- prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled);++cases;
  version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && slmClassReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled && slmClassReady);
@@ -218,6 +236,30 @@ int main(int argc,char**argv){
  // Two pages of the same image: neither correction takes the other's.
  assert(!MetalMPSPlugin::matches(slm.data(),4096,MetalSLMClass::FileOffset,true,false) && !MetalSLMClass::matches(mps.data(),4096,MetalMPSPlugin::FileOffset,true,false));
  printf("PASS: %u thread-group memory class page cases: its own switch, validated executable pages only, mutation race, and independence from the other switches\n",slmCases);
+ // The first page of the Xe compiler adapter, another image, with its compute state check. Its switch alone decides.
+ unsigned limitCases=0;
+ for(unsigned condition=0;condition<11;++condition){
+  auto data=limit;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=slmClassPages=computeLimitPages=0;
+  validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
+  writeOK=condition!=4;race=condition==5;computeLimitReady=condition!=6;vaPageHookReady=condition!=9;
+  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=mpsPluginOffReady=slmClassReady=condition!=10;
+  if(condition==7)data[64]^=1;
+  int valid=-1,t=-1,nx=-1;
+  const uint64_t offset=XeAdapterComputeLimit::FileOffset+(condition==8?4096:0);
+  vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
+  assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
+  const bool patched=condition==0 || condition==9 || condition==10;
+  assert(computeLimitPages==(patched?1U:0U) && !slmClassPages && !mpsPluginPages && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
+  if(patched){auto expected=limit;memcpy(expected.data()+XeAdapterComputeLimit::Site,XeAdapterComputeLimit::Corrected,sizeof(XeAdapterComputeLimit::Corrected));
+   assert(data==expected);assert(!XeAdapterComputeLimit::matches(data.data(),4096,offset,true,false));}
+  else if(condition!=5 && condition!=7)assert(data==limit);
+  ++limitCases;
+ }
+ computeLimitReady=slmClassReady=mpsPluginOffReady=vaPageHookReady=vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=true;writeOK=true;race=false;validation=15;taint=nxValue=0;
+ // Pages of other images: no correction takes another's.
+ assert(!XeAdapterComputeLimit::matches(slm.data(),4096,XeAdapterComputeLimit::FileOffset,true,false) && !XeAdapterComputeLimit::matches(mps.data(),4096,XeAdapterComputeLimit::FileOffset,true,false));
+ assert(!MetalSLMClass::matches(limit.data(),4096,MetalSLMClass::FileOffset,true,false) && !MetalMPSPlugin::matches(limit.data(),4096,MetalMPSPlugin::FileOffset,true,false));
+ printf("PASS: %u compiler adapter page cases: its own switch, validated executable pages only, mutation race, and independence from the other switches\n",limitCases);
  if(haveMetal){
   // The real function, corrected and called: it returns false at once, without reading the bundle's Info.plist.
   auto image=read(argv[7]);assert(image.size()>=MetalSLMClass::FileOffset+4096);
@@ -314,6 +356,7 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
  p=Path(tmp);(p/'kern_local_va_vfe.hpp').write_text(header);(p/'kern_local_va_safe.hpp').write_text(safeHeader);(p/'kern_local_va_pixel.hpp').write_text(pixelHeader)
  (p/'kern_mtl_mps_page.hpp').write_text(mpsHeader);(p/'mps.bin').write_bytes(mps)
  (p/'kern_mtl_slm_page.hpp').write_text(slmHeader);(p/'slm.bin').write_bytes(slm)
+ (p/'kern_xe_adapter_page.hpp').write_text(limitHeader);(p/'limit.bin').write_bytes(limit)
  (p/'page.bin').write_bytes(page);(p/'safe.bin').write_bytes(safe);(p/'pixel.bin').write_bytes(pixel);(p/'test.cpp').write_text(code)
  extra=[]
  if args.intel_gen12:
@@ -325,4 +368,4 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
   extra=['-DINTEL_GEN12_ORACLE','-I'+str(args.intel_gen12),str(p/'oracle.cpp')]
  subprocess.run(['clang++','-arch','x86_64','-std=c++17','-O1','-g','-I'+str(root/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')]+extra,check=True)
  subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin'),str(p/'pixel.bin'),str(p/'mps.bin'),str(p/'slm.bin'),
-  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-'],check=True)
+  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-',str(p/'limit.bin')],check=True)
