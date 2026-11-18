@@ -4,6 +4,7 @@
 #include <Headers/kern_api.hpp>
 #include <IOKit/IORegistryEntry.h>
 #include <libkern/OSAtomic.h>
+#include <libkern/c++/OSSerialize.h>
 
 namespace {
 const char *paths[] {"/System/Library/Extensions/Sandbox.kext/Contents/MacOS/Sandbox"};
@@ -17,6 +18,7 @@ int (*putVnode)(void *);
 const char *(*signingIdentity)(void *);
 int (*platformBinary)(void *);
 int (*signatureValid)(void *);
+void (*selfName)(char *, int);
 using Open = int (*)(void *, void *, void *, int);
 using Map = int (*)(void *, void *, void *, int, int, uint64_t, int *);
 Open originalOpen;
@@ -24,7 +26,20 @@ Map originalMap;
 bool enabled, ready;
 bool nvidiaWebKit = true; // -wex-no-nv-webkit: Safari's GPU service keeps to the Intel driver.
 bool nvidiaVideo = false; // -wex-nv-video: it also maps the NVIDIA runtime's video decoders.
-volatile SInt32 readGrants, mapGrants;
+volatile SInt32 readGrants, mapGrants, readFirst, mapFirst;
+
+// The compiler service opens and maps the Xe compiler adapter every time it starts. Asked first, the
+// sandbox writes a refusal to the log for each of those files before this route grants it, so the log
+// describes a blocked compiler that is in fact running. In that service the route decides first. The
+// process name (the first 16 characters of the executable's name) is only a cheap filter: allowed()
+// still requires the exact files, the read-only or executable private access and the service's exact
+// executable path.
+bool compilerService() {
+    if (!selfName) return false;
+    char name[64] {};
+    selfName(name, sizeof(name));
+    return !strncmp(name, "MTLCompilerService", 16);
+}
 
 bool knownOS() {
     const auto v = getKernelVersion();
@@ -57,6 +72,10 @@ bool allowed(void *vnode, bool executable) {
     return !error && XeDataPolicy::service(path, client);
 }
 int checkOpen(void *cred, void *vnode, void *label, int mode) {
+    if (XeDataPolicy::readOnly(mode) && compilerService() && allowed(vnode, false)) {
+        if (OSIncrementAtomic(&readFirst) < 4) SYSLOG("wex", "GPU Data read admitted before the sandbox");
+        return 0;
+    }
     const int result = originalOpen(cred, vnode, label, mode);
     if (result == 1 && XeDataPolicy::readOnly(mode) && allowed(vnode, false)) {
         if (OSIncrementAtomic(&readGrants) < 4) SYSLOG("wex", "GPU Data read admitted");
@@ -65,12 +84,27 @@ int checkOpen(void *cred, void *vnode, void *label, int mode) {
     return result;
 }
 int checkMap(void *cred, void *file, void *label, int prot, int flags, uint64_t offset, int *maxprot) {
+    // Deciding first skips only the sandbox's own evaluation of these maps: the framework still asks the
+    // other MAC policies, AMFI among them.
+    if (XeDataPolicy::executeOnly(prot, flags) && compilerService() && allowed(fileVnode(file), true)) {
+        if (OSIncrementAtomic(&mapFirst) < 4) SYSLOG("wex", "GPU Data executable map admitted before the sandbox");
+        return 0;
+    }
     const int result = originalMap(cred, file, label, prot, flags, offset, maxprot);
     if (result == 1 && XeDataPolicy::executeOnly(prot, flags) && allowed(fileVnode(file), true)) {
         if (OSIncrementAtomic(&mapGrants) < 4) SYSLOG("wex", "GPU Data executable map admitted");
         return 0;
     }
     return result; // Preserve maxprot and every other MAC policy, including AMFI.
+}
+// {schema, reads and maps granted after a sandbox refusal, reads and maps granted before the sandbox}
+bool serializeGrants(void *, void *, OSSerialize *serializer) {
+    const uint32_t counts[] {1, uint32_t(readGrants), uint32_t(mapGrants), uint32_t(readFirst), uint32_t(mapFirst)};
+    auto data = OSData::withBytes(counts, sizeof(counts));
+    if (!data) return false;
+    const bool ok = data->serialize(serializer);
+    data->release();
+    return ok;
 }
 }
 
@@ -97,6 +131,9 @@ void XeDataAccess::processKernel(KernelPatcher &p) {
     platformBinary = reinterpret_cast<decltype(platformBinary)>(p.solveSymbol(KernelPatcher::KernelID, "_csproc_get_platform_binary"));
     p.clearError();
     signatureValid = reinterpret_cast<decltype(signatureValid)>(p.solveSymbol(KernelPatcher::KernelID, "_cs_valid"));
+    p.clearError();
+    // Without it the compiler service's files are granted after the sandbox's refusal, as before.
+    selfName = reinterpret_cast<decltype(selfName)>(p.solveSymbol(KernelPatcher::KernelID, "_proc_selfname"));
     p.clearError();
     IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeWebKitIdentitySymbols",
         signingIdentity && platformBinary && signatureValid);
@@ -129,6 +166,11 @@ bool XeDataAccess::processKext(KernelPatcher &p, size_t index, mach_vm_address_t
     IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeDataAccess", ready);
     IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeDataAccessNVIDIA", ready && nvidiaWebKit);
     IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeDataAccessNVIDIAVideo", ready && nvidiaWebKit && nvidiaVideo);
+    IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeDataAccessCompilerFirst", ready && selfName);
+    if (ready) if (auto live = OSSerializer::forTarget(nullptr, serializeGrants)) {
+        IORegistryEntry::getRegistryRoot()->setProperty("WhateverXeDataAccessLive", live);
+        live->release();
+    }
     SYSLOG("wex", "GPU Data access ready=%d", ready);
     return true;
 }
