@@ -94,6 +94,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - 実験的機能（TahoeのRaptor Lake-P `8086:A7A0` リビジョン04のみ）: `-wex-va-renderer` を指定すると、コード署名の検証が完全一致のページを受け入れたときにIntelのVAドライバの映像処理を修正します。`MEDIA_VFE_STATE` をGen12のレイアウトに合わせ、メディアのL3設定が `L3ALLOCREG` に書き込むようにし、構成によってバッチが完了しなくなる映像処理の出力リスト1つ（yuv2/NV12）を隠して、ARGB変換はすべて残します。このスイッチは、作成に失敗するとAppleGVAの画像変換がクラッシュする壊れたピクセル転送の機能と、AppleGVAが対応していないペアの後処理グループも除外し、デコードとエンコードの項目は残します。署名済みドライバのページをメモリ上で変更するため、AMFIがそれを許容する必要があります。lymzzyhのUHD 770の作業と、b00t0x/WhateverXe#81で特定されたリストに基づきます。
 - Tahoeでは既定で有効（`-wex-no-compute-max-threads` で無効化）: Xeコンパイラアダプタが、最大スレッド数（1024まで）を指定したコンピュートパイプラインを拒否せずにコンパイルします。その他のコンピュートステートは従来どおり拒否します。
 - TahoeのRaptor Lake-P `8086:A7A0` リビジョン04では既定で有効（`-wex-simd8-dispatch` で無効化）: 小さなMetalコンピュートディスパッチでは、カーネルのSIMD8バイナリの代わりにSIMD16バイナリを実行します。SIMD8バイナリではMetal Performance Shadersの畳み込みが誤った結果になっていました。状態は `WEXMetalSIMDChoiceReady` と `WEXMetalSIMDChoiceLive` で確認できます。
+- Tahoeでは既定で有効（`-wex-native-max-threads` で無効化）: コンピュートパイプラインが報告する最大スレッド数を2のべき乗にします（896の代わりに512、448の代わりに256）。他のGPU向けに書かれたカーネルはこれを前提としています。状態は `WEXMetalPow2MaxThreadsReady` と `WEXMetalPow2MaxThreadsLive` で確認できます。
 
 ## 動作確認済みの機能と既知の問題
 

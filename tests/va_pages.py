@@ -61,6 +61,17 @@ else:
  # A synthetic page carrying the branch of the binary choice where the driver has it.
  simd=bytearray((i*71+19)%256 for i in range(4096));simd[simdSite:simdSite+len(simdNative)]=simdNative
  simdHeader=simdHeader[:simdIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(simd).digest())+simdHeader[simdIdentity.end(1):]
+maxHeader=(root/'WhateverXe/kern_mtl_maxthreads_page.hpp').read_text()
+maxIdentity=re.search(r'ReferenceSHA256\[\]\[32\]\{\{([^}]+)\}\}',maxHeader)
+maxNative=bytes(int(n,0) for n in re.sub(r'//[^\n]*','',re.search(r'Native\[\]\{([^}]+)\}',maxHeader)[1]).split(','))
+maxSite=int(re.search(r'Site=(0x[0-9a-f]+)',maxHeader)[1],16);maxOffset=int(re.search(r'FileOffset=(0x[0-9a-f]+)',maxHeader)[1],16)
+if args.metal:
+ maxPage=args.metal.read_bytes()[maxOffset:maxOffset+4096];assert hashlib.sha256(maxPage).digest()==bytes(int(n,0) for n in maxIdentity[1].split(','))
+ assert maxPage[maxSite:maxSite+len(maxNative)]==maxNative
+else:
+ # A synthetic page carrying the maxTotalThreadsPerThreadgroup getter where the driver has it.
+ maxPage=bytearray((i*73+29)%256 for i in range(4096));maxPage[maxSite:maxSite+len(maxNative)]=maxNative
+ maxHeader=maxHeader[:maxIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(maxPage).digest())+maxHeader[maxIdentity.end(1):]
 if args.donor:
  data=args.donor.read_bytes();page=data[0x2c000:0x2d000];assert hashlib.sha256(page).digest()==expected
  safe=data[0x786000:0x787000];assert hashlib.sha256(safe).digest()==bytes(int(n,0) for n in first[1].split(','))
@@ -87,6 +98,7 @@ code=r'''
 #include "kern_mtl_slm_page.hpp"
 #include "kern_xe_adapter_page.hpp"
 #include "kern_mtl_simd_page.hpp"
+#include "kern_mtl_maxthreads_page.hpp"
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
 #include <cassert>
@@ -117,8 +129,8 @@ static std::vector<uint8_t> read(const char*p){std::ifstream f(p,std::ios::binar
 static void walker(void*,uint32_t*x,uint32_t*y,unsigned i){*x=16+i;*y=32+i;}
 template<class T>void put(uint8_t*p,unsigned o,T v){memcpy(p+o,&v,sizeof(v));}
 int main(int argc,char**argv){
- assert(argc==10);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]),limit=read(argv[8]),simd=read(argv[9]);
- assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096 && limit.size()==4096 && simd.size()==4096);unsigned cases=0;
+ assert(argc==11);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]),limit=read(argv[8]),simd=read(argv[9]),maxPage=read(argv[10]);
+ assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096 && limit.size()==4096 && simd.size()==4096 && maxPage.size()==4096);unsigned cases=0;
  const bool haveImage=strcmp(argv[6],"-"),haveMetal=strcmp(argv[7],"-");
  KernelPatcher patcher;IOPCIDevice gpu;
  // Scope: exact device and revision, no override, Tahoe, the route, and the renderer switch.
@@ -142,20 +154,24 @@ int main(int argc,char**argv){
   assert(simdChoiceReady==(scope && (bits&4) && routeOK));
   prepareVAPages(patcher,&gpu,profile,renderer,false,false,false,true);assert(!simdChoiceReady && slmClassReady==(scope && (bits&4) && routeOK));
   assert(computeLimitReady==(profile.admitted() && (bits&4) && routeOK));
+  // The power-of-two maximum: every GPU this kext drives on Tahoe, like the adapter's thread limit, and its own switch.
+  assert(pow2MaxReady==(profile.admitted() && (bits&4) && routeOK));
+  prepareVAPages(patcher,&gpu,profile,renderer,false,false,false,false,true);assert(!pow2MaxReady && simdChoiceReady==(scope && (bits&4) && routeOK));
+  assert(computeLimitReady==(profile.admitted() && (bits&4) && routeOK));
   assert(mpsPluginOffReady==(profile.admitted() && (bits&4) && routeOK));
   assert(vaPageHookReady==(scope && renderer && (bits&4) && routeOK));++cases;
  }
  kernel=Tahoe;routeOK=true;
- prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady);++cases;
+ prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady && !pow2MaxReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled && !slmClassReady && !simdChoiceReady);
- assert(mpsPluginOffReady==XELP::identify(0x46808086,0x0c).admitted());++cases;
+ assert(mpsPluginOffReady==XELP::identify(0x46808086,0x0c).admitted() && pow2MaxReady==XELP::identify(0x46808086,0x0c).admitted());++cases;
  for(const char *servicing:{"Darwin Kernel Version 25.6.0: other date; root:xnu-new/RELEASE_X86_64","Darwin Kernel Version 25.7.2: future date; root:xnu-next/RELEASE_X86_64"}) {
   version=servicing;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);++cases;
  }
  version="Darwin Kernel Version 24.6.0: Mon Jul 14 11:28:17 PDT 2025; root:xnu-11417.140.69~1/RELEASE_X86_64";
- prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady && !pow2MaxReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled);++cases;
- version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && slmClassReady && simdChoiceReady);++cases;
+ version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && slmClassReady && simdChoiceReady && pow2MaxReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled && slmClassReady);
  // The VFE packet generator: validated executable code pages only, rechecked under the write lock.
  for(unsigned condition=0;condition<11;++condition){
@@ -303,6 +319,32 @@ int main(int argc,char**argv){
  assert(!MetalSIMDChoice::matches(limit.data(),4096,MetalSIMDChoice::FileOffset,true,false) && !XeAdapterComputeLimit::matches(simd.data(),4096,XeAdapterComputeLimit::FileOffset,true,false));
  assert(!MetalSLMClass::matches(simd.data(),4096,MetalSLMClass::FileOffset,true,false) && !MetalMPSPlugin::matches(simd.data(),4096,MetalMPSPlugin::FileOffset,true,false));
  printf("PASS: %u SIMD choice page cases: its own switch, validated executable pages only, mutation race, and independence from the other switches and from the VFE page at the same offset\n",simdCases);
+ // The page of the Metal driver with the maxTotalThreadsPerThreadgroup getter. Its switch alone decides.
+ unsigned maxCases=0;
+ for(unsigned condition=0;condition<11;++condition){
+  auto data=maxPage;racePage=data.data();originalCalls=0;
+  vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=slmClassPages=computeLimitPages=simdChoicePages=pow2MaxPages=0;
+  validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
+  writeOK=condition!=4;race=condition==5;pow2MaxReady=condition!=6;vaPageHookReady=condition!=9;
+  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=mpsPluginOffReady=slmClassReady=computeLimitReady=simdChoiceReady=condition!=10;
+  if(condition==7)data[64]^=1;
+  int valid=-1,t=-1,nx=-1;
+  const uint64_t offset=MetalPow2MaxThreads::FileOffset+(condition==8?4096:0);
+  vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
+  assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
+  const bool patched=condition==0 || condition==9 || condition==10;
+  assert(pow2MaxPages==(patched?1U:0U) && !simdChoicePages && !computeLimitPages && !slmClassPages && !mpsPluginPages && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
+  if(patched){auto expected=maxPage;memcpy(expected.data()+MetalPow2MaxThreads::Site,MetalPow2MaxThreads::Corrected,sizeof(MetalPow2MaxThreads::Corrected));
+   assert(data==expected);assert(!MetalPow2MaxThreads::matches(data.data(),4096,offset,true,false));}
+  else if(condition!=5 && condition!=7)assert(data==maxPage);
+  ++maxCases;
+ }
+ pow2MaxReady=simdChoiceReady=computeLimitReady=slmClassReady=mpsPluginOffReady=vaPageHookReady=vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=true;writeOK=true;race=false;validation=15;taint=nxValue=0;
+ // Pages of the same image and of other images: no correction takes another's.
+ for(const auto *other:{&simd,&slm,&mps,&limit,&page})assert(!MetalPow2MaxThreads::matches(other->data(),4096,MetalPow2MaxThreads::FileOffset,true,false));
+ assert(!MetalSIMDChoice::matches(maxPage.data(),4096,MetalSIMDChoice::FileOffset,true,false) && !MetalSLMClass::matches(maxPage.data(),4096,MetalSLMClass::FileOffset,true,false));
+ assert(!MetalMPSPlugin::matches(maxPage.data(),4096,MetalMPSPlugin::FileOffset,true,false) && !XeAdapterComputeLimit::matches(maxPage.data(),4096,XeAdapterComputeLimit::FileOffset,true,false));
+ printf("PASS: %u maximum thread count page cases: its own switch, validated executable pages only, mutation race, and independence from the other switches\n",maxCases);
  if(haveMetal){
   // The real function, corrected and called: it returns false at once, without reading the bundle's Info.plist.
   auto image=read(argv[7]);assert(image.size()>=MetalSLMClass::FileOffset+4096);
@@ -352,6 +394,23 @@ int main(int argc,char**argv){
   for(const auto &c:choices)assert(choose(nativeChoice,c.binaries,c.groups,c.threads)==c.before && choose(correctedChoice.data(),c.binaries,c.groups,c.threads)==c.after);
   munmap(code,4096);
   puts("PASS: the real binary choice of the Metal driver runs the SIMD16 binary for every dispatch that fits it after the correction, the SIMD8 one only without a SIMD16 binary, and the same binaries as before above that; five bytes change");
+  // The real getter, before and after the correction, run on its own. Its RIP-relative load is pointed at an ivar offset
+  // variable of this test, the only change; the object holds the stored maximum at that offset.
+  const uint8_t *nativeMax=image.data()+MetalPow2MaxThreads::FileOffset;std::vector<uint8_t> correctedMax(nativeMax,nativeMax+4096);
+  assert(MetalPow2MaxThreads::matches(correctedMax.data(),4096,MetalPow2MaxThreads::FileOffset,true,false));MetalPow2MaxThreads::apply(correctedMax.data());
+  changed=0;for(unsigned i=0;i<4096;++i)changed+=correctedMax[i]!=nativeMax[i];assert(changed==16);
+  code=(uint8_t*)mmap(nullptr,4096,7,MAP_ANON|MAP_PRIVATE,-1,0);assert(code!=MAP_FAILED);
+  const auto getMax=[&](const uint8_t *source,uint64_t stored){
+   memcpy(code,source+MetalPow2MaxThreads::Site,sizeof(MetalPow2MaxThreads::Native));
+   const uint64_t ivarOffset=0x20;memcpy(code+0x800,&ivarOffset,8);
+   const bool native=code[0]==0x55;const unsigned at=native?7:3,end=native?11:7;const int32_t disp=int32_t(0x800-end);memcpy(code+at,&disp,4);
+   uint64_t object[8]{};object[4]=stored;
+   return ((uint64_t(*)(void *))code)(object);
+  };
+  const struct {uint64_t stored,before,after;} maxima[]{{8,8,8},{255,255,128},{256,256,256},{448,448,256},{512,512,512},{896,896,512},{1000,1000,512},{1024,1024,1024}};
+  for(const auto &m:maxima)assert(getMax(nativeMax,m.stored)==m.before && getMax(correctedMax.data(),m.stored)==m.after);
+  munmap(code,4096);
+  puts("PASS: the real maxTotalThreadsPerThreadgroup getter returns the stored maximum before the correction and the largest power of two not above it after; 16 bytes change");
  }
  assert(!LocalVAVFE::matches(page.data(),4095,LocalVAVFE::FileOffset,true,false));
  printf("PASS: %u production callback cases: exact scope, both switches, validated pages, mutation race, permissions, NX and original outputs preserved\n",cases);
@@ -424,6 +483,7 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
  (p/'kern_mtl_slm_page.hpp').write_text(slmHeader);(p/'slm.bin').write_bytes(slm)
  (p/'kern_xe_adapter_page.hpp').write_text(limitHeader);(p/'limit.bin').write_bytes(limit)
  (p/'kern_mtl_simd_page.hpp').write_text(simdHeader);(p/'simd.bin').write_bytes(simd)
+ (p/'kern_mtl_maxthreads_page.hpp').write_text(maxHeader);(p/'max.bin').write_bytes(maxPage)
  (p/'page.bin').write_bytes(page);(p/'safe.bin').write_bytes(safe);(p/'pixel.bin').write_bytes(pixel);(p/'test.cpp').write_text(code)
  extra=[]
  if args.intel_gen12:
@@ -435,4 +495,4 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
   extra=['-DINTEL_GEN12_ORACLE','-I'+str(args.intel_gen12),str(p/'oracle.cpp')]
  subprocess.run(['clang++','-arch','x86_64','-std=c++17','-O1','-g','-I'+str(root/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')]+extra,check=True)
  subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin'),str(p/'pixel.bin'),str(p/'mps.bin'),str(p/'slm.bin'),
-  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-',str(p/'limit.bin'),str(p/'simd.bin')],check=True)
+  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-',str(p/'limit.bin'),str(p/'simd.bin'),str(p/'max.bin')],check=True)
