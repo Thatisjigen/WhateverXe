@@ -50,6 +50,17 @@ else:
  # A synthetic page carrying the adapter's compute state check where the adapter has it.
  limit=bytearray((i*67+13)%256 for i in range(4096));limit[limitSite:limitSite+len(limitNative)]=limitNative
  limitHeader=limitHeader[:limitIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(limit).digest())+limitHeader[limitIdentity.end(1):]
+simdHeader=(root/'WhateverXe/kern_mtl_simd_page.hpp').read_text()
+simdIdentity=re.search(r'ReferenceSHA256\[\]\[32\]\{\{([^}]+)\}\}',simdHeader)
+simdNative=bytes(int(n,0) for n in re.sub(r'//[^\n]*','',re.search(r'Native\[\]\{([^}]+)\}',simdHeader)[1]).split(','))
+simdSite=int(re.search(r'Site=(0x[0-9a-f]+)',simdHeader)[1],16);simdOffset=int(re.search(r'FileOffset=(0x[0-9a-f]+)',simdHeader)[1],16)
+if args.metal:
+ simd=args.metal.read_bytes()[simdOffset:simdOffset+4096];assert hashlib.sha256(simd).digest()==bytes(int(n,0) for n in simdIdentity[1].split(','))
+ assert simd[simdSite:simdSite+len(simdNative)]==simdNative
+else:
+ # A synthetic page carrying the branch of the binary choice where the driver has it.
+ simd=bytearray((i*71+19)%256 for i in range(4096));simd[simdSite:simdSite+len(simdNative)]=simdNative
+ simdHeader=simdHeader[:simdIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(simd).digest())+simdHeader[simdIdentity.end(1):]
 if args.donor:
  data=args.donor.read_bytes();page=data[0x2c000:0x2d000];assert hashlib.sha256(page).digest()==expected
  safe=data[0x786000:0x787000];assert hashlib.sha256(safe).digest()==bytes(int(n,0) for n in first[1].split(','))
@@ -75,6 +86,7 @@ code=r'''
 #include "kern_mtl_mps_page.hpp"
 #include "kern_mtl_slm_page.hpp"
 #include "kern_xe_adapter_page.hpp"
+#include "kern_mtl_simd_page.hpp"
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
 #include <cassert>
@@ -105,8 +117,8 @@ static std::vector<uint8_t> read(const char*p){std::ifstream f(p,std::ios::binar
 static void walker(void*,uint32_t*x,uint32_t*y,unsigned i){*x=16+i;*y=32+i;}
 template<class T>void put(uint8_t*p,unsigned o,T v){memcpy(p+o,&v,sizeof(v));}
 int main(int argc,char**argv){
- assert(argc==9);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]),limit=read(argv[8]);
- assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096 && limit.size()==4096);unsigned cases=0;
+ assert(argc==10);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]),limit=read(argv[8]),simd=read(argv[9]);
+ assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096 && limit.size()==4096 && simd.size()==4096);unsigned cases=0;
  const bool haveImage=strcmp(argv[6],"-"),haveMetal=strcmp(argv[7],"-");
  KernelPatcher patcher;IOPCIDevice gpu;
  // Scope: exact device and revision, no override, Tahoe, the route, and the renderer switch.
@@ -126,20 +138,24 @@ int main(int argc,char**argv){
   // The compiler adapter's thread limit: every GPU this kext drives on Tahoe, like the MPS plug-in, and its own switch.
   assert(computeLimitReady==(profile.admitted() && (bits&4) && routeOK));
   prepareVAPages(patcher,&gpu,profile,renderer,false,false,true);assert(!computeLimitReady && slmClassReady==(scope && (bits&4) && routeOK));
+  // The SIMD choice for small compute dispatches: this device and revision only, like the memory class, and its own switch.
+  assert(simdChoiceReady==(scope && (bits&4) && routeOK));
+  prepareVAPages(patcher,&gpu,profile,renderer,false,false,false,true);assert(!simdChoiceReady && slmClassReady==(scope && (bits&4) && routeOK));
+  assert(computeLimitReady==(profile.admitted() && (bits&4) && routeOK));
   assert(mpsPluginOffReady==(profile.admitted() && (bits&4) && routeOK));
   assert(vaPageHookReady==(scope && renderer && (bits&4) && routeOK));++cases;
  }
  kernel=Tahoe;routeOK=true;
- prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady);++cases;
- prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled && !slmClassReady);
+ prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled && !slmClassReady && !simdChoiceReady);
  assert(mpsPluginOffReady==XELP::identify(0x46808086,0x0c).admitted());++cases;
  for(const char *servicing:{"Darwin Kernel Version 25.6.0: other date; root:xnu-new/RELEASE_X86_64","Darwin Kernel Version 25.7.2: future date; root:xnu-next/RELEASE_X86_64"}) {
   version=servicing;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);++cases;
  }
  version="Darwin Kernel Version 24.6.0: Mon Jul 14 11:28:17 PDT 2025; root:xnu-11417.140.69~1/RELEASE_X86_64";
- prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled);++cases;
- version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && slmClassReady);++cases;
+ version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && slmClassReady && simdChoiceReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled && slmClassReady);
  // The VFE packet generator: validated executable code pages only, rechecked under the write lock.
  for(unsigned condition=0;condition<11;++condition){
@@ -260,6 +276,33 @@ int main(int argc,char**argv){
  assert(!XeAdapterComputeLimit::matches(slm.data(),4096,XeAdapterComputeLimit::FileOffset,true,false) && !XeAdapterComputeLimit::matches(mps.data(),4096,XeAdapterComputeLimit::FileOffset,true,false));
  assert(!MetalSLMClass::matches(limit.data(),4096,MetalSLMClass::FileOffset,true,false) && !MetalMPSPlugin::matches(limit.data(),4096,MetalMPSPlugin::FileOffset,true,false));
  printf("PASS: %u compiler adapter page cases: its own switch, validated executable pages only, mutation race, and independence from the other switches\n",limitCases);
+ // The page of the Metal driver that chooses a kernel binary for each dispatch, at the offset of the VA driver's VFE page.
+ // Its switch alone decides.
+ unsigned simdCases=0;
+ for(unsigned condition=0;condition<11;++condition){
+  auto data=simd;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=slmClassPages=computeLimitPages=simdChoicePages=0;
+  validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
+  writeOK=condition!=4;race=condition==5;simdChoiceReady=condition!=6;vaPageHookReady=condition!=9;
+  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=mpsPluginOffReady=slmClassReady=computeLimitReady=condition!=10;
+  if(condition==7)data[64]^=1;
+  int valid=-1,t=-1,nx=-1;
+  const uint64_t offset=MetalSIMDChoice::FileOffset+(condition==8?4096:0);
+  vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
+  assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
+  const bool patched=condition==0 || condition==9 || condition==10;
+  assert(simdChoicePages==(patched?1U:0U) && !computeLimitPages && !slmClassPages && !mpsPluginPages && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
+  if(patched){auto expected=simd;memcpy(expected.data()+MetalSIMDChoice::Site,MetalSIMDChoice::Corrected,sizeof(MetalSIMDChoice::Corrected));
+   assert(data==expected);assert(!MetalSIMDChoice::matches(data.data(),4096,offset,true,false));}
+  else if(condition!=5 && condition!=7)assert(data==simd);
+  ++simdCases;
+ }
+ simdChoiceReady=computeLimitReady=slmClassReady=mpsPluginOffReady=vaPageHookReady=vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=true;writeOK=true;race=false;validation=15;taint=nxValue=0;
+ // The VA driver's VFE page has the same offset; the other pages are other code. No correction takes another's page.
+ assert(!MetalSIMDChoice::matches(page.data(),4096,MetalSIMDChoice::FileOffset,true,false) && !LocalVAVFE::matches(simd.data(),4096,LocalVAVFE::FileOffset,true,false));
+ assert(!MetalSIMDChoice::matches(slm.data(),4096,MetalSIMDChoice::FileOffset,true,false) && !MetalSIMDChoice::matches(mps.data(),4096,MetalSIMDChoice::FileOffset,true,false));
+ assert(!MetalSIMDChoice::matches(limit.data(),4096,MetalSIMDChoice::FileOffset,true,false) && !XeAdapterComputeLimit::matches(simd.data(),4096,XeAdapterComputeLimit::FileOffset,true,false));
+ assert(!MetalSLMClass::matches(simd.data(),4096,MetalSLMClass::FileOffset,true,false) && !MetalMPSPlugin::matches(simd.data(),4096,MetalMPSPlugin::FileOffset,true,false));
+ printf("PASS: %u SIMD choice page cases: its own switch, validated executable pages only, mutation race, and independence from the other switches and from the VFE page at the same offset\n",simdCases);
  if(haveMetal){
   // The real function, corrected and called: it returns false at once, without reading the bundle's Info.plist.
   auto image=read(argv[7]);assert(image.size()>=MetalSLMClass::FileOffset+4096);
@@ -286,6 +329,29 @@ int main(int argc,char**argv){
   for(const auto &s:sizes)assert(classOf(native,s.bytes)==s.before && classOf(corrected.data(),s.bytes)==s.after);
   munmap(code,4096);
   puts("PASS: the real class computation of the Metal driver gives the 64 KB class to every size above 8 KB after the correction and the same classes as before up to 8 KB; two bytes change");
+  // The real choice of a kernel binary, before and after the correction, run on its own: ChalExecuteKernel from its entry
+  // (0x2c848) to where it jumps on with the chosen binary in %rsi (0x2c915), which it returns here instead.
+  const uint8_t *nativeChoice=image.data()+MetalSIMDChoice::FileOffset;std::vector<uint8_t> correctedChoice(nativeChoice,nativeChoice+4096);
+  assert(MetalSIMDChoice::matches(correctedChoice.data(),4096,MetalSIMDChoice::FileOffset,true,false));MetalSIMDChoice::apply(correctedChoice.data());
+  changed=0;for(unsigned i=0;i<4096;++i)changed+=correctedChoice[i]!=nativeChoice[i];assert(changed==sizeof(MetalSIMDChoice::Corrected));
+  code=(uint8_t*)mmap(nullptr,4096,7,MAP_ANON|MAP_PRIVATE,-1,0);assert(code!=MAP_FAILED);
+  const unsigned entry=0x848,leave=0x915;const uint8_t give[]{0x48,0x89,0xf0,0xc3};
+  const auto choose=[&](const uint8_t *source,void *const *binaries,uint64_t groups,uint64_t threads){
+   memcpy(code,source+entry,leave-entry);memcpy(code+leave-entry,give,sizeof(give));
+   // The context's hardware threads: 56 for one thread group and 672 in all (a 96-EU GPU).
+   std::vector<uint8_t> context(0xd60);const uint32_t perGroup=56,total=672;memcpy(context.data()+0xd4c,&perGroup,4);memcpy(context.data()+0xd58,&total,4);
+   const uint64_t perGroupSize[3]{threads,1,1},grid[3]{groups,1,1};
+   return ((void *(*)(void *,void *const *,const uint64_t *,const uint64_t *))code)(context.data(),binaries,perGroupSize,grid);
+  };
+  // Decoded binaries: CompiledSIMD8, CompiledSIMD16 and CompiledSIMD32 at 0x280, 0x281 and 0x282.
+  static uint8_t b8[0x300],b16[0x300],b32[0x300];b8[0x280]=1;b16[0x281]=1;b32[0x282]=1;
+  void *const both[3]{b16,b8,nullptr},*const only8[3]{b8,nullptr,nullptr},*const three[3]{b32,b16,b8};
+  const struct {void *const *binaries;uint64_t groups,threads;const void *before,*after;} choices[]{
+   {both,32,128,b8,b16},{both,42,128,b8,b16},{both,43,128,b16,b16},{both,84,128,b16,b16},{both,85,128,b16,b16},
+   {both,1,512,b16,b16},{both,0,128,b16,b16},{only8,32,128,b8,b8},{only8,85,128,b8,b8},{three,32,128,b8,b16},{three,85,128,b32,b32}};
+  for(const auto &c:choices)assert(choose(nativeChoice,c.binaries,c.groups,c.threads)==c.before && choose(correctedChoice.data(),c.binaries,c.groups,c.threads)==c.after);
+  munmap(code,4096);
+  puts("PASS: the real binary choice of the Metal driver runs the SIMD16 binary for every dispatch that fits it after the correction, the SIMD8 one only without a SIMD16 binary, and the same binaries as before above that; five bytes change");
  }
  assert(!LocalVAVFE::matches(page.data(),4095,LocalVAVFE::FileOffset,true,false));
  printf("PASS: %u production callback cases: exact scope, both switches, validated pages, mutation race, permissions, NX and original outputs preserved\n",cases);
@@ -357,6 +423,7 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
  (p/'kern_mtl_mps_page.hpp').write_text(mpsHeader);(p/'mps.bin').write_bytes(mps)
  (p/'kern_mtl_slm_page.hpp').write_text(slmHeader);(p/'slm.bin').write_bytes(slm)
  (p/'kern_xe_adapter_page.hpp').write_text(limitHeader);(p/'limit.bin').write_bytes(limit)
+ (p/'kern_mtl_simd_page.hpp').write_text(simdHeader);(p/'simd.bin').write_bytes(simd)
  (p/'page.bin').write_bytes(page);(p/'safe.bin').write_bytes(safe);(p/'pixel.bin').write_bytes(pixel);(p/'test.cpp').write_text(code)
  extra=[]
  if args.intel_gen12:
@@ -368,4 +435,4 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
   extra=['-DINTEL_GEN12_ORACLE','-I'+str(args.intel_gen12),str(p/'oracle.cpp')]
  subprocess.run(['clang++','-arch','x86_64','-std=c++17','-O1','-g','-I'+str(root/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')]+extra,check=True)
  subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin'),str(p/'pixel.bin'),str(p/'mps.bin'),str(p/'slm.bin'),
-  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-',str(p/'limit.bin')],check=True)
+  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-',str(p/'limit.bin'),str(p/'simd.bin')],check=True)

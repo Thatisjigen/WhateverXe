@@ -195,5 +195,6 @@
   "-wex-no-reset-skip": [],
   "-wex-intel-mps-plugin": [],
   "-wex-no-slm-64k": [],
-  "-wex-no-compute-max-threads": []
+  "-wex-no-compute-max-threads": [],
+  "-wex-simd8-dispatch": []
 }
