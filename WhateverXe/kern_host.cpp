@@ -146,11 +146,12 @@ void XeHost::processKernel(KernelPatcher &patcher) {
  // Exact corrections of the Intel VA driver's pages, armed with its renderer advertised; Intel's MPS plug-in
  // switched off in the Metal driver, whose kernel sources the Metal compiler of macOS 26 rejects; and the 64 KB class
  // of thread-group memory for Metal compute kernels that would get the 16 or the 32 KB one; and compute pipelines with a
- // maximum thread count in the Xe compiler adapter; the SIMD16 binary for small Metal compute dispatches; and a power of two
- // as the maximum thread count of compute pipelines.
+ // maximum thread count in the Xe compiler adapter; the SIMD16 binary for small Metal compute dispatches; a power of two
+ // as the maximum thread count of compute pipelines; and a GRF-aligned destination for the carry of 64-bit additions in
+ // the Intel graphics compiler that the adapter loads, whose check of that compiler's file accepts the corrected file.
  prepareVAPages(patcher,gpu,profile,checkKernelArgument("-wex-va-renderer"),checkKernelArgument("-wex-intel-mps-plugin"),
   checkKernelArgument("-wex-no-slm-64k"),checkKernelArgument("-wex-no-compute-max-threads"),checkKernelArgument("-wex-simd8-dispatch"),
-  checkKernelArgument("-wex-native-max-threads"));
+  checkKernelArgument("-wex-native-max-threads"),checkKernelArgument("-wex-native-addc"));
 
  const auto display=XELP::displayAdapter(profile.family);
  systemWakeRecovery=active && (display==XELP::DisplayAdapter::ADLP || display==XELP::DisplayAdapter::ADLN);

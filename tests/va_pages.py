@@ -8,7 +8,7 @@ from pathlib import Path
 import argparse,hashlib,re,subprocess,tempfile
 root=Path(__file__).resolve().parents[1]
 ap=argparse.ArgumentParser();ap.add_argument('donor',nargs='?',type=Path);ap.add_argument('--intel-gen12',type=Path);ap.add_argument('--metal',type=Path)
-ap.add_argument('--adapter',type=Path);args=ap.parse_args()
+ap.add_argument('--adapter',type=Path);ap.add_argument('--igc',type=Path);args=ap.parse_args()
 s=(root/'WhateverXe/kern_va_pages.hpp').read_text()
 production=s[s.index('static mach_vm_address_t vaOriginalPage;'):]
 header=(root/'WhateverXe/kern_local_va_vfe.hpp').read_text()
@@ -42,14 +42,22 @@ limitHeader=(root/'WhateverXe/kern_xe_adapter_page.hpp').read_text()
 limitIdentity=re.search(r'ReferenceSHA256\[\]\[32\]\{\{([^}]+)\}\}',limitHeader)
 limitNative=bytes(int(n,0) for n in re.search(r'Native\[\]\{([^}]+)\}',limitHeader)[1].split(','))
 limitSite=int(re.search(r'Site=(0x[0-9a-f]+)',limitHeader)[1],16)
+hashHeader=(root/'WhateverXe/kern_xe_adapter_hash_page.hpp').read_text()
+callIdentity=re.search(r'CallSHA256\[\]\[32\]\{\{([^}]+)\}\}',hashHeader)
+callNative=bytes(int(n,0) for n in re.sub(r'//[^\n]*','',re.search(r'CallNative\[\]\{([^}]+)\}',hashHeader)[1]).split(','))
+callSite=int(re.search(r'CallSite=(0x[0-9a-f]+)',hashHeader)[1],16)
 if args.adapter:
  # The Xe compiler adapter of WhateverXe Graphics: its real first page must be the one the header names.
  limit=args.adapter.read_bytes()[0:4096];assert hashlib.sha256(limit).digest()==bytes(int(n,0) for n in limitIdentity[1].split(','))
  assert limit[limitSite:limitSite+len(limitNative)]==limitNative
+ # The same page carries _verified's comparison, under the same identity in the other header.
+ assert limit[callSite:callSite+len(callNative)]==callNative and hashlib.sha256(limit).digest()==bytes(int(n,0) for n in callIdentity[1].split(','))
 else:
- # A synthetic page carrying the adapter's compute state check where the adapter has it.
+ # A synthetic page carrying the adapter's compute state check and _verified's comparison where the adapter has them.
  limit=bytearray((i*67+13)%256 for i in range(4096));limit[limitSite:limitSite+len(limitNative)]=limitNative
+ limit[callSite:callSite+len(callNative)]=callNative
  limitHeader=limitHeader[:limitIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(limit).digest())+limitHeader[limitIdentity.end(1):]
+ hashHeader=hashHeader[:callIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(limit).digest())+hashHeader[callIdentity.end(1):]
 simdHeader=(root/'WhateverXe/kern_mtl_simd_page.hpp').read_text()
 simdIdentity=re.search(r'ReferenceSHA256\[\]\[32\]\{\{([^}]+)\}\}',simdHeader)
 simdNative=bytes(int(n,0) for n in re.sub(r'//[^\n]*','',re.search(r'Native\[\]\{([^}]+)\}',simdHeader)[1]).split(','))
@@ -72,6 +80,34 @@ else:
  # A synthetic page carrying the maxTotalThreadsPerThreadgroup getter where the driver has it.
  maxPage=bytearray((i*73+29)%256 for i in range(4096));maxPage[maxSite:maxSite+len(maxNative)]=maxNative
  maxHeader=maxHeader[:maxIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(maxPage).digest())+maxHeader[maxIdentity.end(1):]
+addcHeader=(root/'WhateverXe/kern_igc_addc_page.hpp').read_text()
+addcIdentity=re.search(r'ReferenceSHA256\[\]\[32\]\{\{([^}]+)\}\}',addcHeader)
+addcNative=bytes(int(n,0) for n in re.sub(r'//[^\n]*','',re.search(r'Native\[\]\{([^}]+)\}',addcHeader)[1]).split(','))
+addcSite=int(re.search(r'Site=(0x[0-9a-f]+)',addcHeader)[1],16);addcOffset=int(re.search(r'FileOffset=(0x[0-9a-f]+)',addcHeader)[1],16)
+if args.igc:
+ # The Intel graphics compiler of WhateverXe Graphics: its real page must be the one the header names.
+ addcPage=args.igc.read_bytes()[addcOffset:addcOffset+4096];assert hashlib.sha256(addcPage).digest()==bytes(int(n,0) for n in addcIdentity[1].split(','))
+ assert addcPage[addcSite:addcSite+len(addcNative)]==addcNative
+else:
+ # A synthetic page carrying fixAddcSubb's call where the compiler has it.
+ addcPage=bytearray((i*79+37)%256 for i in range(4096));addcPage[addcSite:addcSite+len(addcNative)]=addcNative
+ addcHeader=addcHeader[:addcIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(addcPage).digest())+addcHeader[addcIdentity.end(1):]
+helperIdentity=re.search(r'HelperSHA256\[\]\[32\]\{\{([^}]+)\}\}',hashHeader)
+helperCorrected=bytes(int(n,0) for n in re.sub(r'//[^\n]*','',re.search(r'HelperCorrected\[\]\{([^}]+)\}',hashHeader)[1]).split(','))
+helperSite=int(re.search(r'HelperSite=(0x[0-9a-f]+)',hashHeader)[1],16)
+if args.adapter:
+ # The adapter's third page: zero padding after __unwind_info where the helper goes.
+ helperPage=args.adapter.read_bytes()[0x2000:0x3000];assert hashlib.sha256(helperPage).digest()==bytes(int(n,0) for n in helperIdentity[1].split(','))
+ assert not any(helperPage[helperSite:helperSite+len(helperCorrected)])
+else:
+ # A synthetic third page with that padding.
+ helperPage=bytearray((i*83+41)%256 for i in range(4096));helperPage[helperSite:helperSite+len(helperCorrected)]=bytes(len(helperCorrected))
+ hashHeader=hashHeader[:helperIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(helperPage).digest())+hashHeader[helperIdentity.end(1):]
+if args.igc:
+ # The corrected digest beside the helper is the digest of the whole compiler file with the compiler's correction.
+ addcCorrected=bytes(int(n,0) for n in re.sub(r'//[^\n]*','',re.search(r'Corrected\[\]\{([^}]+)\}',addcHeader)[1]).split(','))
+ igcFile=bytearray(args.igc.read_bytes());igcFile[addcOffset+addcSite:addcOffset+addcSite+len(addcCorrected)]=addcCorrected
+ assert hashlib.sha256(igcFile).digest()==helperCorrected[0x50:0x70]
 if args.donor:
  data=args.donor.read_bytes();page=data[0x2c000:0x2d000];assert hashlib.sha256(page).digest()==expected
  safe=data[0x786000:0x787000];assert hashlib.sha256(safe).digest()==bytes(int(n,0) for n in first[1].split(','))
@@ -99,6 +135,8 @@ code=r'''
 #include "kern_xe_adapter_page.hpp"
 #include "kern_mtl_simd_page.hpp"
 #include "kern_mtl_maxthreads_page.hpp"
+#include "kern_igc_addc_page.hpp"
+#include "kern_xe_adapter_hash_page.hpp"
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
 #include <cassert>
@@ -129,8 +167,8 @@ static std::vector<uint8_t> read(const char*p){std::ifstream f(p,std::ios::binar
 static void walker(void*,uint32_t*x,uint32_t*y,unsigned i){*x=16+i;*y=32+i;}
 template<class T>void put(uint8_t*p,unsigned o,T v){memcpy(p+o,&v,sizeof(v));}
 int main(int argc,char**argv){
- assert(argc==11);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]),limit=read(argv[8]),simd=read(argv[9]),maxPage=read(argv[10]);
- assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096 && limit.size()==4096 && simd.size()==4096 && maxPage.size()==4096);unsigned cases=0;
+ assert(argc==13);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]),limit=read(argv[8]),simd=read(argv[9]),maxPage=read(argv[10]),addcPage=read(argv[11]),helperPage=read(argv[12]);
+ assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096 && limit.size()==4096 && simd.size()==4096 && maxPage.size()==4096 && addcPage.size()==4096 && helperPage.size()==4096);unsigned cases=0;
  const bool haveImage=strcmp(argv[6],"-"),haveMetal=strcmp(argv[7],"-");
  KernelPatcher patcher;IOPCIDevice gpu;
  // Scope: exact device and revision, no override, Tahoe, the route, and the renderer switch.
@@ -158,20 +196,24 @@ int main(int argc,char**argv){
   assert(pow2MaxReady==(profile.admitted() && (bits&4) && routeOK));
   prepareVAPages(patcher,&gpu,profile,renderer,false,false,false,false,true);assert(!pow2MaxReady && simdChoiceReady==(scope && (bits&4) && routeOK));
   assert(computeLimitReady==(profile.admitted() && (bits&4) && routeOK));
+  // The compiler's carry destination: every GPU this kext drives on Tahoe, like the adapter, and its own switch.
+  assert(addcAlignReady==(profile.admitted() && (bits&4) && routeOK));
+  prepareVAPages(patcher,&gpu,profile,renderer,false,false,false,false,false,true);assert(!addcAlignReady && pow2MaxReady==(profile.admitted() && (bits&4) && routeOK));
   assert(mpsPluginOffReady==(profile.admitted() && (bits&4) && routeOK));
   assert(vaPageHookReady==(scope && renderer && (bits&4) && routeOK));++cases;
  }
  kernel=Tahoe;routeOK=true;
- prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady && !pow2MaxReady);++cases;
+ prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady && !pow2MaxReady && !addcAlignReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled && !slmClassReady && !simdChoiceReady);
- assert(mpsPluginOffReady==XELP::identify(0x46808086,0x0c).admitted() && pow2MaxReady==XELP::identify(0x46808086,0x0c).admitted());++cases;
+ assert(mpsPluginOffReady==XELP::identify(0x46808086,0x0c).admitted() && pow2MaxReady==XELP::identify(0x46808086,0x0c).admitted());
+ assert(addcAlignReady==XELP::identify(0x46808086,0x0c).admitted());++cases;
  for(const char *servicing:{"Darwin Kernel Version 25.6.0: other date; root:xnu-new/RELEASE_X86_64","Darwin Kernel Version 25.7.2: future date; root:xnu-next/RELEASE_X86_64"}) {
   version=servicing;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);++cases;
  }
  version="Darwin Kernel Version 24.6.0: Mon Jul 14 11:28:17 PDT 2025; root:xnu-11417.140.69~1/RELEASE_X86_64";
- prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady && !pow2MaxReady);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady && !pow2MaxReady && !addcAlignReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled);++cases;
- version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && slmClassReady && simdChoiceReady && pow2MaxReady);++cases;
+ version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && slmClassReady && simdChoiceReady && pow2MaxReady && addcAlignReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled && slmClassReady);
  // The VFE packet generator: validated executable code pages only, rechecked under the write lock.
  for(unsigned condition=0;condition<11;++condition){
@@ -271,9 +313,9 @@ int main(int argc,char**argv){
  // The first page of the Xe compiler adapter, another image, with its compute state check. Its switch alone decides.
  unsigned limitCases=0;
  for(unsigned condition=0;condition<11;++condition){
-  auto data=limit;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=slmClassPages=computeLimitPages=0;
+  auto data=limit;racePage=data.data();originalCalls=0;vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=slmClassPages=computeLimitPages=adapterHashPages=0;
   validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
-  writeOK=condition!=4;race=condition==5;computeLimitReady=condition!=6;vaPageHookReady=condition!=9;
+  writeOK=condition!=4;race=condition==5;computeLimitReady=condition!=6;vaPageHookReady=condition!=9;addcAlignReady=false;
   vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=mpsPluginOffReady=slmClassReady=condition!=10;
   if(condition==7)data[64]^=1;
   int valid=-1,t=-1,nx=-1;
@@ -281,17 +323,79 @@ int main(int argc,char**argv){
   vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
   assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
   const bool patched=condition==0 || condition==9 || condition==10;
-  assert(computeLimitPages==(patched?1U:0U) && !slmClassPages && !mpsPluginPages && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
+  assert(computeLimitPages==(patched?1U:0U) && !adapterHashPages && !slmClassPages && !mpsPluginPages && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
   if(patched){auto expected=limit;memcpy(expected.data()+XeAdapterComputeLimit::Site,XeAdapterComputeLimit::Corrected,sizeof(XeAdapterComputeLimit::Corrected));
    assert(data==expected);assert(!XeAdapterComputeLimit::matches(data.data(),4096,offset,true,false));}
   else if(condition!=5 && condition!=7)assert(data==limit);
   ++limitCases;
  }
- computeLimitReady=slmClassReady=mpsPluginOffReady=vaPageHookReady=vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=true;writeOK=true;race=false;validation=15;taint=nxValue=0;
+ computeLimitReady=addcAlignReady=slmClassReady=mpsPluginOffReady=vaPageHookReady=vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=true;writeOK=true;race=false;validation=15;taint=nxValue=0;
  // Pages of other images: no correction takes another's.
  assert(!XeAdapterComputeLimit::matches(slm.data(),4096,XeAdapterComputeLimit::FileOffset,true,false) && !XeAdapterComputeLimit::matches(mps.data(),4096,XeAdapterComputeLimit::FileOffset,true,false));
  assert(!MetalSLMClass::matches(limit.data(),4096,MetalSLMClass::FileOffset,true,false) && !MetalMPSPlugin::matches(limit.data(),4096,MetalMPSPlugin::FileOffset,true,false));
  printf("PASS: %u compiler adapter page cases: its own switch, validated executable pages only, mutation race, and independence from the other switches\n",limitCases);
+ // The adapter's check of the compiler's file: _verified's comparison on the same first page, with and without the
+ // compute state correction, then the helper on its third page. The compiler carry switch decides both.
+ unsigned hashCases=0;
+ for(unsigned both=0;both<2;++both)for(unsigned condition=0;condition<11;++condition){
+  auto data=limit;racePage=data.data();originalCalls=0;
+  vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=slmClassPages=computeLimitPages=simdChoicePages=pow2MaxPages=addcAlignPages=adapterHashPages=0;
+  validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
+  writeOK=condition!=4;race=condition==5;addcAlignReady=condition!=6;computeLimitReady=both;vaPageHookReady=condition!=9;
+  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=mpsPluginOffReady=slmClassReady=simdChoiceReady=pow2MaxReady=condition!=10;
+  if(condition==7)data[64]^=1;
+  int valid=-1,t=-1,nx=-1;
+  const uint64_t offset=XeAdapterBackendHash::CallOffset+(condition==8?4096:0);
+  vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
+  assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
+  const bool hashed=condition==0 || condition==9 || condition==10,limited=both && (hashed || condition==6);
+  assert(adapterHashPages==(hashed?1U:0U) && computeLimitPages==(limited?1U:0U) && !addcAlignPages && !pow2MaxPages && !simdChoicePages);
+  assert(!slmClassPages && !mpsPluginPages && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
+  if(hashed || limited){auto expected=limit;
+   if(limited)memcpy(expected.data()+XeAdapterComputeLimit::Site,XeAdapterComputeLimit::Corrected,sizeof(XeAdapterComputeLimit::Corrected));
+   if(hashed)memcpy(expected.data()+XeAdapterBackendHash::CallSite,XeAdapterBackendHash::CallCorrected,sizeof(XeAdapterBackendHash::CallCorrected));
+   assert(data==expected);assert(!XeAdapterBackendHash::matchesCall(data.data(),4096,offset,true,false));}
+  else if(condition!=5 && condition!=7)assert(data==limit);
+  ++hashCases;
+ }
+ for(unsigned condition=0;condition<11;++condition){
+  auto data=helperPage;racePage=data.data();originalCalls=0;
+  vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=slmClassPages=computeLimitPages=simdChoicePages=pow2MaxPages=addcAlignPages=adapterHashPages=0;
+  validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
+  writeOK=condition!=4;race=condition==5;addcAlignReady=condition!=6;vaPageHookReady=condition!=9;
+  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=mpsPluginOffReady=slmClassReady=computeLimitReady=simdChoiceReady=pow2MaxReady=condition!=10;
+  if(condition==7)data[64]^=1;
+  int valid=-1,t=-1,nx=-1;
+  const uint64_t offset=XeAdapterBackendHash::HelperOffset+(condition==8?4096:0);
+  vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
+  assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
+  const bool patched=condition==0 || condition==9 || condition==10;
+  assert(adapterHashPages==(patched?1U:0U) && !computeLimitPages && !addcAlignPages && !pow2MaxPages && !simdChoicePages);
+  assert(!slmClassPages && !mpsPluginPages && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
+  if(patched){auto expected=helperPage;memcpy(expected.data()+XeAdapterBackendHash::HelperSite,XeAdapterBackendHash::HelperCorrected,sizeof(XeAdapterBackendHash::HelperCorrected));
+   assert(data==expected);assert(!XeAdapterBackendHash::matchesHelper(data.data(),4096,offset,true,false));}
+  else if(condition!=5 && condition!=7)assert(data==helperPage);
+  ++hashCases;
+ }
+ addcAlignReady=computeLimitReady=slmClassReady=mpsPluginOffReady=simdChoiceReady=pow2MaxReady=vaPageHookReady=vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=true;writeOK=true;race=false;validation=15;taint=nxValue=0;
+ // Pages of other images: no correction takes another's.
+ for(const auto *other:{&slm,&mps,&page,&helperPage})assert(!XeAdapterBackendHash::matchesCall(other->data(),4096,XeAdapterBackendHash::CallOffset,true,false));
+ for(const auto *other:{&slm,&mps,&page,&limit})assert(!XeAdapterBackendHash::matchesHelper(other->data(),4096,XeAdapterBackendHash::HelperOffset,true,false));
+ assert(!XeAdapterComputeLimit::matches(helperPage.data(),4096,XeAdapterComputeLimit::FileOffset,true,false));
+ {
+  // The helper, on the corrected third page and run on its own: 1 for the shipped digest, read from the page's own
+  // constant at 0x2030 and 0x2020, and for the corrected one stored beside it; 0 for a digest with one bit changed.
+  auto corrected=helperPage;XeAdapterBackendHash::applyHelper(corrected.data());
+  auto *code=(uint8_t*)mmap(nullptr,4096,7,MAP_ANON|MAP_PRIVATE,-1,0);assert(code!=MAP_FAILED);memcpy(code,corrected.data(),4096);
+  const auto accepts=[&](const uint8_t *digest){return ((int(*)(const uint8_t *))(code+XeAdapterBackendHash::HelperSite))(digest);};
+  uint8_t shipped[32],corr[32],zero[32]{};memcpy(shipped,corrected.data()+0x30,16);memcpy(shipped+16,corrected.data()+0x20,16);
+  memcpy(corr,XeAdapterBackendHash::HelperCorrected+0x50,32);
+  assert(accepts(shipped)==1 && accepts(corr)==1 && accepts(zero)==0);
+  for(unsigned bit=0;bit<256;++bit){uint8_t a[32],b[32];memcpy(a,shipped,32);memcpy(b,corr,32);a[bit/8]^=1<<(bit%8);b[bit/8]^=1<<(bit%8);
+   assert(accepts(a)==0 && accepts(b)==0);}
+  munmap(code,4096);
+ }
+ printf("PASS: %u adapter compiler-file check cases: the compiler carry switch, both corrections of the first page, validated executable pages only, mutation race; the helper accepts the shipped and the corrected digest only\n",hashCases);
  // The page of the Metal driver that chooses a kernel binary for each dispatch, at the offset of the VA driver's VFE page.
  // Its switch alone decides.
  unsigned simdCases=0;
@@ -345,6 +449,39 @@ int main(int argc,char**argv){
  assert(!MetalSIMDChoice::matches(maxPage.data(),4096,MetalSIMDChoice::FileOffset,true,false) && !MetalSLMClass::matches(maxPage.data(),4096,MetalSLMClass::FileOffset,true,false));
  assert(!MetalMPSPlugin::matches(maxPage.data(),4096,MetalMPSPlugin::FileOffset,true,false) && !XeAdapterComputeLimit::matches(maxPage.data(),4096,XeAdapterComputeLimit::FileOffset,true,false));
  printf("PASS: %u maximum thread count page cases: its own switch, validated executable pages only, mutation race, and independence from the other switches\n",maxCases);
+ // The page of the compiler with fixAddcSubb's call. Its switch alone decides.
+ unsigned addcCases=0;
+ for(unsigned condition=0;condition<11;++condition){
+  auto data=addcPage;racePage=data.data();originalCalls=0;
+  vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=slmClassPages=computeLimitPages=simdChoicePages=pow2MaxPages=addcAlignPages=0;
+  validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
+  writeOK=condition!=4;race=condition==5;addcAlignReady=condition!=6;vaPageHookReady=condition!=9;
+  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=mpsPluginOffReady=slmClassReady=computeLimitReady=simdChoiceReady=pow2MaxReady=condition!=10;
+  if(condition==7)data[64]^=1;
+  int valid=-1,t=-1,nx=-1;
+  const uint64_t offset=IGCAddcAlign::FileOffset+(condition==8?4096:0);
+  vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
+  assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
+  const bool patched=condition==0 || condition==9 || condition==10;
+  assert(addcAlignPages==(patched?1U:0U) && !pow2MaxPages && !simdChoicePages && !computeLimitPages && !slmClassPages && !mpsPluginPages && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
+  if(patched){auto expected=addcPage;memcpy(expected.data()+IGCAddcAlign::Site,IGCAddcAlign::Corrected,sizeof(IGCAddcAlign::Corrected));
+   assert(data==expected);assert(!IGCAddcAlign::matches(data.data(),4096,offset,true,false));}
+  else if(condition!=5 && condition!=7)assert(data==addcPage);
+  ++addcCases;
+ }
+ addcAlignReady=pow2MaxReady=simdChoiceReady=computeLimitReady=slmClassReady=mpsPluginOffReady=vaPageHookReady=vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=true;writeOK=true;race=false;validation=15;taint=nxValue=0;
+ // Pages of the same images and of other images: no correction takes another's.
+ for(const auto *other:{&maxPage,&simd,&slm,&mps,&limit,&page})assert(!IGCAddcAlign::matches(other->data(),4096,IGCAddcAlign::FileOffset,true,false));
+ assert(!MetalPow2MaxThreads::matches(addcPage.data(),4096,MetalPow2MaxThreads::FileOffset,true,false) && !MetalSIMDChoice::matches(addcPage.data(),4096,MetalSIMDChoice::FileOffset,true,false));
+ assert(!MetalSLMClass::matches(addcPage.data(),4096,MetalSLMClass::FileOffset,true,false) && !MetalMPSPlugin::matches(addcPage.data(),4096,MetalMPSPlugin::FileOffset,true,false));
+ assert(!XeAdapterComputeLimit::matches(addcPage.data(),4096,XeAdapterComputeLimit::FileOffset,true,false));
+ {
+  // One byte changes: the alignment fixAddcSubb asks for its addc's temporary, from Any (1) to 16 words.
+  auto corrected=addcPage;IGCAddcAlign::apply(corrected.data());unsigned changed=0;
+  for(unsigned i=0;i<4096;++i)changed+=corrected[i]!=addcPage[i];
+  assert(changed==1 && addcPage[IGCAddcAlign::Site+7]==0x01 && corrected[IGCAddcAlign::Site+7]==0x10);
+ }
+ printf("PASS: %u compiler carry page cases: its own switch, validated executable pages only, mutation race, independence from the other switches, one byte changed\n",addcCases);
  if(haveMetal){
   // The real function, corrected and called: it returns false at once, without reading the bundle's Info.plist.
   auto image=read(argv[7]);assert(image.size()>=MetalSLMClass::FileOffset+4096);
@@ -484,6 +621,8 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
  (p/'kern_xe_adapter_page.hpp').write_text(limitHeader);(p/'limit.bin').write_bytes(limit)
  (p/'kern_mtl_simd_page.hpp').write_text(simdHeader);(p/'simd.bin').write_bytes(simd)
  (p/'kern_mtl_maxthreads_page.hpp').write_text(maxHeader);(p/'max.bin').write_bytes(maxPage)
+ (p/'kern_igc_addc_page.hpp').write_text(addcHeader);(p/'addc.bin').write_bytes(addcPage)
+ (p/'kern_xe_adapter_hash_page.hpp').write_text(hashHeader);(p/'helper.bin').write_bytes(helperPage)
  (p/'page.bin').write_bytes(page);(p/'safe.bin').write_bytes(safe);(p/'pixel.bin').write_bytes(pixel);(p/'test.cpp').write_text(code)
  extra=[]
  if args.intel_gen12:
@@ -495,4 +634,4 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
   extra=['-DINTEL_GEN12_ORACLE','-I'+str(args.intel_gen12),str(p/'oracle.cpp')]
  subprocess.run(['clang++','-arch','x86_64','-std=c++17','-O1','-g','-I'+str(root/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')]+extra,check=True)
  subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin'),str(p/'pixel.bin'),str(p/'mps.bin'),str(p/'slm.bin'),
-  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-',str(p/'limit.bin'),str(p/'simd.bin'),str(p/'max.bin')],check=True)
+  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-',str(p/'limit.bin'),str(p/'simd.bin'),str(p/'max.bin'),str(p/'addc.bin'),str(p/'helper.bin')],check=True)
