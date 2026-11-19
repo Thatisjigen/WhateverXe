@@ -199,5 +199,6 @@
   "-wex-simd8-dispatch": [],
   "-wex-native-max-threads": [],
   "-wex-native-addc": [],
-  "-wex-native-barrier-flag": []
+  "-wex-native-barrier-flag": [],
+  "-wex-native-hevc-teardown": []
 }

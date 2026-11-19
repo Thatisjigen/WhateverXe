@@ -149,10 +149,12 @@ void XeHost::processKernel(KernelPatcher &patcher) {
  // maximum thread count in the Xe compiler adapter; the SIMD16 binary for small Metal compute dispatches; a power of two
  // as the maximum thread count of compute pipelines; and a GRF-aligned destination for the carry of 64-bit additions in
  // the Intel graphics compiler that the adapter loads, whose check of that compiler's file accepts the corrected file;
- // and a clear pending-barrier flag in every new compute context of the Metal driver.
+ // and a clear pending-barrier flag in every new compute context of the Metal driver; and the release of the HEVC
+ // decoder's second-level batch buffer in the VA driver, in every slice format.
  prepareVAPages(patcher,gpu,profile,checkKernelArgument("-wex-va-renderer"),checkKernelArgument("-wex-intel-mps-plugin"),
   checkKernelArgument("-wex-no-slm-64k"),checkKernelArgument("-wex-no-compute-max-threads"),checkKernelArgument("-wex-simd8-dispatch"),
-  checkKernelArgument("-wex-native-max-threads"),checkKernelArgument("-wex-native-addc"),checkKernelArgument("-wex-native-barrier-flag"));
+  checkKernelArgument("-wex-native-max-threads"),checkKernelArgument("-wex-native-addc"),checkKernelArgument("-wex-native-barrier-flag"),
+  checkKernelArgument("-wex-native-hevc-teardown"));
 
  const auto display=XELP::displayAdapter(profile.family);
  systemWakeRecovery=active && (display==XELP::DisplayAdapter::ADLP || display==XELP::DisplayAdapter::ADLN);

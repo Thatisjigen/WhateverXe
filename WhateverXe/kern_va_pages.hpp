@@ -24,6 +24,9 @@
 // (kern_xe_adapter_hash_page.hpp), on Tahoe for every GPU this kext drives; -wex-native-addc keeps both as shipped.
 // And a new compute context of the Metal driver starts with its pending-barrier flag clear (kern_mtl_barrier_page.hpp),
 // on Tahoe for every GPU this kext drives; -wex-native-barrier-flag keeps the driver's constructor.
+// And the HEVC decoder of the VA driver frees its second-level batch buffer when it is destroyed after decoding in the long
+// slice format too, which closes the accelerator's shared client of its session (kern_local_va_teardown.hpp), on Tahoe for
+// every GPU this kext drives; -wex-native-hevc-teardown keeps the driver's destructor.
 #pragma once
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
@@ -39,9 +42,10 @@
 #include "kern_igc_addc_page.hpp"
 #include "kern_xe_adapter_hash_page.hpp"
 #include "kern_mtl_barrier_page.hpp"
+#include "kern_local_va_teardown.hpp"
 static mach_vm_address_t vaOriginalPage;
-static bool vaPageHookReady,vaGen12Enabled,vaSafeEnabled,vaPixelEnabled,mpsPluginOffReady,slmClassReady,computeLimitReady,simdChoiceReady,pow2MaxReady,addcAlignReady,barrierFlagReady;
-static uint64_t vaVFEPages,vaL3Pages,vaSafePages,vaPixelPages,mpsPluginPages,slmClassPages,computeLimitPages,simdChoicePages,pow2MaxPages,addcAlignPages,adapterHashPages,barrierFlagPages;
+static bool vaPageHookReady,vaGen12Enabled,vaSafeEnabled,vaPixelEnabled,mpsPluginOffReady,slmClassReady,computeLimitReady,simdChoiceReady,pow2MaxReady,addcAlignReady,barrierFlagReady,hevcTeardownReady;
+static uint64_t vaVFEPages,vaL3Pages,vaSafePages,vaPixelPages,mpsPluginPages,slmClassPages,computeLimitPages,simdChoicePages,pow2MaxPages,addcAlignPages,adapterHashPages,barrierFlagPages,hevcTeardownPages;
 using VAPageValidator=void (*)(vnode_t,memory_object_t,memory_object_offset_t,const void *,int *,int *,int *);
 // Keep local hardware selection separate from servicing-build metadata.
 static bool vaPagesScope(const XELP::Profile &profile,XELP::OS os) {
@@ -85,6 +89,11 @@ static bool barrierFlagSerialize(void *,void *,OSSerialize *serial) {
  auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
  const bool ok=data->serialize(serial);data->release();return ok;
 }
+static bool hevcTeardownSerialize(void *,void *,OSSerialize *serial) {
+ const uint64_t q[]{1,hevcTeardownReady,__atomic_load_n(&hevcTeardownPages,__ATOMIC_ACQUIRE)};
+ auto data=OSData::withBytes(q,sizeof(q));if(!data)return false;
+ const bool ok=data->serialize(serial);data->release();return ok;
+}
 static bool vaPagesSerialize(void *,void *,OSSerialize *serial) {
  const uint64_t q[]{1,vaPageHookReady && vaGen12Enabled,vaPageHookReady && vaSafeEnabled,
   __atomic_load_n(&vaVFEPages,__ATOMIC_ACQUIRE),__atomic_load_n(&vaL3Pages,__ATOMIC_ACQUIRE),
@@ -107,6 +116,7 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
  const bool hashCallPage=addcAlignReady && accepted && XeAdapterBackendHash::matchesCall(data,PAGE_SIZE,offset,true,false);
  const bool hashHelperPage=addcAlignReady && accepted && XeAdapterBackendHash::matchesHelper(data,PAGE_SIZE,offset,true,false);
  const bool barrierPage=barrierFlagReady && accepted && MetalPendingBarrier::matches(data,PAGE_SIZE,offset,true,false);
+ const bool teardownPage=hevcTeardownReady && accepted && LocalVAHEVCTeardown::matches(data,PAGE_SIZE,offset,true,false);
  const bool safePage=vaPageHookReady && vaSafeEnabled && validated && tainted && nx &&
   LocalVASafe::match(data,PAGE_SIZE,offset,*validated==0xf,*tainted)==0;
  const int pixelPage=vaPageHookReady && vaPixelEnabled && accepted ?
@@ -114,7 +124,8 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
  const bool vaPage=vaPageHookReady && (safePage || pixelPage>=0 || (accepted && vaGen12Enabled &&
      (LocalVAVFE::matches(data,PAGE_SIZE,offset,true,false) ||
       LocalVAL3::matches(data,PAGE_SIZE,offset,true,false))));
- if(!mpsPage && !slmPage && !limitPage && !hashCallPage && !hashHelperPage && !simdPage && !maxPage && !addcPage && !barrierPage && !vaPage)return;
+ if(!mpsPage && !slmPage && !limitPage && !hashCallPage && !hashHelperPage && !simdPage && !maxPage && !addcPage && !barrierPage &&
+    !teardownPage && !vaPage)return;
  if(MachInfo::setKernelWriting(true,KernelPatcher::kernelWriteLock)!=KERN_SUCCESS)return;
  // Readers may race: recheck the complete page under the existing write lock.
  if(mpsPage && MetalMPSPlugin::matches(data,PAGE_SIZE,offset,true,false)) {
@@ -138,6 +149,8 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
   MetalPow2MaxThreads::apply(const_cast<void *>(data));__atomic_fetch_add(&pow2MaxPages,1ULL,__ATOMIC_RELEASE);
  } else if(addcPage && IGCAddcAlign::matches(data,PAGE_SIZE,offset,true,false)) {
   IGCAddcAlign::apply(const_cast<void *>(data));__atomic_fetch_add(&addcAlignPages,1ULL,__ATOMIC_RELEASE);
+ } else if(teardownPage && LocalVAHEVCTeardown::matches(data,PAGE_SIZE,offset,true,false)) {
+  LocalVAHEVCTeardown::apply(const_cast<void *>(data));__atomic_fetch_add(&hevcTeardownPages,1ULL,__ATOMIC_RELEASE);
  } else if(!vaPage) {
  } else if(safePage && LocalVASafe::match(data,PAGE_SIZE,offset,*validated==0xf,*tainted)==0) {
   // Only the first list; the others carry the ARGB conversions the window server needs.
@@ -155,7 +168,7 @@ static void vaValidatePage(vnode_t node,memory_object_t pager,memory_object_offs
 static_assert(__is_same(decltype(&vaValidatePage),VAPageValidator),"Tahoe validator ABI");
 static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::Profile &profile,bool renderer,bool intelMPSPlugin=false,
  bool nativeSLMClass=false,bool adapterRefusesLimit=false,bool driverSIMD8=false,
- bool nativeMaxThreads=false,bool nativeAddc=false,bool nativeBarrierFlag=false) {
+ bool nativeMaxThreads=false,bool nativeAddc=false,bool nativeBarrierFlag=false,bool nativeHEVCTeardown=false) {
  const bool scope=gpu && vaPagesScope(profile,XELP::kernelOS(version));
  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=scope && renderer;
  const bool mpsPluginOff=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !intelMPSPlugin;
@@ -171,10 +184,13 @@ static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::P
  const bool addcAlign=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !nativeAddc;
  // The driver file is the same for every GPU the Graphics package serves: the MPS plug-in's scope.
  const bool barrierFlag=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !nativeBarrierFlag;
- vaPageHookReady=mpsPluginOffReady=slmClassReady=computeLimitReady=simdChoiceReady=pow2MaxReady=addcAlignReady=barrierFlagReady=false;
+ // The VA driver is the same file for every GPU the Graphics package serves: the MPS plug-in's scope.
+ const bool hevcTeardown=gpu && mpsPluginPageScope(profile,XELP::kernelOS(version)) && !nativeHEVCTeardown;
+ vaPageHookReady=mpsPluginOffReady=slmClassReady=computeLimitReady=simdChoiceReady=pow2MaxReady=addcAlignReady=barrierFlagReady=
+  hevcTeardownReady=false;
  // One route serves every page correction: a second one over the same function is not safe.
  if((vaGen12Enabled || vaSafeEnabled || vaPixelEnabled || mpsPluginOff || slmClass || computeLimit || simdChoice || pow2Max || addcAlign ||
-     barrierFlag) &&
+     barrierFlag || hevcTeardown) &&
     getKernelVersion()==KernelVersion::Tahoe) {
   KernelPatcher::RouteRequest route("_cs_validate_page",vaValidatePage,vaOriginalPage);
   const bool routed=patcher.routeMultipleLong(KernelPatcher::KernelID,&route,1);patcher.clearError();
@@ -186,6 +202,7 @@ static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::P
   pow2MaxReady=routed && pow2Max;
   addcAlignReady=routed && addcAlign;
   barrierFlagReady=routed && barrierFlag;
+  hevcTeardownReady=routed && hevcTeardown;
  }
  auto root=IORegistryEntry::getRegistryRoot();
  root->setProperty("WEXVAPagesScope",scope);
@@ -215,4 +232,7 @@ static void prepareVAPages(KernelPatcher &patcher,IOPCIDevice *gpu,const XELP::P
  // Whether a new compute context starts with its pending-barrier flag clear, and how many times that page was corrected.
  root->setProperty("WEXMetalBarrierFlagReady",barrierFlagReady);
  if(auto live=OSSerializer::forTarget(nullptr,barrierFlagSerialize)){root->setProperty("WEXMetalBarrierFlagLive",live);live->release();}
+ // Whether the HEVC decoder frees its second-level batch buffer in every format, and how many times that page was corrected.
+ root->setProperty("WEXVAHEVCTeardownReady",hevcTeardownReady);
+ if(auto live=OSSerializer::forTarget(nullptr,hevcTeardownSerialize)){root->setProperty("WEXVAHEVCTeardownLive",live);live->release();}
 }
