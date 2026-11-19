@@ -117,6 +117,18 @@ if args.igc:
  addcCorrected=bytes(int(n,0) for n in re.sub(r'//[^\n]*','',re.search(r'Corrected\[\]\{([^}]+)\}',addcHeader)[1]).split(','))
  igcFile=bytearray(args.igc.read_bytes());igcFile[addcOffset+addcSite:addcOffset+addcSite+len(addcCorrected)]=addcCorrected
  assert hashlib.sha256(igcFile).digest()==helperCorrected[0x50:0x70]
+teardownHeader=(root/'WhateverXe/kern_local_va_teardown.hpp').read_text()
+teardownIdentity=re.search(r'ReferenceSHA256\[\]\[32\]\{\{([^}]+)\}\}',teardownHeader)
+teardownNative=bytes(int(n,0) for n in re.sub(r'//[^\n]*','',re.search(r'Native\[\]\{([^}]+)\}',teardownHeader)[1]).split(','))
+teardownSite=int(re.search(r'Site=(0x[0-9a-f]+)',teardownHeader)[1],16);teardownOffset=int(re.search(r'FileOffset=(0x[0-9a-f]+)',teardownHeader)[1],16)
+if args.donor:
+ # The VA driver image: the page with the HEVC decoder's resource destructor must be the one the header names.
+ teardown=args.donor.read_bytes()[teardownOffset:teardownOffset+4096];assert hashlib.sha256(teardown).digest()==bytes(int(n,0) for n in teardownIdentity[1].split(','))
+ assert teardown[teardownSite:teardownSite+len(teardownNative)]==teardownNative
+else:
+ # A synthetic page carrying the destructor's short-format block where the driver has it.
+ teardown=bytearray((i*89+43)%256 for i in range(4096));teardown[teardownSite:teardownSite+len(teardownNative)]=teardownNative
+ teardownHeader=teardownHeader[:teardownIdentity.start(1)]+','.join(hex(v) for v in hashlib.sha256(teardown).digest())+teardownHeader[teardownIdentity.end(1):]
 if args.donor:
  data=args.donor.read_bytes();page=data[0x2c000:0x2d000];assert hashlib.sha256(page).digest()==expected
  safe=data[0x786000:0x787000];assert hashlib.sha256(safe).digest()==bytes(int(n,0) for n in first[1].split(','))
@@ -147,6 +159,7 @@ code=r'''
 #include "kern_igc_addc_page.hpp"
 #include "kern_xe_adapter_hash_page.hpp"
 #include "kern_mtl_barrier_page.hpp"
+#include "kern_local_va_teardown.hpp"
 #include "kern_xelp_platform.hpp"
 #include "kern_xelp_os.hpp"
 #include <cassert>
@@ -177,8 +190,8 @@ static std::vector<uint8_t> read(const char*p){std::ifstream f(p,std::ios::binar
 static void walker(void*,uint32_t*x,uint32_t*y,unsigned i){*x=16+i;*y=32+i;}
 template<class T>void put(uint8_t*p,unsigned o,T v){memcpy(p+o,&v,sizeof(v));}
 int main(int argc,char**argv){
- assert(argc==13);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]),limit=read(argv[8]),simd=read(argv[9]),maxPage=read(argv[10]),addcPage=read(argv[11]),helperPage=read(argv[12]);
- assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096 && limit.size()==4096 && simd.size()==4096 && maxPage.size()==4096 && addcPage.size()==4096 && helperPage.size()==4096);unsigned cases=0;
+ assert(argc==14);auto page=read(argv[1]),safe=read(argv[2]),pixel=read(argv[3]),mps=read(argv[4]),slm=read(argv[5]),limit=read(argv[8]),simd=read(argv[9]),maxPage=read(argv[10]),addcPage=read(argv[11]),helperPage=read(argv[12]),teardown=read(argv[13]);
+ assert(page.size()==4096 && safe.size()==4096 && pixel.size()==4096 && mps.size()==4096 && slm.size()==4096 && limit.size()==4096 && simd.size()==4096 && maxPage.size()==4096 && addcPage.size()==4096 && helperPage.size()==4096 && teardown.size()==4096);unsigned cases=0;
  const bool haveImage=strcmp(argv[6],"-"),haveMetal=strcmp(argv[7],"-");
  KernelPatcher patcher;IOPCIDevice gpu;
  // Scope: exact device and revision, no override, Tahoe, the route, and the renderer switch.
@@ -214,20 +227,27 @@ int main(int argc,char**argv){
   assert(barrierFlagReady==(profile.admitted() && (bits&4) && routeOK));
   prepareVAPages(patcher,&gpu,profile,renderer,false,false,false,false,false,false,true);assert(!barrierFlagReady && simdChoiceReady==(scope && (bits&4) && routeOK));
   assert(addcAlignReady==(profile.admitted() && (bits&4) && routeOK));
+  // The HEVC decoder's batch buffer in the VA driver: every GPU this kext drives on Tahoe, like the adapter, whatever the VA
+  // switch says, and its own switch.
+  assert(hevcTeardownReady==(profile.admitted() && (bits&4) && routeOK));
+  prepareVAPages(patcher,&gpu,profile,renderer);assert(hevcTeardownReady==(profile.admitted() && (bits&4) && routeOK));
+  prepareVAPages(patcher,&gpu,profile,renderer,false,false,false,false,false,false,false,true);
+  assert(!hevcTeardownReady && barrierFlagReady==(profile.admitted() && (bits&4) && routeOK) && slmClassReady==(scope && (bits&4) && routeOK));
   assert(vaPageHookReady==(scope && renderer && (bits&4) && routeOK));++cases;
  }
  kernel=Tahoe;routeOK=true;
- prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady && !pow2MaxReady && !addcAlignReady && !barrierFlagReady);++cases;
+ prepareVAPages(patcher,nullptr,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady && !pow2MaxReady && !addcAlignReady && !barrierFlagReady && !hevcTeardownReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0x46808086,0x0c),true);assert(!vaPageHookReady && !vaSafeEnabled && !vaPixelEnabled && !slmClassReady && !simdChoiceReady);
  assert(mpsPluginOffReady==XELP::identify(0x46808086,0x0c).admitted() && pow2MaxReady==XELP::identify(0x46808086,0x0c).admitted());
- assert(addcAlignReady==XELP::identify(0x46808086,0x0c).admitted() && barrierFlagReady==XELP::identify(0x46808086,0x0c).admitted());++cases;
+ assert(addcAlignReady==XELP::identify(0x46808086,0x0c).admitted() && barrierFlagReady==XELP::identify(0x46808086,0x0c).admitted());
+ assert(hevcTeardownReady==XELP::identify(0x46808086,0x0c).admitted());++cases;
  for(const char *servicing:{"Darwin Kernel Version 25.6.0: other date; root:xnu-new/RELEASE_X86_64","Darwin Kernel Version 25.7.2: future date; root:xnu-next/RELEASE_X86_64"}) {
   version=servicing;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled);++cases;
  }
  version="Darwin Kernel Version 24.6.0: Mon Jul 14 11:28:17 PDT 2025; root:xnu-11417.140.69~1/RELEASE_X86_64";
- prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady && !pow2MaxReady && !addcAlignReady && !barrierFlagReady);++cases;
+ prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled && !mpsPluginOffReady && !slmClassReady && !computeLimitReady && !simdChoiceReady && !pow2MaxReady && !addcAlignReady && !barrierFlagReady && !hevcTeardownReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && !vaGen12Enabled && !vaSafeEnabled && !vaPixelEnabled);++cases;
- version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && slmClassReady && simdChoiceReady && pow2MaxReady && addcAlignReady && barrierFlagReady);++cases;
+ version=tahoe;prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),false);assert(!vaPageHookReady && slmClassReady && simdChoiceReady && pow2MaxReady && addcAlignReady && barrierFlagReady && hevcTeardownReady);++cases;
  prepareVAPages(patcher,&gpu,XELP::identify(0xa7a08086,0x04),true);assert(vaPageHookReady && vaGen12Enabled && vaSafeEnabled && vaPixelEnabled && slmClassReady);
  // The VFE packet generator: validated executable code pages only, rechecked under the write lock.
  for(unsigned condition=0;condition<11;++condition){
@@ -523,6 +543,37 @@ int main(int argc,char**argv){
   assert(changed==1 && addcPage[IGCAddcAlign::Site+7]==0x01 && corrected[IGCAddcAlign::Site+7]==0x10);
  }
  printf("PASS: %u compiler carry page cases: its own switch, validated executable pages only, mutation race, independence from the other switches, one byte changed\n",addcCases);
+ // The page of the VA driver with the HEVC decoder's resource destructor. Its switch alone decides.
+ unsigned teardownCases=0;
+ for(unsigned condition=0;condition<11;++condition){
+  auto data=teardown;racePage=data.data();originalCalls=0;
+  vaVFEPages=vaL3Pages=vaSafePages=vaPixelPages=mpsPluginPages=slmClassPages=computeLimitPages=simdChoicePages=pow2MaxPages=addcAlignPages=adapterHashPages=barrierFlagPages=hevcTeardownPages=0;
+  validation=condition==1?0x7:0xf;taint=condition==2?1:0;nxValue=condition==3?1:0;
+  writeOK=condition!=4;race=condition==5;hevcTeardownReady=condition!=6;vaPageHookReady=condition!=9;
+  vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=mpsPluginOffReady=slmClassReady=computeLimitReady=simdChoiceReady=pow2MaxReady=addcAlignReady=barrierFlagReady=condition!=10;
+  if(condition==7)data[64]^=1;
+  int valid=-1,t=-1,nx=-1;
+  const uint64_t offset=LocalVAHEVCTeardown::FileOffset+(condition==8?4096:0);
+  vaValidatePage((void*)1,(void*)2,offset,data.data(),&valid,&t,&nx);
+  assert(originalCalls==1 && !writing && valid==validation && t==taint && nx==nxValue);
+  const bool patched=condition==0 || condition==9 || condition==10;
+  assert(hevcTeardownPages==(patched?1U:0U) && !barrierFlagPages && !addcAlignPages && !adapterHashPages && !pow2MaxPages && !simdChoicePages && !computeLimitPages);
+  assert(!slmClassPages && !mpsPluginPages && !vaVFEPages && !vaL3Pages && !vaSafePages && !vaPixelPages);
+  if(patched){auto expected=teardown;memcpy(expected.data()+LocalVAHEVCTeardown::Site,LocalVAHEVCTeardown::Corrected,sizeof(LocalVAHEVCTeardown::Corrected));
+   assert(data==expected);assert(!LocalVAHEVCTeardown::matches(data.data(),4096,offset,true,false));}
+  else if(condition!=5 && condition!=7)assert(data==teardown);
+  ++teardownCases;
+ }
+ hevcTeardownReady=barrierFlagReady=addcAlignReady=pow2MaxReady=simdChoiceReady=computeLimitReady=slmClassReady=mpsPluginOffReady=vaPageHookReady=vaGen12Enabled=vaSafeEnabled=vaPixelEnabled=true;writeOK=true;race=false;validation=15;taint=nxValue=0;
+ // Pages of the same image and of other images: no correction takes another's.
+ for(const auto *other:{&page,&safe,&pixel,&simd,&slm,&mps,&limit,&maxPage,&addcPage,&helperPage})assert(!LocalVAHEVCTeardown::matches(other->data(),4096,LocalVAHEVCTeardown::FileOffset,true,false));
+ assert(!LocalVAVFE::matches(teardown.data(),4096,LocalVAVFE::FileOffset,true,false) && LocalVAPixel::match(teardown.data(),4096,0x2b000,true,false)==-1);
+ assert(!MetalPendingBarrier::matches(teardown.data(),4096,MetalPendingBarrier::FileOffset,true,false) && !IGCAddcAlign::matches(teardown.data(),4096,IGCAddcAlign::FileOffset,true,false));
+ {
+  unsigned changed=0;auto corrected=teardown;LocalVAHEVCTeardown::apply(corrected.data());
+  for(unsigned i=0;i<4096;++i)changed+=corrected[i]!=teardown[i];assert(changed==47);
+ }
+ printf("PASS: %u HEVC decoder teardown page cases: its own switch, validated executable pages only, mutation race, independence from the other switches; 47 bytes change\n",teardownCases);
  if(haveMetal){
   // The real function, corrected and called: it returns false at once, without reading the bundle's Info.plist.
   auto image=read(argv[7]);assert(image.size()>=MetalSLMClass::FileOffset+4096);
@@ -639,6 +690,46 @@ int main(int argc,char**argv){
   if(!condition){LocalVAL3::apply(originalL3.data());assert(l3==originalL3);}
  }
  puts("PASS: eight L3 page callback cases, including NX/taint rejection and a raced page");
+ {
+  // The real short-format block of the HEVC decoder's resource destructor, before and after the correction, run on its own
+  // from the mapped image with its real Mhw_FreeBb: a frame holds the decoder at -0x30(%rbp), the code after the block
+  // returns, and the OS interface's resource release records what it is given.
+  const unsigned site=LocalVAHEVCTeardown::FileOffset+LocalVAHEVCTeardown::Site,after=0x77623;
+  std::vector<uint8_t> nativeBlock(mapped+site,mapped+site+sizeof(LocalVAHEVCTeardown::Native)),afterBytes(mapped+after,mapped+after+2);
+  assert(!memcmp(nativeBlock.data(),LocalVAHEVCTeardown::Native,sizeof(LocalVAHEVCTeardown::Native)));
+  static std::vector<const void *> freed;static uint8_t os[0x300];
+  struct Release{static int record(void *o,void *resource){assert(o==os);freed.push_back(resource);return 0;}};
+  void *release=(void *)&Release::record;memcpy(os+0x200,&release,8);
+  auto *enter=(uint8_t*)mmap(nullptr,4096,7,MAP_ANON|MAP_PRIVATE,-1,0);assert(enter!=MAP_FAILED);
+  // pushq %rbp; movq %rsp,%rbp; subq $0x40,%rsp; movq %rdi,-0x30(%rbp); movq %rdi,%rax; movabsq $block,%rcx; jmpq *%rcx
+  const uint8_t head[]{0x55,0x48,0x89,0xe5,0x48,0x83,0xec,0x40,0x48,0x89,0x7d,0xd0,0x48,0x89,0xf8,0x48,0xb9};
+  const uint8_t *block=mapped+site;memcpy(enter,head,sizeof(head));memcpy(enter+sizeof(head),&block,8);enter[sizeof(head)+8]=0xff;enter[sizeof(head)+9]=0xe1;
+  const uint8_t leave[]{0xc9,0xc3};memcpy(mapped+after,leave,sizeof(leave));
+  const auto run=[&](bool corrected,bool shortFormat){
+   memcpy(mapped+site,corrected?LocalVAHEVCTeardown::Corrected:LocalVAHEVCTeardown::Native,sizeof(LocalVAHEVCTeardown::Native));
+   std::vector<uint8_t> decoder(0x6000);const void *o=os;memcpy(decoder.data()+0x10,&o,8);decoder[0xbae]=shortFormat;
+   // A batch buffer that holds a resource, not locked, and its sizes.
+   decoder[0x5250]=0x5a;put(decoder.data(),0x5250+0x14c,uint32_t(0x2000));put(decoder.data(),0x5250+0x150,uint32_t(1));
+   freed.clear();((void(*)(void *))enter)(decoder.data());
+   // Where each released resource sits in the decoder.
+   std::vector<long> at;for(const void *r:freed)at.push_back((const uint8_t *)r-decoder.data());
+   return std::make_pair(at,decoder);
+  };
+  const auto nativeLong=run(false,false),nativeShort=run(false,true),correctedLong=run(true,false),correctedShort=run(true,true);
+  const auto offsetOf=[](const std::pair<std::vector<long>,std::vector<uint8_t>> &r,unsigned i){return r.first[i];};
+  // Before: the long format frees nothing, the short one the batch buffer and the eight resources after it.
+  assert(nativeLong.first.empty() && nativeShort.first.size()==9);
+  for(unsigned i=0;i<9;++i)assert(offsetOf(nativeShort,i)==(i?0x53f8+0x148*(i-1):0x5250));
+  // After: the long format frees the batch buffer alone, the short one exactly what it freed before, in the same order.
+  assert(correctedLong.first.size()==1 && offsetOf(correctedLong,0)==0x5250 && correctedShort.first.size()==9);
+  for(unsigned i=0;i<9;++i)assert(offsetOf(correctedShort,i)==offsetOf(nativeShort,i));
+  // Mhw_FreeBb clears the buffer's sizes and nothing else of the decoder: the long format kept them before the correction.
+  const auto size=[](const std::vector<uint8_t> &d){uint32_t v;memcpy(&v,d.data()+0x5250+0x14c,4);return v;};
+  assert(size(nativeLong.second)==0x2000 && !size(correctedLong.second) && !size(nativeShort.second) && correctedShort.second==nativeShort.second);
+  auto longAsShort=correctedLong.second;longAsShort[0xbae]=1;assert(longAsShort==nativeShort.second);
+  memcpy(mapped+site,nativeBlock.data(),nativeBlock.size());memcpy(mapped+after,afterBytes.data(),afterBytes.size());munmap(enter,4096);
+  puts("PASS: the real destructor block of the HEVC decoder frees the second-level batch buffer in the long slice format after the correction and nothing before; the short format frees the same nine resources in the same order");
+ }
  std::vector<uint8_t> owner(0xa900),table(0x100),object(0x5000),baseline;unsigned nativeCases=0;
  put(table.data(),0x78,&walker);
  for(unsigned count:{0U,1U,2U})for(unsigned threads:{32U,112U,224U,672U,1024U})for(unsigned curbe:{0U,32U,256U,1024U})for(unsigned mode=0;mode<5;++mode){
@@ -681,6 +772,7 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
  (p/'kern_mtl_maxthreads_page.hpp').write_text(maxHeader);(p/'max.bin').write_bytes(maxPage)
  (p/'kern_igc_addc_page.hpp').write_text(addcHeader);(p/'addc.bin').write_bytes(addcPage)
  (p/'kern_xe_adapter_hash_page.hpp').write_text(hashHeader);(p/'helper.bin').write_bytes(helperPage)
+ (p/'kern_local_va_teardown.hpp').write_text(teardownHeader);(p/'teardown.bin').write_bytes(teardown)
  (p/'page.bin').write_bytes(page);(p/'safe.bin').write_bytes(safe);(p/'pixel.bin').write_bytes(pixel);(p/'test.cpp').write_text(code)
  extra=[]
  if args.intel_gen12:
@@ -692,4 +784,4 @@ with tempfile.TemporaryDirectory(prefix='wex-va-pages-') as tmp:
   extra=['-DINTEL_GEN12_ORACLE','-I'+str(args.intel_gen12),str(p/'oracle.cpp')]
  subprocess.run(['clang++','-arch','x86_64','-std=c++17','-O1','-g','-I'+str(root/'WhateverXe'),str(p/'test.cpp'),'-o',str(p/'test')]+extra,check=True)
  subprocess.run([str(p/'test'),str(p/'page.bin'),str(p/'safe.bin'),str(p/'pixel.bin'),str(p/'mps.bin'),str(p/'slm.bin'),
-  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-',str(p/'limit.bin'),str(p/'simd.bin'),str(p/'max.bin'),str(p/'addc.bin'),str(p/'helper.bin')],check=True)
+  str(args.donor.resolve()) if args.donor else '-',str(args.metal.resolve()) if args.metal else '-',str(p/'limit.bin'),str(p/'simd.bin'),str(p/'max.bin'),str(p/'addc.bin'),str(p/'helper.bin'),str(p/'teardown.bin')],check=True)
