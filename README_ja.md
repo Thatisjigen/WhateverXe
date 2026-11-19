@@ -98,6 +98,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 - Tahoeでは既定で有効（`-wex-native-addc` で無効化）: Xeコンパイラアダプタが読み込むIntelグラフィックスコンパイラが、64ビット加算の桁上がりを正しく読み取ります。これにより、Metal Performance ShadersとMPSGraphの畳み込みでタップが欠ける問題が直ります。状態は `WEXIGCAddcAlignReady` と `WEXIGCAddcAlignLive` で確認できます。
 - Tahoeでは既定で有効（`-wex-native-barrier-flag` で無効化）: 新しいMetalコンピュートコンテキストは保留中のバリアなしで始まり、エンコーダの最初のディスパッチも他と同じく同期されます。以前はMPSGraphのネットワークがランダムに誤った値を返していました。状態は `WEXMetalBarrierFlagReady` と `WEXMetalBarrierFlagLive` で確認できます。
 - Tahoeでは既定で有効（`-wex-native-hevc-teardown` で無効化）: Intel VAドライバのHEVCデコーダが、破棄時にすべてのバッファを解放します。クリップの再開を繰り返す動画壁紙がGPUのクライアントを使い切り、アプリがGPUを開けなくなる問題がなくなります。状態は `WEXVAHEVCTeardownReady` と `WEXVAHEVCTeardownLive` で確認できます。
+- Tiger Lake以外では既定で有効（`-wex-native-gpgpu-preempt` で無効化）: WindowServerはMetalのコンピュート処理をディスパッチの間でのみプリエンプトします。画面の使用中に長いコンピュート処理でGPUがハングしなくなりますが、WindowServerは実行中のディスパッチの終了を待ちます。状態は `TGLGPGPUCommandPreemptionReady` で確認できます。
 
 ## 動作確認済みの機能と既知の問題
 
