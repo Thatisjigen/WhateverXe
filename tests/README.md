@@ -210,6 +210,7 @@ The registry contract checks that newly added scripts are not silently omitted.
 | `test_runner_contract.py` | Missing required work fails, all modes are visible, failure stops execution, results cannot be overwritten | Exercises the actual runner's registration, omissions and stage handling |
 | AUX parent/observer replays | Reference ownership, inaccessible MMIO and memory-only telemetry retention, including quiet training | Old fixture declarations and qualification have been updated without changing the reference-balance expectation. Added PG telemetry is not required to occupy old record indices |
 | DKL and outer-ring replays | Linux coefficient tables and Gen12 PIPE_CONTROL bit meanings, respectively | Actual donor code runs with boundary leaves. Outer-ring comparison uses original bytes as baseline, not a candidate with one bit cleared |
+| `tgl_gpgpu_preemption.py` | Donor `startGraphicsEngine` writes one GPGPU level to the global granularity register 0x20E4 and to 0x2580: thread group (mid-thread with flags bit 32) before the correction, command level (0x60004) after it for every flags value, with the object-preemption, selector and FF DOP corrections that production applies outside Tiger Lake | Actual donor block executed on CPU-backed registers; accepts the donor only by its SHA-256. Which register the hardware reads while per-context control is off, and the GPU outcome, are not tested |
 
 Compat's fixed donor identity is
 `c004fc1ac9ee4157e2e12736f40fa6639bde025a279326beeb9dd48c9b445731`.

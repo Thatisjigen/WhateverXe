@@ -14218,6 +14218,28 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 				patcher.applyLookupPatch(&patch,ffModeSite,sizeof(ffModeFind)+1);
 				ffModeOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(ffModeSite,ffModeReplace,sizeof(ffModeReplace));
 			}
+			// Metal compute runs on the render engine, which the window server's drawing keeps preempting. For a GPGPU
+			// walker the donor asks for preemption between thread groups (0x60002, or mid-thread with a flags bit that is
+			// never set) and writes that level to 0x20E4, the global granularity that applies while r144 leaves
+			// per-context control off, and to 0x2580. Outside Tiger Lake a walker resumed that way can leave the command
+			// streamer stopped on it or on the PIPE_CONTROL after it, with the EUs idle: compute work in command buffers of
+			// up to a second hung the GPU within minutes while the screen was being composed, and never with the displays
+			// asleep. Preempt compute only between commands (0x60004, the level Intel's media driver programs under
+			// WaMidBatchPreemption): the window server gets the engine at the next walker boundary and no walker is
+			// resumed halfway. -wex-native-gpgpu-preempt keeps the donor's level.
+			const bool commandPreempt=xeProfile.family!=XELP::Family::Unknown && xeProfile.family!=XELP::Family::TigerLake &&
+				!checkKernelArgument("-wex-native-gpgpu-preempt");
+			const uint8_t gpgpuLevelFind[] {0x83,0xE1,0x02,0x81,0xF1,0x02,0x00,0x06,0x00};
+			const uint8_t gpgpuLevelReplace[] {0xB9,0x04,0x00,0x06,0x00,0x0F,0x1F,0x40,0x00};
+			auto gpgpuLevelSite=reinterpret_cast<uint8_t *>(address+0x2515D);
+			bool gpgpuLevelOK=commandPreempt && objectPreemptOK && !memcmp(gpgpuLevelSite,gpgpuLevelFind,sizeof(gpgpuLevelFind));
+			patcher.clearError();
+			if(gpgpuLevelOK) {
+				KernelPatcher::LookupPatch patch {currentGraphics,gpgpuLevelFind,gpgpuLevelReplace,sizeof(gpgpuLevelFind),1};
+				patcher.applyLookupPatch(&patch,gpgpuLevelSite,sizeof(gpgpuLevelFind)+1);
+				gpgpuLevelOK=patcher.getError()==KernelPatcher::Error::NoError && !memcmp(gpgpuLevelSite,gpgpuLevelReplace,sizeof(gpgpuLevelReplace));
+			}
+			IORegistryEntry::getRegistryRoot()->setProperty("TGLGPGPUCommandPreemptionReady",gpgpuLevelOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLFFModeTimerReady",ffModeOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLFFDOPClockDisableReady",ffDopOK);
 			IORegistryEntry::getRegistryRoot()->setProperty("TGLObjectPreemptionGlobalReady",selectorOK);
@@ -19671,6 +19693,8 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    q[54]=*reinterpret_cast<volatile uint32_t *>(b+0x2580);
    q[55]=*reinterpret_cast<volatile uint32_t *>(b+0x20A0);
    q[56]=*reinterpret_cast<volatile uint32_t *>(b+0x7304);
+   // The global GPGPU preemption granularity.
+   q[57]=*reinterpret_cast<volatile uint32_t *>(b+0x20E4);
   }
  }
  if (n<arrsize(tglHost.submit)) {

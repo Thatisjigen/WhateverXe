@@ -200,5 +200,6 @@
   "-wex-native-max-threads": [],
   "-wex-native-addc": [],
   "-wex-native-barrier-flag": [],
-  "-wex-native-hevc-teardown": []
+  "-wex-native-hevc-teardown": [],
+  "-wex-native-gpgpu-preempt": []
 }

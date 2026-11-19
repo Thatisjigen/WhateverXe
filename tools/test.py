@@ -53,7 +53,7 @@ display13_combo_clock adls_panel_pwm display13_panel_runtime tgl_panel_timing
 tgl_agdc_port_status tgl_tc_native tgl_tc_mode tgl_mode_native tgl_panel_depth_route
 adls_donor adls_clock_native""".split()
 ACCELERATOR_TESTS = """xelp_video_irq adlp_video_route tgl_ccs tgl_completion_cache tgl_cps_color_pipe tgl_ff_dop
-tgl_ff_mode tgl_object_preemption tgl_object_selector tgl_render_flush
+tgl_ff_mode tgl_object_preemption tgl_object_selector tgl_gpgpu_preemption tgl_render_flush
 dsi_backing_adapter dsi_backing_native tgl_rpcs_native small_gt_urb
 tgl_tlb_preparser tgl_semaphore_tlb tgl_iosurface_compression tgl_gt2_urb""".split()
 
