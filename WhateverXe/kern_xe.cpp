@@ -585,7 +585,7 @@ uintptr_t tglCPSRestoreOriginal {},tglCPSRestoreCaller {};
 static bool tglContextCacheEnabled,tglContextAuxInvalidate;
 // Linux's render-engine workarounds for Xe-LP that the per-context batch (tglCPSPrepare) rewrites on every context
 // restore: the thread-dispatch ones on every family, the semaphore idle message where Linux applies it.
-static bool tglEngineWorkarounds,tglEngineSemaphoreIdle,tglEngineSemaphoreIdleCompute;
+static bool tglEngineWorkarounds,tglEngineSemaphoreIdle,tglEngineSemaphoreIdleCompute,tglContextHiZSampler;
 // Opt-in hardware writes for narrowing down a fault outside Tiger Lake. The donor makes the first three on Tiger
 // Lake, behind workaround-mask bits it drops from PCI revision 4 on (processTGLAccelerator adds the bits back);
 // Linux makes the last three on every Xe-LP and the donor never does (tglExtraWorkaroundsApply).
@@ -651,11 +651,20 @@ static bool tglCPSPrepare(void *owner) {
  // The donor has all but the first in its engine start code, each behind a bit of the workaround mask that
  // processTGLAccelerator completes for Alder and Raptor Lake. An engine reset clears the engine's registers, and
  // neither the donor's restore list nor gpuResetRCSRegisters has ROW_CHICKEN4 or RING_PSMI_CTL.
- uint32_t batch[20] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000};
+ // Two more that Linux sets on every Xe-LP render context (i915 gen12_ctx_workarounds_init and
+ // rcs_engine_wa_init, xe lrc_was and engine_was), unless -wex-no-ctx-hiz-wa:
+ //   Wa_1806527549, HIZ_CHICKEN bit 13: no HiZ depth-test optimisation for the LE and GE functions. The donor
+ //   never writes the register;
+ //   Wa_1406941453, SAMPLER_MODE bit 15 (ENABLE_SMALLPL). The donor sets it by MMIO when the engine starts, behind
+ //   bit 17 of its workaround mask; the register travels with the render context, so an image saved before that
+ //   write would bring it back clear. In the load it is in every context, after every restore.
+ // TGLContextWorkaroundsLive reads both back from the resident context.
+ uint32_t batch[24] {0,0x11000005,0x7304,0x02000200,0x6604,0xE0040000,0xE4F4,0x40004000};
  unsigned words=8;
  if(tglEngineWorkarounds) {
   batch[7]=0x41004100;batch[words++]=0xE48C;batch[words++]=0x02000200;
   batch[words++]=0x7300;batch[words++]=0x00400040;
+  if(tglContextHiZSampler) {batch[words++]=0x7018;batch[words++]=0x20002000;batch[words++]=0xE18C;batch[words++]=0x80008000;}
   if(tglEngineSemaphoreIdle) {batch[words++]=0x2050;batch[words++]=0x10801080;}
   if(tglEngineSemaphoreIdleCompute) {batch[words++]=0x1A050;batch[words++]=0x10801080;}
   batch[1]=0x11000000|(words-3); // MI_LOAD_REGISTER_IMM length: two dwords per register, minus one
@@ -738,6 +747,16 @@ static bool tglContextCacheInit(void *context,void *task,const void *params,uint
 // Read-only sparse samples during the existing RCS forcewake. These are resident
 // register values, not the incoming draw's identity. No GPU/register writes.
 uint32_t tglStateRedirectCounts[4] {}; // samples, bit11 set, invalid all-ones, last
+// Resident-context receipts of the per-context workarounds, read where TGLCPSColorPipeLive reads 0x7304: samples with
+// this plugin's batch pointer, of those with HIZ_CHICKEN bit 13, with SAMPLER_MODE bit 15, with COMMON_SLICE_CHICKEN4
+// bit 6, then the last 0x7018, 0xE18C and 0x7300.
+uint32_t tglContextWaCounts[7] {};
+static bool tglContextWaSerialize(void *,void *,OSSerialize *serializer) {
+ uint32_t out[9] {1,uint32_t(tglContextHiZSampler)};
+ for(unsigned i=0;i<7;++i)out[i+2]=__atomic_load_n(&tglContextWaCounts[i],__ATOMIC_RELAXED);
+ auto data=OSData::withBytes(out,sizeof(out));if(!data)return false;
+ const bool ok=data->serialize(serializer);data->release();return ok;
+}
 bool tglStateRedirectSerialize(void *,void *,OSSerialize *serializer) {
  uint32_t out[5] {150};
  for(unsigned i=0;i<4;++i)out[i+1]=__atomic_load_n(&tglStateRedirectCounts[i],__ATOMIC_RELAXED);
@@ -14974,6 +14993,7 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			// leaves ROW_CHICKEN2 bit 8, ROW_CHICKEN4 bit 9 and RING_PSMI_CTL bits 7 and 12 clear.
 			// -wex-no-engine-wa keeps the donor's values.
 			tglEngineWorkarounds=cpsOK && xeProfile.family!=XELP::Family::Unknown && !checkKernelArgument("-wex-no-engine-wa");
+			tglContextHiZSampler=tglEngineWorkarounds && !checkKernelArgument("-wex-no-ctx-hiz-wa");
 			tglEngineSemaphoreIdle=tglEngineWorkarounds && xeProfile.family!=XELP::Family::AlderLakeS &&
 				xeProfile.family!=XELP::Family::RaptorLakeS;
 			// The second render ring is in use outside Tiger Lake only with -wex-parallel-compute; on Tiger Lake
@@ -15030,6 +15050,9 @@ bool XE::processTGLAccelerator(KernelPatcher &patcher, size_t index, mach_vm_add
 			}
 			if(auto live=OSSerializer::forTarget(nullptr,tglCPSSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLCPSColorPipeLive",live);live->release();
+			}
+			if(auto live=OSSerializer::forTarget(nullptr,tglContextWaSerialize)) {
+				IORegistryEntry::getRegistryRoot()->setProperty("TGLContextWorkaroundsLive",live);live->release();
 			}
 			if(auto live=OSSerializer::forTarget(nullptr,tglEarlyReadSerialize)) {
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLEarlyReadLive",live);live->release();
@@ -19683,6 +19706,17 @@ void XE::wrapTGLHostSubmit(void *streamer,uint32_t flags) {
    __atomic_fetch_add(&tglCPSCounts[ptr==expected?10:11],1,__ATOMIC_RELAXED);
    __atomic_fetch_add(&tglCPSCounts[(v&0x200)?6:7],1,__ATOMIC_RELAXED);
    __atomic_fetch_add(&tglCPSCounts[5],1,__ATOMIC_RELAXED);
+   if(ptr==expected) {
+    const uint32_t hiz=*reinterpret_cast<volatile uint32_t *>(b+0x7018),sampler=*reinterpret_cast<volatile uint32_t *>(b+0xE18C),
+     slice=*reinterpret_cast<volatile uint32_t *>(b+0x7300);
+    __atomic_fetch_add(&tglContextWaCounts[0],1,__ATOMIC_RELAXED);
+    if(hiz!=UINT32_MAX && (hiz&0x2000))__atomic_fetch_add(&tglContextWaCounts[1],1,__ATOMIC_RELAXED);
+    if(sampler!=UINT32_MAX && (sampler&0x8000))__atomic_fetch_add(&tglContextWaCounts[2],1,__ATOMIC_RELAXED);
+    if(slice!=UINT32_MAX && (slice&0x40))__atomic_fetch_add(&tglContextWaCounts[3],1,__ATOMIC_RELAXED);
+    __atomic_store_n(&tglContextWaCounts[4],hiz,__ATOMIC_RELAXED);
+    __atomic_store_n(&tglContextWaCounts[5],sampler,__ATOMIC_RELAXED);
+    __atomic_store_n(&tglContextWaCounts[6],slice,__ATOMIC_RELAXED);
+   }
   }
   // Read only while the existing RCS submit wrapper owns forcewake.
   // These are resident hardware values, not the incoming context's state.
