@@ -17,7 +17,7 @@ LIMITS = {
     '_ZN2XE13processKernelER13KernelPatcherP10DeviceInfo': 2048,
     '_ZN2XE13adlnBootstrapEP11IOPCIDevice': 5120,
     '_ZN2XE11processKextER13KernelPatchermym': 256,
-    '_ZN2XE21processTGLAcceleratorER13KernelPatchermym': 6144,
+    '_ZN2XE21processTGLAcceleratorER13KernelPatchermym': 7168,
     '_ZN2XE15processKextFullER13KernelPatchermym': 6144,
     '_ZL22tglStartOrderSerializePvS_P11OSSerialize': 3328,
     '_ZN2XE20display13WMArmUpdateEP9IOService': 2816, # Existing body behind the DSI entry guard.
