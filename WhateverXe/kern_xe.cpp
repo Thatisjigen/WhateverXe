@@ -5,6 +5,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/graphics/IOGraphicsTypes.h>
 #include <kern/thread_call.h>
+#include <sys/sysctl.h>
 #include <os/log.h>
 //
 //  kern_xe.cpp
@@ -786,6 +787,61 @@ static uint32_t tglHostRPSEncode(uint32_t requested,uint32_t boost,uint32_t caps
  if(f<lo)f=lo;if(f>hi)f=hi;
  return (f*3)<<23; // 50 MHz policy units -> 16.67 MHz hardware units
 }
+// GT frequency governor from activity (b00t0x/WhateverXe#176). Without GuC, Apple leaves requested and boost (+0xEC8/+0xECC)
+// at RP0, so the GT left every RC6 at its maximum frequency even under a light load. The occupancy comes from the RC6
+// residency counter (0x138108, in the always-on range, 1280 ns units): no forcewake, no wait, no MMIO write.
+// Over a window of at least 16 ms, busy = 1 - RC6/time: at 85 % or more the answer goes straight to RP0, at 60 % it rises
+// by a quarter of the range, under 30 % it drops by a quarter, and between 30 and 60 % it holds. It starts at RP1, and a
+// long pause between calls counts as idle (RC6 covers the pause).
+// debug.g15gtgov=0 returns at once to max(requested,boost), without sudo; -wex-g15-gtgov-off keeps it off from boot.
+// debug.g15gtgov_info: windows, trips to RP0, rises, drops, the current frequency and the last window's occupancy.
+static int g15GtGov=1;
+static uint32_t g15GovBusyFlag, g15GovRc6, g15GovCur, g15GovPct;
+static uint64_t g15GovNs, g15GovWin, g15GovMax, g15GovUp, g15GovDown, g15GovReset;
+static uint32_t g15GovPick(volatile uint8_t *base,uint32_t caps) {
+ const uint32_t lo=(caps>>16)&255,rp1=(caps>>8)&255,hi=caps&255;
+ if(!lo || lo>hi || hi>85)return 0;
+ if(__atomic_exchange_n(&g15GovBusyFlag,1U,__ATOMIC_ACQUIRE)) {   // another thread is deciding: use the current frequency
+  const uint32_t cur=__atomic_load_n(&g15GovCur,__ATOMIC_RELAXED);
+  return (cur>=lo && cur<=hi) ? cur : hi;
+ }
+ uint64_t t,ns;clock_get_uptime(&t);absolutetime_to_nanoseconds(t,&ns);
+ const uint32_t rc6=*reinterpret_cast<volatile uint32_t *>(base+0x138108);
+ uint32_t cur=g15GovCur;
+ const uint64_t el=ns-g15GovNs;
+ if(cur<lo || cur>hi || el>60000000000ULL) {          // first call, new caps, or a pause over 60 s (the counter may have wrapped)
+  if(!cur || cur<lo || cur>hi)cur=(rp1>=lo && rp1<=hi) ? rp1 : lo;
+  else cur=lo;
+  g15GovNs=ns;g15GovRc6=rc6;g15GovReset++;
+ } else if(el>=16000000ULL) {
+  const uint64_t idle=uint64_t(rc6-g15GovRc6)*1280ULL;
+  const uint32_t busy=idle>=el ? 0 : uint32_t((el-idle)*100/el);
+  const uint32_t step=(hi-lo+3)/4 ? (hi-lo+3)/4 : 1;
+  if(busy>=85) {if(cur!=hi){cur=hi;g15GovMax++;}}
+  else if(busy>=60) {if(cur<hi){cur=cur+step>hi ? hi : cur+step;g15GovUp++;}}
+  else if(busy<30) {if(cur>lo){cur=cur<lo+step ? lo : cur-step;g15GovDown++;}}
+  g15GovNs=ns;g15GovRc6=rc6;g15GovPct=busy;g15GovWin++;
+ }
+ __atomic_store_n(&g15GovCur,cur,__ATOMIC_RELAXED);
+ __atomic_store_n(&g15GovBusyFlag,0U,__ATOMIC_RELEASE);
+ return cur;
+}
+static int g15GtGovSysctl SYSCTL_HANDLER_ARGS {
+ (void)arg1;(void)arg2;
+ int v=g15GtGov;const int e=sysctl_handle_int(oidp,&v,0,req);
+ if(!e && req->newptr){g15GtGov=v?1:0;__atomic_store_n(&g15GovCur,0U,__ATOMIC_RELAXED);}
+ return e;
+}
+static int g15GtGovInfoSysctl SYSCTL_HANDLER_ARGS {
+ (void)arg1;(void)arg2;
+ char s[192];
+ snprintf(s,sizeof(s),"on %d | cur %u MHz | busy %u%% | windows %llu | toRP0 %llu up %llu down %llu | resets %llu | last %u MHz",
+   g15GtGov,g15GovCur*50,g15GovPct,g15GovWin,g15GovMax,g15GovUp,g15GovDown,g15GovReset,
+   ((__atomic_load_n(&tglHostRPSLast,__ATOMIC_RELAXED)>>23)/3)*50);
+ return sysctl_handle_string(oidp,s,0,req);
+}
+SYSCTL_PROC(_debug,OID_AUTO,g15gtgov,CTLTYPE_INT|CTLFLAG_RW|CTLFLAG_ANYBODY|CTLFLAG_LOCKED,nullptr,0,g15GtGovSysctl,"I","");
+SYSCTL_PROC(_debug,OID_AUTO,g15gtgov_info,CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_LOCKED,nullptr,0,g15GtGovInfoSysctl,"A","");
 uint32_t tglHostPMNotify(void *controller,uint32_t priority,uint32_t event,uint64_t *usage,uint32_t *frequency) {
  __atomic_fetch_add(&tglHostRPSCalls,1ULL,__ATOMIC_RELAXED);
  auto c=static_cast<uint8_t *>(controller);
@@ -795,7 +851,9 @@ uint32_t tglHostPMNotify(void *controller,uint32_t priority,uint32_t event,uint6
    auto base=*reinterpret_cast<volatile uint8_t **>(access+0x50);
    if(base) {
     const uint32_t caps=*reinterpret_cast<volatile uint32_t *>(base+0x145998);
-    const uint32_t encoded=tglHostRPSEncode(*reinterpret_cast<uint32_t *>(c+0xec8),
+    uint32_t encoded=0;
+    if(g15GtGov) {const uint32_t f=g15GovPick(base,caps);if(f)encoded=(f*3)<<23;}
+    if(!encoded)encoded=tglHostRPSEncode(*reinterpret_cast<uint32_t *>(c+0xec8),
       *reinterpret_cast<uint32_t *>(c+0xecc),caps);
     if(encoded) {
      *frequency=encoded;
@@ -4607,6 +4665,12 @@ bool XE::xelpInstallHostRPS(KernelPatcher &patcher,size_t index,mach_vm_address_
     if(ready) {
         KernelPatcher::RouteRequest route(symbol,tglHostPMNotify,tglOriginalPMNotify);
         ready=patcher.routeMultiple(index,&route,1,address,size);patcher.clearError();
+    }
+    // The GT governor, on unless -wex-g15-gtgov-off. Two paths install this route: its sysctls are registered once.
+    static bool governorRegistered;
+    if(ready && !__atomic_exchange_n(&governorRegistered,true,__ATOMIC_ACQ_REL)) {
+        if(checkKernelArgument("-wex-g15-gtgov-off"))g15GtGov=0;
+        sysctl_register_oid(&sysctl__debug_g15gtgov);sysctl_register_oid(&sysctl__debug_g15gtgov_info);
     }
     return ready;
 }

@@ -202,5 +202,6 @@
   "-wex-native-addc": [],
   "-wex-native-barrier-flag": [],
   "-wex-native-hevc-teardown": [],
-  "-wex-native-gpgpu-preempt": []
+  "-wex-native-gpgpu-preempt": [],
+  "-wex-g15-gtgov-off": []
 }
